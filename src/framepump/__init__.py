@@ -1,4 +1,4 @@
-from framepump.videolib import (
+from framepump.framepump import (
     VideoFrames,
     get_duration,
     get_fps,

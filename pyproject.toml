@@ -22,6 +22,7 @@ dependencies = [
     "imageio",
     "imageio-ffmpeg",
     "ffmpeg-python",
+    "simplepyutils",
 ]
 
 classifiers = [
@@ -38,6 +39,11 @@ Homepage = "https://github.com/isarandi/framepump"
 Repository = "https://github.com/isarandi/framepump"
 Issues = "https://github.com/isarandi/framepump/issues"
 Author = "https://istvansarandi.com"
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+write_to = "src/framepump/_version.py"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

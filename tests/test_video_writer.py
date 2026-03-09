@@ -344,7 +344,13 @@ class TestPixelRoundtrip:
         writer.start_sequence(str(video_path), fps=30, gpu=True)
         for _ in range(5):
             writer.append_data(frame)
-        writer.end_sequence()
+        try:
+            writer.end_sequence()
+        except RuntimeError as e:
+            writer.close()
+            if 'nvenc' in str(e).lower() or 'not permitted' in str(e).lower():
+                pytest.skip(f'NVENC not available: {e}')
+            raise
         writer.close()
 
         if not video_path.exists() or video_path.stat().st_size == 0:
@@ -411,8 +417,15 @@ class TestPixelRoundtrip:
         writer.start_sequence(str(video_path), fps=30, gpu=True)
         writer.append_data(frame)
 
-        with pytest.raises(RuntimeError, match='NVENC frame size too small'):
+        with pytest.raises(RuntimeError) as exc_info:
             writer.end_sequence()
+
+        msg = str(exc_info.value).lower()
+        if 'nvenc frame size too small' not in msg:
+            writer.close()
+            if 'nvenc' in msg or 'not permitted' in msg:
+                pytest.skip(f'NVENC not available: {exc_info.value}')
+            raise exc_info.value
 
         writer.close()
 

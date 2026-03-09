@@ -1,0 +1,11 @@
+/* Custom theme overrides */
+
+/* Adjust code block styling */
+.highlight pre {
+    border-radius: 4px;
+}
+
+/* Make function signatures more readable */
+.sig-name {
+    font-weight: bold;
+}

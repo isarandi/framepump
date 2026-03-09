@@ -1,49 +1,91 @@
 [build-system]
-requires = [
-    "setuptools>=42",
-    "wheel",
-    "setuptools_scm[toml]>=8",
-]
+requires = ["setuptools>=64", "wheel", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "framepump"
 dynamic = ["version"]
-description = "Video processing utilities"
+description = "High-performance video processing built on PyAV"
 authors = [
     { name = "István Sárándi", email = "istvan.sarandi@uni-tuebingen.de" }
 ]
 readme = "README.md"
-requires-python = ">=3.8"
-license = "MIT"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
 
-dependencies = [
-    "numpy",
-    "imageio",
-    "imageio-ffmpeg",
-    "ffmpeg-python",
-    "simplepyutils",
+keywords = [
+    "video",
+    "ffmpeg",
+    "frames",
+    "processing",
+    "multimedia",
 ]
 
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Topic :: Software Development :: Libraries",
+    "Topic :: Multimedia :: Video",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Operating System :: POSIX :: Linux"
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "numpy",
+    "av",  # PyAV for video I/O
+    "simplepyutils",
+    "more-itertools",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "pytest-forked",
+]
+lint = [
+    "ruff",
+    "pyright",
+    "pre-commit",
+]
+docs = [
+    "sphinx",
+    "pydata-sphinx-theme",
+    "sphinx-autoapi",
+    "sphinxcontrib-bibtex",
+    "setuptools-scm",
+    "toml",
+]
+gl = [
+    "moderngl",
+    "glfw",
+]
+nvenc-cuda = [
+    "cuda-python>=13,<14",  # Pinned to v13 bindings API (cuCtxCreate, cuGLGetDevices signatures)
+]
+dev = [
+    "framepump[test,lint,docs]",
 ]
 
 [project.urls]
 Homepage = "https://github.com/isarandi/framepump"
 Repository = "https://github.com/isarandi/framepump"
+Documentation = "https://framepump.readthedocs.io/"
 Issues = "https://github.com/isarandi/framepump/issues"
+Changelog = "https://github.com/isarandi/framepump/releases"
 Author = "https://istvansarandi.com"
 
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
-write_to = "src/framepump/_version.py"
+version_file = "src/framepump/_version.py"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -51,6 +93,23 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.black]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "--forked"
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+
+[tool.ruff]
 line-length = 99
-skip-string-normalization = true
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"

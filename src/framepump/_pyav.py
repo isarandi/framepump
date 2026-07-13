@@ -32,12 +32,13 @@ class FramePumpError(Exception):
 class VideoDecodeError(FramePumpError):
     """Error during video decoding, typically due to corrupt/truncated data."""
 
-    def __init__(self, path: PathLike, frame_count: int, original_error: Exception):
-        self.path = Path(path)
+    def __init__(self, path, frame_count: int, original_error: Exception):
+        self.path = Path(path) if isinstance(path, (str, Path)) else path
         self.frame_count = frame_count
         self.original_error = original_error
+        name = self.path.name if isinstance(self.path, Path) else '<file-like>'
         msg = (
-            f'Corrupt or truncated video: {self.path.name}\n'
+            f'Corrupt or truncated video: {name}\n'
             f'Decoded {frame_count} frames before encountering invalid data.\n'
             f'Original error: {type(original_error).__name__}: {original_error}'
         )
@@ -56,11 +57,12 @@ class VideoEncodeError(FramePumpError):
         resolution: tuple[int, int] | None = None,
         codec: str | None = None,
     ):
-        self.path = Path(path)
+        self.path = Path(path) if isinstance(path, (str, Path)) else path
         self.frame_count = frame_count
         self.original_error = original_error
         self.resolution = resolution
         self.codec = codec
+        name = self.path.name if isinstance(self.path, Path) else '<file-like>'
 
         # Build informative message
         parts = []
@@ -71,7 +73,7 @@ class VideoEncodeError(FramePumpError):
                 f'(minimum ~145x49 for h264_nvenc)'
             )
         else:
-            parts.append(f'Failed to encode video: {self.path.name}')
+            parts.append(f'Failed to encode video: {name}')
             if resolution:
                 parts.append(f'Resolution: {resolution[0]}x{resolution[1]}')
         if codec:
@@ -84,9 +86,10 @@ class VideoEncodeError(FramePumpError):
 class NoAudioStreamError(FramePumpError):
     """Raised when audio is expected but not found."""
 
-    def __init__(self, path: PathLike):
-        self.path = Path(path)
-        super().__init__(f'No audio stream found in {self.path.name}')
+    def __init__(self, path):
+        self.path = Path(path) if isinstance(path, (str, Path)) else path
+        name = self.path.name if isinstance(self.path, Path) else '<file-like>'
+        super().__init__(f'No audio stream found in {name}')
 
 
 class FilterConfigError(FramePumpError):
@@ -111,43 +114,52 @@ class PyAVReader:
 
     def __init__(
         self,
-        path: PathLike,
+        source,
         gpu: bool | int = False,
     ) -> None:
         """Open video file for reading.
 
         Args:
-            path: Path to video file.
+            source: Path to video file (str or Path), or a seekable file-like
+                object (must support read, seek, tell).
             gpu: False for CPU decoding, True for GPU (CUDA) on default device,
                 or an int to select a specific GPU device ordinal.
         """
-        self.path = Path(path)
+        self._is_fileobj = hasattr(source, 'read')
+
+        if self._is_fileobj:
+            if gpu:
+                raise ValueError(
+                    'GPU decoding requires a filesystem path, not a file-like object')
+            self.path = None
+            self._source = source
+            try:
+                self._container = av.open(source, metadata_errors='surrogateescape')
+            except av.error.FFmpegError as e:
+                raise VideoDecodeError('<file-like>', 0, e) from e
+        else:
+            self.path = Path(source)
+            self._source = source
+            if not self.path.exists():
+                raise FileNotFoundError(f'Video file not found: {source}')
+            if gpu:
+                self._probe_gpu_safety(source)
+            options = {}
+            if gpu:
+                options['hwaccel'] = 'cuda'
+                if type(gpu) is int:
+                    options['hwaccel_device'] = str(gpu)
+            try:
+                self._container = av.open(
+                    str(source), options=options, metadata_errors='surrogateescape')
+            except av.error.FFmpegError as e:
+                raise VideoDecodeError(source, 0, e) from e
+
         self._gpu = gpu
 
-        if not self.path.exists():
-            raise FileNotFoundError(f'Video file not found: {path}')
-
-        # When GPU is requested, probe the file first (without hwaccel) to check
-        # whether CUDA decode is safe. Certain container formats (FLV) and codecs
-        # without CUVID support cause unrecoverable segfaults inside FFmpeg when
-        # opened with hwaccel=cuda.
-        if gpu:
-            self._probe_gpu_safety(path)
-
-        # Open container with optional GPU acceleration
-        options = {}
-        if gpu:
-            options['hwaccel'] = 'cuda'
-            if type(gpu) is int:
-                options['hwaccel_device'] = str(gpu)
-
-        try:
-            self._container = av.open(
-                str(path), options=options, metadata_errors='surrogateescape')
-        except av.error.FFmpegError as e:
-            raise VideoDecodeError(path, 0, e) from e
         if not self._container.streams.video:
-            raise ValueError(f'No video stream found in {path}')
+            raise ValueError(
+                f'No video stream found in {source if not self._is_fileobj else "<file-like>"}')
         self._stream = self._container.streams.video[0]
 
         # Enable multi-threaded decoding (~5x speedup).
@@ -168,7 +180,7 @@ class PyAVReader:
             self._stream.time_base.numerator, self._stream.time_base.denominator
         )
 
-        # Test if seeking is supported (cached)
+        # Test if seeking is supported (cached).
         self._seekable: bool | None = None
         self._current_frame_idx: int = 0  # Track position for non-seekable streams
 
@@ -275,16 +287,24 @@ class PyAVReader:
         if use_threading is None:
             use_threading = self._use_threading
         self._container.close()
-        options = {}
-        if self._gpu:
-            options['hwaccel'] = 'cuda'
-            if type(self._gpu) is int:
-                options['hwaccel_device'] = str(self._gpu)
-        try:
-            self._container = av.open(
-                str(self.path), options=options, metadata_errors='surrogateescape')
-        except av.error.FFmpegError as e:
-            raise VideoDecodeError(self.path, 0, e) from e
+        if self._is_fileobj:
+            self._source.seek(0)
+            try:
+                self._container = av.open(
+                    self._source, metadata_errors='surrogateescape')
+            except av.error.FFmpegError as e:
+                raise VideoDecodeError('<file-like>', 0, e) from e
+        else:
+            options = {}
+            if self._gpu:
+                options['hwaccel'] = 'cuda'
+                if type(self._gpu) is int:
+                    options['hwaccel_device'] = str(self._gpu)
+            try:
+                self._container = av.open(
+                    str(self.path), options=options, metadata_errors='surrogateescape')
+            except av.error.FFmpegError as e:
+                raise VideoDecodeError(self.path, 0, e) from e
         self._stream = self._container.streams.video[0]
         if use_threading:
             self._stream.thread_type = 'AUTO'
@@ -676,14 +696,15 @@ class FrameIndexPyAV:
     safe_seek_pts: list[Fraction]  # Safe seek points in Fraction
     frame_count: int
 
-    def __init__(self, video_path: PathLike, reader: PyAVReader | None = None) -> None:
+    def __init__(self, video_path, reader: PyAVReader | None = None) -> None:
         """Build index from video file using PyAV.
 
         Args:
-            video_path: Path to the video file.
+            video_path: Path to the video file, or a file-like object.
             reader: Optional existing PyAVReader to use (avoids reopening).
         """
-        self.video_path = Path(video_path)
+        self.video_path = (
+            Path(video_path) if isinstance(video_path, (str, Path)) else video_path)
 
         # Use provided reader or create temporary one
         own_reader = reader is None

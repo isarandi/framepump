@@ -47,15 +47,25 @@ class VideoFrames:
 
     def __init__(
         self,
-        video_path: PathLike,
+        video_path,
         dtype: DTypeLike = np.uint8,
         gpu: bool | int = False,
         constant_framerate: Union[bool, float] = False,
+        seekable: bool | None = None,
     ) -> None:
         """Open a video file for lazy frame access.
 
+        Args:
+            video_path: Path to video file (str or Path), or a seekable file-like
+                object (must support read, seek, tell). File-like objects cannot
+                be used with ``gpu=True``.
+            seekable: Whether the video stream supports seeking. ``None``
+                (default) auto-detects by probing. ``True``/``False`` skips the
+                probe, which saves one seek+decode per reader creation.
+
         See class docstring for full parameter descriptions.
         """
+        self._is_fileobj = hasattr(video_path, 'read')
         self.path = video_path
 
         # Create persistent PyAV reader for metadata and decoding
@@ -87,6 +97,10 @@ class VideoFrames:
 
         # Build frame index upfront
         self._index = FrameIndexPyAV(self.path, reader=self._reader)
+
+        # Cache seekable result so new readers don't need to re-probe.
+        # If caller provided an explicit value, use it (skips the probe).
+        self._seekable = seekable if seekable is not None else self._reader.seekable
 
         # Close the reader — it gets reopened lazily in __iter__
         self._reader.close()
@@ -194,7 +208,8 @@ class VideoFrames:
 
     def __repr__(self) -> str:
         h, w = self.imshape
-        return f"VideoFrames('{self.path}', {w}x{h}, {self.fps:.4g} fps, {len(self)} frames)"
+        label = self.path if isinstance(self.path, (str, Path)) else '<file-like>'
+        return f"VideoFrames('{label}', {w}x{h}, {self.fps:.4g} fps, {len(self)} frames)"
 
     @property
     def imshape(self) -> tuple[int, int]:
@@ -245,12 +260,18 @@ class VideoFrames:
         result._target_fps_frac = self._target_fps_frac
         # Share index with clones (read-only, thread-safe)
         result._index = self._index
+        result._is_fileobj = self._is_fileobj
+        result._seekable = self._seekable
         result._reader = None  # Each clone gets its own reader on iteration
         return result
 
     def _create_reader(self) -> PyAVReader:
         """Create a new reader for iteration."""
-        return PyAVReader(self.path, gpu=self.gpu)
+        if self._is_fileobj:
+            self.path.seek(0)
+        reader = PyAVReader(self.path, gpu=self.gpu)
+        reader._seekable = self._seekable
+        return reader
 
     def close(self) -> None:
         """Close the video reader. Call when done with this VideoFrames."""

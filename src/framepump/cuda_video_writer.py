@@ -13,6 +13,7 @@ import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from ctypes import byref, c_uint32, c_void_p
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Union
@@ -301,9 +302,14 @@ class JpegVideoWriterCUDA(AbstractVideoWriter[bytes], AbstractContextManager['Jp
             queue_size: Unused, present for API compatibility with VideoWriter.
             encoder_config: Encoder configuration (crf, preset, bframes, gop).
             gpu: CUDA device ordinal (default 0).
-            chroma: Chroma subsampling override ('420' or '444'). If None,
-                auto-detected from the first JPEG frame.
+            chroma: Target chroma subsampling for 4:4:4 JPEG input: '420' or
+                '422' downsample the chroma planes before encoding; None or
+                '444' keep the source subsampling (4:2:0 input is always
+                encoded as 4:2:0, 4:4:4 input as 4:4:4).
         """
+        if chroma not in (None, '420', '422', '444'):
+            raise ValueError(
+                f"chroma must be None, '420', '422' or '444', got {chroma!r}")
         del queue_size
         self._writer: _CudaSequenceWriter | None = None
         self._accepts_new_frames: bool = False
@@ -403,6 +409,109 @@ class SequenceContext(AbstractContextManager['SequenceContext']):
 
 
 
+@dataclass(frozen=True)
+class _Plane:
+    """One plane inside a GPU buffer: byte offset, row pitch, allocated rows."""
+
+    offset: int
+    pitch: int
+    rows: int
+
+    @property
+    def nbytes(self) -> int:
+        return self.pitch * self.rows
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.nbytes
+
+
+@dataclass(frozen=True)
+class _EncodeBufferLayout:
+    """Byte layout of one NVENC input buffer.
+
+    Plane offsets, pitches and the total size all follow the PADDED encode
+    dimensions: NVENC locates the chroma planes from the registered pitch and
+    encode height, so the decode side must place its output with this exact
+    geometry. The display-sized decode extents live in `_ScratchLayout` and
+    the writer's `_width`/`_height`; mixing up the padded and display
+    families of numbers is what used to corrupt chroma at heights not
+    divisible by 16 (e.g. 1080).
+    """
+
+    buffer_format: int
+    size: int
+    y: _Plane
+    u: _Plane  # the interleaved UV plane for NV16
+    v: _Plane | None  # None for NV16 (V is interleaved into `u`)
+
+
+@dataclass(frozen=True)
+class _ScratchLayout:
+    """Scratch buffer layout for 4:4:4 → 4:2:0/4:2:2 chroma downsampling.
+
+    Holds the full-resolution U/V planes decoded from the JPEG and, for the
+    4:2:2 path, staging planes for the half-width resize before NV16
+    interleaving. Extents here are display-sized on purpose: this buffer is
+    never registered with NVENC.
+    """
+
+    size: int
+    full_u: _Plane
+    full_v: _Plane
+    resized_u: _Plane | None
+    resized_v: _Plane | None
+    chroma_width: int
+    chroma_height: int
+
+
+def _build_encode_layout(
+    enc_width: int, enc_height: int, subsampling: int, downsample_to: str | None
+) -> _EncodeBufferLayout:
+    """Compute the NVENC input buffer layout from the padded encode dimensions."""
+    # Align pitch to 256 bytes for optimal GPU access
+    pitch = ((enc_width + 255) // 256) * 256
+    y = _Plane(0, pitch, enc_height)
+    if subsampling == NVJPEG_CSS_420 or downsample_to == '420':
+        # IYUV: UV pitch must be exactly Y pitch / 2 (NVENC infers it from Y)
+        uv_pitch = pitch // 2
+        u = _Plane(y.end, uv_pitch, enc_height // 2)
+        v = _Plane(u.end, uv_pitch, enc_height // 2)
+        return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_IYUV, v.end, y, u, v)
+    if downsample_to == '422':
+        # NV16: interleaved UV plane with the same pitch and rows as Y
+        uv = _Plane(y.end, pitch, enc_height)
+        return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_NV16, uv.end, y, uv, None)
+    if subsampling == NVJPEG_CSS_444:
+        u = _Plane(y.end, pitch, enc_height)
+        v = _Plane(u.end, pitch, enc_height)
+        return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_YUV444, v.end, y, u, v)
+    raise NvencError(f'Unsupported chroma subsampling: {_css_name(subsampling)}')
+
+
+def _build_scratch_layout(
+    width: int, height: int, y_pitch: int, downsample_to: str
+) -> _ScratchLayout:
+    """Compute the downsample scratch layout from the display dimensions."""
+    full_u = _Plane(0, y_pitch, height)
+    full_v = _Plane(full_u.end, y_pitch, height)
+    chroma_width = width // 2
+    if downsample_to == '422':
+        half_pitch = ((chroma_width + 255) // 256) * 256
+        resized_u = _Plane(full_v.end, half_pitch, height)
+        resized_v = _Plane(resized_u.end, half_pitch, height)
+        return _ScratchLayout(
+            resized_v.end, full_u, full_v, resized_u, resized_v, chroma_width, height)
+    return _ScratchLayout(full_v.end, full_u, full_v, None, None, chroma_width, height // 2)
+
+
+_CSS_NAMES = {0: '4:4:4', 1: '4:2:2', 2: '4:2:0', 3: '4:4:0', 4: '4:1:1', 5: '4:1:0', 6: 'gray'}
+
+
+def _css_name(subsampling: int) -> str:
+    return _CSS_NAMES.get(subsampling, f'unknown ({subsampling})')
+
+
 class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
     """Internal writer: nvJPEG decode (YUV) → NVENC encode via device pointer.
 
@@ -461,8 +570,9 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         # YUV buffers for ping-pong pipeline
         self._yuv_buffers: list[int] = []  # CUdeviceptr list
         self._registered_resources: list = []  # Registered resources
+        self._layout: _EncodeBufferLayout | None = None  # NVENC input buffer layout
+        self._scratch: _ScratchLayout | None = None  # Downsample scratch layout
         self._yuv_pitch = 0  # Y plane pitch (256-byte aligned)
-        self._uv_pitch = 0  # U/V plane pitch (for 4:2:0, half of Y pitch)
         self._subsampling = None  # NVJPEG_CSS_420 or NVJPEG_CSS_444
         self._downsample_to = None  # '420' or '422' when downsampling from 4:4:4
         self._uv_scratch: int = 0  # Scratch buffer for full-res U/V before downsample
@@ -531,48 +641,43 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         # decoders display the original dimensions.
         self._encode_width = ((width + 15) // 16) * 16
         self._encode_height = ((height + 15) // 16) * 16
-        enc_h = self._encode_height
 
-        # Align pitch to 256 bytes for optimal GPU access
-        self._yuv_pitch = ((self._encode_width + 255) // 256) * 256
-
-        if subsampling == NVJPEG_CSS_420 or self._downsample_to == '420':
-            # IYUV layout for NVENC: UV pitch must be exactly Y pitch / 2
-            # (NVENC infers UV pitch from Y pitch for IYUV format)
-            self._uv_pitch = self._yuv_pitch // 2
-            buffer_size = self._yuv_pitch * enc_h + 2 * self._uv_pitch * (enc_h // 2)
-        elif self._downsample_to == '422':
-            # NV16 layout: Y plane (pitch * height) + interleaved UV (pitch * height)
-            # UV pitch = Y pitch (same width as Y, since UV is interleaved: W/2 * 2 = W)
-            self._uv_pitch = self._yuv_pitch
-            buffer_size = self._yuv_pitch * enc_h * 2
-        elif subsampling == NVJPEG_CSS_444:
-            # YUV444 layout: Y (pitch * height) + U (pitch * height) + V (pitch * height)
-            self._uv_pitch = self._yuv_pitch  # Same pitch for all planes
-            buffer_size = self._yuv_pitch * enc_h * 3
-        else:
-            raise NvencError(f'Unsupported chroma subsampling: {subsampling}')
+        self._layout = _build_encode_layout(
+            self._encode_width, self._encode_height, subsampling, self._downsample_to)
+        self._yuv_pitch = self._layout.y.pitch
 
         # Allocate buffers for pipeline (need multiple for B-frame lookahead)
         for i in range(self._num_yuv_buffers):
-            err, devptr = driver.cuMemAlloc(buffer_size)
+            err, devptr = driver.cuMemAlloc(self._layout.size)
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise NvencError(f'Failed to allocate YUV device buffer {i}: {err}')
             self._yuv_buffers.append(int(devptr))
+            self._memset_planes(int(devptr), self._layout)
 
         if self._downsample_to:
-            # Scratch space for full-res U and V planes before downsample,
-            # plus space for two half-width resized planes (for 422 interleave).
-            # Shared across ping-pong buffers (decode stream is serialized).
-            half_pitch = ((width // 2 + 255) // 256) * 256
-            self._scratch_half_pitch = half_pitch
-            scratch_size = self._yuv_pitch * height * 2 + half_pitch * height * 2
-            err, devptr = driver.cuMemAlloc(scratch_size)
+            # Scratch shared across ping-pong buffers (decode stream is serialized)
+            self._scratch = _build_scratch_layout(
+                width, height, self._layout.y.pitch, self._downsample_to)
+            err, devptr = driver.cuMemAlloc(self._scratch.size)
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise NvencError(f'Failed to allocate UV scratch buffer: {err}')
             self._uv_scratch = int(devptr)
             from .npp_bindings import make_npp_stream_context
             self._npp_ctx = make_npp_stream_context(self._gpu)
+
+    @staticmethod
+    def _memset_planes(base: int, layout: _EncodeBufferLayout) -> None:
+        """Define every byte of the buffer: black luma, neutral chroma.
+
+        The padding rows (display height..encode height) get encoded, so they
+        must hold deterministic values rather than uninitialized memory.
+        """
+        for plane, value in ((layout.y, 0), (layout.u, 128), (layout.v, 128)):
+            if plane is None:
+                continue
+            err, = driver.cuMemsetD8(base + plane.offset, value, plane.nbytes)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise NvencError(f'Failed to initialize YUV buffer: {err}')
 
     def _init_nvenc(self, width: int, height: int, subsampling: int) -> None:
         """Initialize NVENC encoder for YUV input."""
@@ -700,27 +805,18 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                     nvenc_status_message(status, f'Failed to create bitstream buffer {i}'))
             self._bitstream_buffers.append(bs_params.bitstreamBuffer)
 
-        # Determine buffer format
-        if self._downsample_to == '422':
-            buffer_format = NV_ENC_BUFFER_FORMAT_NV16
-        elif subsampling == NVJPEG_CSS_420 or self._downsample_to == '420':
-            buffer_format = NV_ENC_BUFFER_FORMAT_IYUV
-        elif subsampling == NVJPEG_CSS_444:
-            buffer_format = NV_ENC_BUFFER_FORMAT_YUV444
-        else:
-            raise NvencError(f'Unsupported chroma subsampling: {subsampling}')
-
-        # Register all YUV buffers with NVENC
+        # Register all YUV buffers with NVENC, using the same layout the
+        # decode side writes with (pitch, padded height, plane format)
         for i, devptr in enumerate(self._yuv_buffers):
             reg = NV_ENC_REGISTER_RESOURCE()
             reg.version = NV_ENC_REGISTER_RESOURCE_VER
             reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR
             reg.width = self._encode_width
             reg.height = self._encode_height
-            reg.pitch = self._yuv_pitch
+            reg.pitch = self._layout.y.pitch
             reg.resourceToRegister = devptr
             reg.bufferUsage = NV_ENC_INPUT_IMAGE
-            reg.bufferFormat = buffer_format
+            reg.bufferFormat = self._layout.buffer_format
 
             status = self._api.nvEncRegisterResource(self._nvenc_encoder, byref(reg))
             if status != NV_ENC_SUCCESS:
@@ -791,11 +887,12 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             self._open()
             self._jpeg_decoder.decode_host()
         else:
-            # Sync BEFORE decode_host: previous frame's decode_transfer is async
-            # and reads from nvJPEG's internal pinned buffer. decode_host overwrites
-            # that buffer, so we must wait for the transfer to complete first.
+            # Wait for the previous frame's async decode to complete: its
+            # buffer is submitted to NVENC below (which reads it right away),
+            # and the phased decoder's slots are recycled every other frame.
             driver.cuStreamSynchronize(self._decode_stream)
-            self._jpeg_decoder.parse(jpeg_data)
+            width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+            self._check_frame_consistent(width, height, subsampling)
             self._jpeg_decoder.decode_host()
 
         buf_idx = self._current_buffer
@@ -812,92 +909,74 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._current_buffer = (buf_idx + 1) % self._num_yuv_buffers
         self._frame_idx += 1
 
+    def _check_frame_consistent(self, width: int, height: int, subsampling: int) -> None:
+        """All frames must match the geometry the GPU buffers were sized for."""
+        if (width, height) != (self._width, self._height):
+            raise ValueError(
+                f'JPEG dimensions {width}x{height} do not match initial frame '
+                f'dimensions {self._width}x{self._height}')
+        if subsampling != self._subsampling:
+            raise ValueError(
+                f'JPEG chroma subsampling {_css_name(subsampling)} does not match '
+                f'initial frame subsampling {_css_name(self._subsampling)}')
+
     def _decode_gpu_into_buffer(self, buf_idx: int) -> None:
         """Transfer + device decode into specified buffer (async on decode stream)."""
-        devptr = self._yuv_buffers[buf_idx]
+        base = self._yuv_buffers[buf_idx]
         stream = int(self._decode_stream)
+        layout = self._layout
 
         # Transfer from pinned buffer to device (async)
         self._jpeg_decoder.decode_transfer(stream)
 
-        # Compute plane pointers based on subsampling
-        if self._subsampling == NVJPEG_CSS_420:
-            # I420 layout: Y, then U (half size), then V (half size)
-            y_ptr = devptr
-            u_ptr = y_ptr + self._yuv_pitch * self._height
-            v_ptr = u_ptr + self._uv_pitch * (self._height // 2)
-            self._jpeg_decoder.decode_device(
-                y_ptr, u_ptr, v_ptr,
-                self._yuv_pitch, self._uv_pitch, self._uv_pitch,
-                stream,
-            )
-        elif self._downsample_to:
+        if self._downsample_to:
             # Decode 4:4:4 JPEG, then downsample U/V chroma.
-            # Y goes directly into encode buffer; U/V go to scratch, then resize.
-            y_ptr = devptr
-            scratch_plane_size = self._yuv_pitch * self._height
-            scratch_u = self._uv_scratch
-            scratch_v = scratch_u + scratch_plane_size
+            # Y goes directly into the encode buffer; U/V go to scratch, then resize.
+            scratch = self._scratch
             self._jpeg_decoder.decode_device(
-                y_ptr, scratch_u, scratch_v,
-                self._yuv_pitch, self._yuv_pitch, self._yuv_pitch,
+                base + layout.y.offset,
+                self._uv_scratch + scratch.full_u.offset,
+                self._uv_scratch + scratch.full_v.offset,
+                layout.y.pitch, scratch.full_u.pitch, scratch.full_v.pitch,
                 stream,
             )
             self._npp_ctx.hStream = stream
             from .npp_bindings import resize_plane_8u
-            chroma_w = self._width // 2
             if self._downsample_to == '420':
-                # 4:2:0: half width, half height → IYUV planar layout
-                chroma_h = self._height // 2
-                dst_u = y_ptr + self._yuv_pitch * self._height
-                dst_v = dst_u + self._uv_pitch * chroma_h
-                resize_plane_8u(
-                    scratch_u, self._yuv_pitch, self._width, self._height,
-                    dst_u, self._uv_pitch, chroma_w, chroma_h,
-                    ctx=self._npp_ctx,
-                )
-                resize_plane_8u(
-                    scratch_v, self._yuv_pitch, self._width, self._height,
-                    dst_v, self._uv_pitch, chroma_w, chroma_h,
-                    ctx=self._npp_ctx,
-                )
-            else:  # '422'
-                # 4:2:2: half width, full height → NV16 semi-planar layout
-                chroma_h = self._height
-                hp = self._scratch_half_pitch
-                # Resize into separate area after full-res scratch
-                resized_base = self._uv_scratch + scratch_plane_size * 2
-                resized_u = resized_base
-                resized_v = resized_base + hp * chroma_h
-                resize_plane_8u(
-                    scratch_u, self._yuv_pitch, self._width, self._height,
-                    resized_u, hp, chroma_w, chroma_h,
-                    ctx=self._npp_ctx,
-                )
-                resize_plane_8u(
-                    scratch_v, self._yuv_pitch, self._width, self._height,
-                    resized_v, hp, chroma_w, chroma_h,
-                    ctx=self._npp_ctx,
-                )
-                # Interleave U and V into NV16 UV plane
-                uv_ptr = y_ptr + self._yuv_pitch * self._height
+                # Half width, half height, straight into the IYUV chroma planes
+                for src, dst in ((scratch.full_u, layout.u), (scratch.full_v, layout.v)):
+                    resize_plane_8u(
+                        self._uv_scratch + src.offset, src.pitch, self._width, self._height,
+                        base + dst.offset, dst.pitch,
+                        scratch.chroma_width, scratch.chroma_height,
+                        ctx=self._npp_ctx,
+                    )
+            else:  # '422': half width, full height, staged then interleaved into NV16
+                for src, dst in (
+                    (scratch.full_u, scratch.resized_u),
+                    (scratch.full_v, scratch.resized_v),
+                ):
+                    resize_plane_8u(
+                        self._uv_scratch + src.offset, src.pitch, self._width, self._height,
+                        self._uv_scratch + dst.offset, dst.pitch,
+                        scratch.chroma_width, scratch.chroma_height,
+                        ctx=self._npp_ctx,
+                    )
                 from .npp_bindings import interleave_uv
                 interleave_uv(
-                    resized_u, hp,
-                    resized_v, hp,
-                    uv_ptr, self._uv_pitch,
-                    chroma_w, chroma_h,
+                    self._uv_scratch + scratch.resized_u.offset, scratch.resized_u.pitch,
+                    self._uv_scratch + scratch.resized_v.offset, scratch.resized_v.pitch,
+                    base + layout.u.offset, layout.u.pitch,
+                    scratch.chroma_width, scratch.chroma_height,
                     stream=stream,
                 )
-        else:  # NVJPEG_CSS_444 (native)
-            # YUV444 layout: Y, U, V all same size
-            plane_size = self._yuv_pitch * self._height
-            y_ptr = devptr
-            u_ptr = y_ptr + plane_size
-            v_ptr = u_ptr + plane_size
+        else:
+            # Native 4:2:0 or 4:4:4: decode straight into the encode buffer planes
             self._jpeg_decoder.decode_device(
-                y_ptr, u_ptr, v_ptr,
-                self._yuv_pitch, self._yuv_pitch, self._yuv_pitch,
+                base + layout.y.offset,
+                base + layout.u.offset,
+                base + layout.v.offset,
+                layout.y.pitch, layout.u.pitch, layout.v.pitch,
                 stream,
             )
 
@@ -1074,12 +1153,21 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             return
         self._closed = True
 
-        self._cleanup_resources()
-        if self._temp_file is not None:
-            self._temp_file.cleanup()
+        try:
+            self._cleanup_resources()
+        finally:
+            if self._temp_file is not None:
+                self._temp_file.cleanup()
+                self._temp_file = None
 
     def _cleanup_gpu_resources(self) -> None:
         """Release all GPU resources (CUDA, nvJPEG, NVENC)."""
+        # An aborted write can still have an async decode in flight;
+        # cuStreamDestroy does not wait for queued work, so synchronize before
+        # freeing the buffers and nvJPEG state that the decode writes to.
+        if self._decode_stream:
+            driver.cuStreamSynchronize(self._decode_stream)
+
         # Clean up NVENC
         if self._nvenc_encoder:
             for reg_resource in self._registered_resources:

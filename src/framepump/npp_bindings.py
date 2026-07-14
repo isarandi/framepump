@@ -513,23 +513,29 @@ $done: ret;
 }
 '''
 
-_interleave_module = None
-_interleave_func = None
+# CUmodule/CUfunction handles are only valid inside the context they were
+# loaded in, so the cache is keyed by the current context. A plain global
+# handle would go stale once that context is destroyed (e.g. between two
+# sequentially used writers in one process).
+_interleave_funcs: dict[int, object] = {}
 
 
 def _get_interleave_func():
-    global _interleave_module, _interleave_func
-    if _interleave_func is None:
-        from cuda.bindings import driver
+    from cuda.bindings import driver
+    err, ctx = driver.cuCtxGetCurrent()
+    if err != driver.CUresult.CUDA_SUCCESS or ctx is None or int(ctx) == 0:
+        raise RuntimeError('interleave_uv requires a current CUDA context')
+    key = int(ctx)
+    func = _interleave_funcs.get(key)
+    if func is None:
         err, mod = driver.cuModuleLoadData(_INTERLEAVE_UV_PTX)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'Failed to load interleave PTX: {err}')
-        _interleave_module = mod
         err, func = driver.cuModuleGetFunction(mod, b'interleave_uv')
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'Failed to get interleave_uv function: {err}')
-        _interleave_func = func
-    return _interleave_func
+        _interleave_funcs[key] = func
+    return func
 
 
 def interleave_uv(

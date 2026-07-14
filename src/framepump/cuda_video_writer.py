@@ -8,48 +8,30 @@ nvJPEG decodes directly into NVENC-registered device buffer - no GPU copies.
 
 from __future__ import annotations
 
-import ctypes
-import os
-from collections.abc import Iterator
 from contextlib import AbstractContextManager
-from ctypes import byref, c_uint32, c_void_p
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Union
 
-import av
 import simplepyutils as spu
 from cuda.bindings import driver
 
 from ._cuda_compat import cuCtxCreate
-from ._temp_file import TempFile
+from ._h264_mux import H264PassthroughMuxer
 from .encoder_config import EncoderConfig
-from .video_writing import VideoOutput
-from .nvenc.bindings import (GUID, NVENCAPI_VERSION, NV_ENC_BUFFER_FORMAT_IYUV,
-                             NV_ENC_BUFFER_FORMAT_NV16, NV_ENC_BUFFER_FORMAT_YUV444,
-                             NV_ENC_CODEC_H264_GUID, NV_ENC_CONFIG,
-                             NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER,
-                             NV_ENC_CREATE_BITSTREAM_BUFFER_VER, NV_ENC_DEVICE_TYPE_CUDA,
-                             NV_ENC_ERR_NEED_MORE_INPUT,
+from .nvenc._session import NvencEncodeSession
+from .nvenc.bindings import (NV_ENC_BUFFER_FORMAT_IYUV, NV_ENC_BUFFER_FORMAT_NV16,
+                             NV_ENC_BUFFER_FORMAT_YUV444, NV_ENC_DEVICE_TYPE_CUDA,
                              NV_ENC_H264_PROFILE_HIGH_422_GUID,
-                             NV_ENC_H264_PROFILE_HIGH_444_GUID,
-                             NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER,
-                             NV_ENC_INPUT_IMAGE, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                             NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER,
-                             NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER,
-                             NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
-                             NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_PIC_FLAG_EOS,
-                             NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT_FRAME,
-                             NV_ENC_PIC_TYPE_IDR, NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER,
-                             NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY,
-                             NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER,
-                             NV_ENC_SUCCESS, NvencAPI)
-from .nvenc.exceptions import NvencError, nvenc_status_message
-from .nvenc.presets import DEFAULT_PRESET
+                             NV_ENC_H264_PROFILE_HIGH_444_GUID, NV_ENC_INPUT_IMAGE,
+                             NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+                             NV_ENC_PARAMS_RC_CONSTQP, NV_ENC_REGISTER_RESOURCE,
+                             NV_ENC_REGISTER_RESOURCE_VER)
+from .nvenc.exceptions import NvencError
 from .nvjpeg import NvjpegPhasedDecoder
 from .nvjpeg.bindings import NVJPEG_CSS_420, NVJPEG_CSS_444
-from .video_writing import AbstractVideoWriter
+from .video_writing import AbstractVideoWriter, VideoOutput
 
 PathLike = Union[str, Path]
 
@@ -276,6 +258,9 @@ class JpegVideoWriterCUDA(AbstractVideoWriter[bytes], AbstractContextManager['Jp
 
     Decodes JPEG to YUV420 on GPU with nvJPEG and encodes with NVENC using
     the IYUV (I420) format - all without CPU-GPU data transfers.
+
+    Ending a sequence to which no frame was written is a no-op: no output
+    file is created.
 
     Example:
         >>> with JpegVideoWriterCUDA('output.mp4', fps=30) as writer:
@@ -535,44 +520,33 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._encoder_config = encoder_config if encoder_config is not None else EncoderConfig()
         self._gpu = gpu
         self._target_chroma = chroma  # None/'native', '420', or '422'
+        self._video_output = video_output
+        self._format = format
 
-        # Determine output mode: file-like or path
-        if isinstance(video_output, (str, Path)):
-            self._temp_file = TempFile(video_output)
-            self._file_output = None
-            self._format = format or Path(video_output).suffix.lstrip('.')
-        else:
-            # File-like object
-            self._temp_file = None
-            self._file_output = video_output
-            if format is None:
-                raise ValueError("format is required when writing to a file-like object")
-            self._format = format
+        if not isinstance(video_output, (str, Path)) and format is None:
+            raise ValueError('format is required when writing to a file-like object')
 
-        # State initialized on first frame
-        self._output_container: av.container.OutputContainer | None = None
-        self._audio_input_container: av.container.InputContainer | None = None
-        self._video_stream: av.stream.Stream | None = None
-        self._audio_stream: av.stream.Stream | None = None
-        self._audio_time_base: Fraction = Fraction(1)
-        self._audio_pkts: Iterator[av.Packet] = iter([])
-        self._audio_putback: av.Packet | None = None
+        # Muxer created on first frame, once the frame geometry is known
+        self._muxer: H264PassthroughMuxer | None = None
 
         # CUDA/NVENC state
         self._cuda_ctx = None
         self._owns_cuda_ctx = False
         self._jpeg_decoder: NvjpegPhasedDecoder | None = None
-        self._api = None
-        self._nvenc_encoder = None
+        self._session: NvencEncodeSession | None = None
         self._width = 0
         self._height = 0
+        self._encode_width = 0
+        self._encode_height = 0
+        self._sps_crop_right = 0
+        self._sps_crop_bottom = 0
 
-        # YUV buffers for ping-pong pipeline
+        # YUV input ring: decode targets that double as NVENC input buffers
         self._yuv_buffers: list[int] = []  # CUdeviceptr list
-        self._registered_resources: list = []  # Registered resources
+        self._registered: list = []  # NVENC registered-resource handles
+        self._num_yuv_buffers = 0  # Set from the session's ring size
         self._layout: _EncodeBufferLayout | None = None  # NVENC input buffer layout
         self._scratch: _ScratchLayout | None = None  # Downsample scratch layout
-        self._yuv_pitch = 0  # Y plane pitch (256-byte aligned)
         self._subsampling = None  # NVJPEG_CSS_420 or NVJPEG_CSS_444
         self._downsample_to = None  # '420' or '422' when downsampling from 4:4:4
         self._uv_scratch: int = 0  # Scratch buffer for full-res U/V before downsample
@@ -581,18 +555,6 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
 
         # CUDA stream for async GPU decode (transfer + device)
         self._decode_stream = None
-
-        # YUV buffers for decode pipeline (ping-pong)
-        self._num_yuv_buffers = 2
-
-        # Multiple bitstream buffers — sized in _init_nvenc after config is known
-        self._num_buffers = 0
-        self._bitstream_buffers: list = []
-        self._next_submit_buffer = 0  # Next buffer to use for encoding
-        self._next_read_buffer = 0  # Next buffer to read output from (in submission order)
-
-        # Incremental muxing state
-        self._next_dts = 0  # DTS counter for decode-order muxing
 
         self._frame_idx = 0
         self._closed = False
@@ -625,8 +587,8 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 self._cuda_ctx = None
             raise NvencError(f'Failed to create decode stream: {err}')
 
-    def _alloc_buffers(self, width: int, height: int, subsampling: int) -> None:
-        """Allocate two GPU buffers for pipeline (ping-pong)."""
+    def _prepare_layouts(self, width: int, height: int, subsampling: int) -> None:
+        """Fix the frame geometry and compute the GPU buffer layouts."""
         self._width = width
         self._height = height
         self._subsampling = subsampling
@@ -644,9 +606,20 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
 
         self._layout = _build_encode_layout(
             self._encode_width, self._encode_height, subsampling, self._downsample_to)
-        self._yuv_pitch = self._layout.y.pitch
+        if self._downsample_to:
+            self._scratch = _build_scratch_layout(
+                width, height, self._layout.y.pitch, self._downsample_to)
 
-        # Allocate buffers for pipeline (need multiple for B-frame lookahead)
+    def _alloc_buffers(self) -> None:
+        """Allocate the YUV input ring plus downsample scratch space.
+
+        The ring size comes from the encode session: NVENC may hold that many
+        submitted inputs before producing output, and the decode target for
+        the next frame occupies exactly the session's one slot of headroom,
+        so the session requirement and the decode-pipeline requirement
+        coincide.
+        """
+        self._num_yuv_buffers = self._session.ring_size
         for i in range(self._num_yuv_buffers):
             err, devptr = driver.cuMemAlloc(self._layout.size)
             if err != driver.CUresult.CUDA_SUCCESS:
@@ -655,9 +628,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             self._memset_planes(int(devptr), self._layout)
 
         if self._downsample_to:
-            # Scratch shared across ping-pong buffers (decode stream is serialized)
-            self._scratch = _build_scratch_layout(
-                width, height, self._layout.y.pitch, self._downsample_to)
+            # Scratch shared across ring buffers (decode stream is serialized)
             err, devptr = driver.cuMemAlloc(self._scratch.size)
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise NvencError(f'Failed to allocate UV scratch buffer: {err}')
@@ -679,135 +650,82 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise NvencError(f'Failed to initialize YUV buffer: {err}')
 
-    def _init_nvenc(self, width: int, height: int, subsampling: int) -> None:
-        """Initialize NVENC encoder for YUV input."""
-        self._api = NvencAPI()
+    def _init_session(self) -> None:
+        """Open the NVENC encode session, customized for JPEG-decoded YUV input."""
+        if self._downsample_to == '422':
+            chroma_idc = 2
+        elif self._subsampling == NVJPEG_CSS_444 and not self._downsample_to:
+            chroma_idc = 3
+        else:
+            chroma_idc = 1
+        self._compute_sps_crop(chroma_idc)
 
-        # Open session
-        params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS()
-        params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER
-        params.deviceType = NV_ENC_DEVICE_TYPE_CUDA
-        params.device = int(self._cuda_ctx)
-        params.apiVersion = NVENCAPI_VERSION
+        qp = self._encoder_config.crf
 
-        encoder = c_void_p()
-        status = self._api.nvEncOpenEncodeSessionEx(byref(params), byref(encoder))
-        if status != NV_ENC_SUCCESS:
-            raise NvencError(nvenc_status_message(status, 'Failed to open encode session'))
-        self._nvenc_encoder = encoder
+        def tune(config) -> None:
+            # CONSTQP mode - pure quality control, no bitrate targets needed.
+            # B-frames use higher QP (factor 1.25 + offset 1.25, like FFmpeg default)
+            config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP
+            config.rcParams.constQP.qpIntra = qp
+            config.rcParams.constQP.qpInterP = qp
+            config.rcParams.constQP.qpInterB = int(qp * 1.25 + 1.25 + 0.5)
+            h264 = config.encodeCodecConfig.h264Config
+            if chroma_idc == 2:
+                config.profileGUID = NV_ENC_H264_PROFILE_HIGH_422_GUID
+                h264.chromaFormatIDC = 2
+            elif chroma_idc == 3:
+                config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID
+                h264.chromaFormatIDC = 3
+            # Signal full-range BT.601 YUV (what JPEG uses), not TV range
+            vui = h264.h264VUIParameters
+            vui.videoSignalTypePresentFlag = 1
+            vui.videoFullRangeFlag = 1
+            vui.colourDescriptionPresentFlag = 1
+            vui.colourPrimaries = 6  # SMPTE 170M (BT.601)
+            vui.transferCharacteristics = 6
+            vui.colourMatrix = 6
 
-        codec_guid = NV_ENC_CODEC_H264_GUID
-        preset_guid = NV_ENC_PRESET_P4_GUID
-
-        # Get preset config (use Ex version with tuning info for P1-P7 presets)
-        preset_config = NV_ENC_PRESET_CONFIG()
-        preset_config.version = NV_ENC_PRESET_CONFIG_VER
-        preset_config.presetCfg.version = NV_ENC_CONFIG_VER
-        self._api.nvEncGetEncodePresetConfigEx(
-            self._nvenc_encoder, codec_guid, preset_guid,
-            NV_ENC_TUNING_INFO_HIGH_QUALITY, byref(preset_config)
+        self._session = NvencEncodeSession(
+            device_type=NV_ENC_DEVICE_TYPE_CUDA,
+            device=int(self._cuda_ctx),
+            width=self._encode_width,
+            height=self._encode_height,
+            fps=self._fps_frac,
+            crf=qp,
+            gop=self._encoder_config.gop,
+            bframes=self._encoder_config.bframes,
+            dar_size=(self._width, self._height),
+            tune_config=tune,
         )
 
-        # Configure
-        config = NV_ENC_CONFIG()
-        ctypes.memmove(byref(config), byref(preset_config.presetCfg), ctypes.sizeof(NV_ENC_CONFIG))
-        config.version = NV_ENC_CONFIG_VER
-        config.gopLength = self._encoder_config.gop
-        config.frameIntervalP = self._encoder_config.bframes + 1
-        # CONSTQP mode - pure quality control, no bitrate targets needed
-        # QP directly controls quantization (lower = higher quality)
-        # B-frames use higher QP (factor 1.25 + offset 1.25, like FFmpeg default)
-        from .nvenc.bindings import NV_ENC_PARAMS_RC_CONSTQP
-        config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP
-        qp = self._encoder_config.crf
-        config.rcParams.constQP.qpIntra = qp
-        config.rcParams.constQP.qpInterP = qp
-        config.rcParams.constQP.qpInterB = int(qp * 1.25 + 1.25 + 0.5)
-
-        # Set chroma format and profile for H.264
-        if self._downsample_to == '422':
-            config.profileGUID = NV_ENC_H264_PROFILE_HIGH_422_GUID
-            config.encodeCodecConfig.h264Config.chromaFormatIDC = 2
-        elif subsampling == NVJPEG_CSS_444 and not self._downsample_to:
-            config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID
-            config.encodeCodecConfig.h264Config.chromaFormatIDC = 3
-
-        # Signal full-range YUV (JPEG uses full range 0-255, not TV range 16-235)
-        h264_vui = config.encodeCodecConfig.h264Config.h264VUIParameters
-        h264_vui.videoSignalTypePresentFlag = 1  # Enable video signal type info
-        h264_vui.videoFullRangeFlag = 1  # Full range (0-255) not TV range (16-235)
-        # Signal BT.601 color space (JPEG standard uses BT.601 matrix coefficients)
-        h264_vui.colourDescriptionPresentFlag = 1
-        h264_vui.colourPrimaries = 6          # SMPTE 170M (BT.601)
-        h264_vui.transferCharacteristics = 6   # SMPTE 170M (BT.601)
-        h264_vui.colourMatrix = 6              # SMPTE 170M (BT.601)
-
-        # Initialize encoder
-        init_params = NV_ENC_INITIALIZE_PARAMS()
-        init_params.version = NV_ENC_INITIALIZE_PARAMS_VER
-        init_params.encodeGUID = codec_guid
-        init_params.presetGUID = preset_guid
-        init_params.encodeWidth = self._encode_width
-        init_params.encodeHeight = self._encode_height
-        init_params.darWidth = self._width
-        init_params.darHeight = self._height
-
-        # Compute SPS crop offsets (in crop units, not pixels)
+    def _compute_sps_crop(self, chroma_idc: int) -> None:
+        """Compute SPS crop offsets (in crop units, not pixels)."""
         dw = self._encode_width - self._width
         dh = self._encode_height - self._height
-        if dw or dh:
-            # CropUnitX/Y depend on chroma_format_idc (progressive: frame_mbs_only=1)
-            chroma_idc = config.encodeCodecConfig.h264Config.chromaFormatIDC
-            cu_x = 1 if chroma_idc == 3 else 2  # 444→1, 420/422→2
-            cu_y = 2 if chroma_idc == 1 else 1   # 420→2, 422/444→1
-            if dw % cu_x or dh % cu_y:
-                fmt = ['', '4:2:0', '4:2:2', '4:4:4'][chroma_idc]
-                need_even_w = cu_x > 1
-                need_even_h = cu_y > 1
-                parts = []
-                if need_even_w and self._width % 2:
-                    parts.append(f'width={self._width} (must be even)')
-                if need_even_h and self._height % 2:
-                    parts.append(f'height={self._height} (must be even)')
-                raise ValueError(
-                    f'H.264 {fmt} requires even {" and ".join(parts)} — '
-                    f'cannot represent exact dimensions {self._width}x{self._height}')
-            self._sps_crop_right = dw // cu_x
-            self._sps_crop_bottom = dh // cu_y
-        else:
+        if not (dw or dh):
             self._sps_crop_right = 0
             self._sps_crop_bottom = 0
-        init_params.frameRateNum = self._fps_frac.numerator
-        init_params.frameRateDen = self._fps_frac.denominator
-        init_params.enableEncodeAsync = 0
-        init_params.enablePTD = 1
-        init_params.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY
-        init_params.encodeConfig = ctypes.pointer(config)
+            return
 
-        status = self._api.nvEncInitializeEncoder(self._nvenc_encoder, byref(init_params))
-        if status != NV_ENC_SUCCESS:
-            raise NvencError(nvenc_status_message(status, 'Failed to initialize encoder'))
+        # CropUnitX/Y depend on chroma_format_idc (progressive: frame_mbs_only=1)
+        cu_x = 1 if chroma_idc == 3 else 2  # 444→1, 420/422→2
+        cu_y = 2 if chroma_idc == 1 else 1  # 420→2, 422/444→1
+        if dw % cu_x or dh % cu_y:
+            fmt = ['', '4:2:0', '4:2:2', '4:4:4'][chroma_idc]
+            parts = []
+            if cu_x > 1 and self._width % 2:
+                parts.append(f'width={self._width} (must be even)')
+            if cu_y > 1 and self._height % 2:
+                parts.append(f'height={self._height} (must be even)')
+            raise ValueError(
+                f'H.264 {fmt} requires even {" and ".join(parts)} — '
+                f'cannot represent exact dimensions {self._width}x{self._height}')
+        self._sps_crop_right = dw // cu_x
+        self._sps_crop_bottom = dh // cu_y
 
-        # Compute exact bitstream buffer count from finalized config.
-        # NVENC holds at most (frameIntervalP - 1 + lookaheadDepth) frames
-        # before producing output. We need one extra since we submit before
-        # reading, so the maximum in-flight count is frameIntervalP + lookahead.
-        enable_lookahead = (config.rcParams.rcFlags >> 5) & 1
-        lookahead = config.rcParams.lookaheadDepth if enable_lookahead else 0
-        self._num_buffers = config.frameIntervalP + lookahead
-
-        for i in range(self._num_buffers):
-            bs_params = NV_ENC_CREATE_BITSTREAM_BUFFER()
-            bs_params.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER
-            status = self._api.nvEncCreateBitstreamBuffer(self._nvenc_encoder, byref(bs_params))
-            if status != NV_ENC_SUCCESS:
-                raise NvencError(
-                    nvenc_status_message(status, f'Failed to create bitstream buffer {i}'))
-            self._bitstream_buffers.append(bs_params.bitstreamBuffer)
-
-        # Register all YUV buffers with NVENC, using the same layout the
-        # decode side writes with (pitch, padded height, plane format)
-        for i, devptr in enumerate(self._yuv_buffers):
+    def _register_buffers(self) -> None:
+        """Register the YUV ring with NVENC, using the decode side's layout."""
+        for devptr in self._yuv_buffers:
             reg = NV_ENC_REGISTER_RESOURCE()
             reg.version = NV_ENC_REGISTER_RESOURCE_VER
             reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR
@@ -817,54 +735,28 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             reg.resourceToRegister = devptr
             reg.bufferUsage = NV_ENC_INPUT_IMAGE
             reg.bufferFormat = self._layout.buffer_format
-
-            status = self._api.nvEncRegisterResource(self._nvenc_encoder, byref(reg))
-            if status != NV_ENC_SUCCESS:
-                raise NvencError(
-                    nvenc_status_message(status, f'Failed to register YUV resource {i}'))
-            self._registered_resources.append(reg.registeredResource)
+            self._registered.append(self._session.register_input(reg))
 
     def _open(self) -> None:
-        """Open output container."""
-        # Start DTS negative to ensure dts <= pts; negative_cts_offsets avoids edit list
-        self._next_dts = -self._encoder_config.bframes
-
-        muxer_options = {'movflags': 'negative_cts_offsets', 'use_editlist': '0'}
-        if self._temp_file is not None:
-            self._output_container = av.open(
-                os.fspath(self._temp_file.temp_path), 'w', format=self._format,
-                options=muxer_options)
-        else:
-            self._output_container = av.open(
-                self._file_output, 'w', format=self._format, options=muxer_options)
-
-        self._video_stream = self._output_container.add_stream('h264', rate=self._fps_frac)
-        self._video_stream.width = self._encode_width
-        self._video_stream.height = self._encode_height
+        """Create the output muxer, once the frame geometry is known."""
         if self._downsample_to == '422':
-            self._video_stream.pix_fmt = 'yuv422p'
+            pix_fmt = 'yuv422p'
         elif self._subsampling == NVJPEG_CSS_444 and not self._downsample_to:
-            self._video_stream.pix_fmt = 'yuv444p'
+            pix_fmt = 'yuv444p'
         else:
-            self._video_stream.pix_fmt = 'yuv420p'
-        self._video_stream.codec_context.options = {'strict': 'experimental'}
+            pix_fmt = 'yuv420p'
 
-        # Audio setup
-        if self._audio_source_path is not None:
-            try:
-                self._audio_input_container = av.open(str(self._audio_source_path))
-                if self._audio_input_container.streams.audio:
-                    src_audio = self._audio_input_container.streams.audio[0]
-                    self._audio_stream = self._output_container.add_stream(template=src_audio)
-                    self._audio_time_base = src_audio.time_base
-                    self._audio_pkts = (
-                        pkt for pkt in self._audio_input_container.demux(src_audio)
-                        if pkt.dts is not None
-                    )
-            except Exception:
-                if self._audio_input_container:
-                    self._audio_input_container.close()
-                self._audio_input_container = None
+        self._muxer = H264PassthroughMuxer(
+            self._video_output,
+            fps=self._fps_frac,
+            width=self._encode_width,
+            height=self._encode_height,
+            bframes=self._encoder_config.bframes,
+            pix_fmt=pix_fmt,
+            audio_source_path=self._audio_source_path,
+            format=self._format,
+            stream_options={'strict': 'experimental'},
+        )
 
     def write_jpeg(self, jpeg_data: bytes) -> None:
         """Decode JPEG and encode to video using pipelined GPU processing.
@@ -882,8 +774,10 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             self._init_cuda()
             self._jpeg_decoder = NvjpegPhasedDecoder(gpu=None)
             width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
-            self._alloc_buffers(width, height, subsampling)
-            self._init_nvenc(width, height, subsampling)
+            self._prepare_layouts(width, height, subsampling)
+            self._init_session()
+            self._alloc_buffers()
+            self._register_buffers()
             self._open()
             self._jpeg_decoder.decode_host()
         else:
@@ -981,184 +875,63 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             )
 
     def _encode_buffer(self, buf_idx: int) -> None:
-        """Encode frame. When output is ready, read all pending buffers in submission order."""
-        bs_idx, need_more = self._submit_frame_for_encoding(buf_idx)
+        """Submit a decoded YUV buffer to NVENC and mux whatever output is ready."""
+        packets = self._session.submit(
+            self._registered[buf_idx],
+            width=self._encode_width,
+            height=self._encode_height,
+            pitch=self._layout.y.pitch,
+        )
+        self._mux_packets(packets)
 
-        if not need_more:
-            # Output is ready - read all buffers in submission order up to and including this one
-            while self._next_read_buffer <= bs_idx:
-                self._read_bitstream_buffer(self._next_read_buffer)
-                self._next_read_buffer += 1
-
-    def _submit_frame_for_encoding(self, buf_idx: int) -> tuple[int, bool]:
-        """Submit YUV buffer to NVENC. Returns (bitstream_buffer_idx, need_more_input)."""
-        # Assign a bitstream buffer (use frame index for simpler tracking)
-        bs_idx = self._next_submit_buffer
-        self._next_submit_buffer += 1
-        output_buffer = self._bitstream_buffers[bs_idx % self._num_buffers]
-
-        # Map the resource for the specified buffer
-        map_params = NV_ENC_MAP_INPUT_RESOURCE()
-        map_params.version = NV_ENC_MAP_INPUT_RESOURCE_VER
-        map_params.registeredResource = self._registered_resources[buf_idx]
-
-        status = self._api.nvEncMapInputResource(self._nvenc_encoder, byref(map_params))
-        if status != NV_ENC_SUCCESS:
-            raise NvencError(nvenc_status_message(status, 'Failed to map resource'))
-
-        mapped_resource = map_params.mappedResource
-        mapped_format = map_params.mappedBufferFmt
-
-        encode_frame_idx = self._frame_idx - 1  # We're encoding the previous frame
-
-        try:
-            pic_params = NV_ENC_PIC_PARAMS()
-            pic_params.version = NV_ENC_PIC_PARAMS_VER
-            pic_params.inputWidth = self._encode_width
-            pic_params.inputHeight = self._encode_height
-            pic_params.inputPitch = self._yuv_pitch
-            pic_params.inputBuffer = mapped_resource
-            pic_params.outputBitstream = output_buffer
-            pic_params.bufferFmt = mapped_format
-            pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME
-            pic_params.frameIdx = encode_frame_idx
-            pic_params.inputTimeStamp = encode_frame_idx
-
-            status = self._api.nvEncEncodePicture(self._nvenc_encoder, byref(pic_params))
-            if status != NV_ENC_SUCCESS and status != NV_ENC_ERR_NEED_MORE_INPUT:
-                raise NvencError(
-                    nvenc_status_message(status, f'Failed to encode frame {encode_frame_idx}'))
-            need_more_input = (status == NV_ENC_ERR_NEED_MORE_INPUT)
-        finally:
-            self._api.nvEncUnmapInputResource(self._nvenc_encoder, mapped_resource)
-
-        return bs_idx, need_more_input
-
-    def _read_bitstream_buffer(self, bs_idx: int) -> None:
-        """Read encoded data from bitstream buffer and mux immediately."""
-        output_buffer = self._bitstream_buffers[bs_idx % self._num_buffers]
-
-        lock_bs = NV_ENC_LOCK_BITSTREAM()
-        lock_bs.version = NV_ENC_LOCK_BITSTREAM_VER
-        lock_bs.outputBitstream = output_buffer
-        lock_bs.doNotWait = 0
-
-        status = self._api.nvEncLockBitstream(self._nvenc_encoder, byref(lock_bs))
-        if status != NV_ENC_SUCCESS:
-            raise NvencError(
-                f'nvEncLockBitstream failed: {nvenc_status_message(status)}'
-            )
-
-        try:
-            if lock_bs.bitstreamSizeInBytes > 0:
-                data = ctypes.string_at(lock_bs.bitstreamBufferPtr, lock_bs.bitstreamSizeInBytes)
-                nvenc_pts = lock_bs.outputTimeStamp  # NVENC's assigned display timestamp
-                is_keyframe = lock_bs.pictureType == NV_ENC_PIC_TYPE_IDR
-
-                # Rewrite SPS NALs to add frame_cropping_rect if dimensions
-                # were padded to macroblock alignment (only IDR packets have SPS)
-                if is_keyframe and (self._sps_crop_right or self._sps_crop_bottom):
-                    data = _patch_sps_crop(
-                        data, self._sps_crop_right, self._sps_crop_bottom)
-
-                # Compute video time for audio interleaving
-                video_time = self._next_dts / self._fps_frac
-
-                # Interleave: write audio packets up to current video time
-                if (self._audio_putback is not None
-                        and self._audio_putback.dts * self._audio_time_base <= video_time):
-                    self._audio_putback.stream = self._audio_stream
-                    self._output_container.mux(self._audio_putback)
-                    self._audio_putback = None
-                if self._audio_putback is None:
-                    for audio_pkt in self._audio_pkts:
-                        if audio_pkt.dts * self._audio_time_base > video_time:
-                            self._audio_putback = audio_pkt
-                            break
-                        audio_pkt.stream = self._audio_stream
-                        self._output_container.mux(audio_pkt)
-
-                # Mux video packet immediately
-                packet = av.Packet(data)
-                packet.stream = self._video_stream
-                packet.pts = nvenc_pts
-                packet.dts = self._next_dts
-                packet.time_base = 1 / self._fps_frac
-                packet.is_keyframe = is_keyframe
-                self._output_container.mux(packet)
-
-                self._next_dts += 1
-        finally:
-            self._api.nvEncUnlockBitstream(self._nvenc_encoder, output_buffer)
-
-    def _flush_encoder(self) -> None:
-        """Flush remaining B-frames after EOS."""
-        if self._nvenc_encoder is None:
-            return
-
-        # Send EOS to signal end of input
-        pic_params = NV_ENC_PIC_PARAMS()
-        pic_params.version = NV_ENC_PIC_PARAMS_VER
-        pic_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS
-        self._api.nvEncEncodePicture(self._nvenc_encoder, byref(pic_params))
-
-        # After EOS, read all remaining buffers in submission order
-        while self._next_read_buffer < self._next_submit_buffer:
-            self._read_bitstream_buffer(self._next_read_buffer)
-            self._next_read_buffer += 1
+    def _mux_packets(self, packets) -> None:
+        for packet in packets:
+            # Rewrite SPS NALs to add frame_cropping_rect if dimensions were
+            # padded to macroblock alignment (only IDR packets carry SPS)
+            if packet.is_keyframe and (self._sps_crop_right or self._sps_crop_bottom):
+                packet.data = _patch_sps_crop(
+                    packet.data, self._sps_crop_right, self._sps_crop_bottom)
+            self._muxer.mux(packet)
 
     def close(self) -> None:
-        """Flush encoder, close containers, release all resources."""
+        """Encode the last frame, flush, finalize the output, free GPU state.
+
+        On error, the output is discarded (no file at the final path) and the
+        error propagates. If no frame was written, no file is created.
+        """
         if self._closed:
             return
         self._closed = True
 
-        if self._output_container is not None:
-            try:
+        try:
+            if self._muxer is not None:
                 # Encode the last frame (still in the previous buffer)
                 if self._frame_idx > 0:
                     driver.cuStreamSynchronize(self._decode_stream)
                     last_buf = (self._current_buffer - 1) % self._num_yuv_buffers
                     self._encode_buffer(last_buf)
-
-                self._flush_encoder()
-
-                if self._audio_putback is not None:
-                    self._audio_putback.stream = self._audio_stream
-                    self._output_container.mux(self._audio_putback)
-                    self._audio_putback = None
-                for audio_pkt in self._audio_pkts:
-                    audio_pkt.stream = self._audio_stream
-                    self._output_container.mux(audio_pkt)
-            finally:
-                if self._output_container:
-                    self._output_container.close()
-                if self._audio_input_container:
-                    self._audio_input_container.close()
-
-        # Handle temp file: finalize only if frames were actually muxed, else cleanup
-        if self._temp_file is not None:
-            if self._next_read_buffer > 0:
-                self._temp_file.finalize()
-            else:
-                self._temp_file.cleanup()
-            self._temp_file = None
-
-        # Now release all GPU resources
-        self._cleanup_gpu_resources()
+                self._mux_packets(self._session.flush())
+                self._muxer.close()
+        except BaseException:
+            if self._muxer is not None:
+                self._muxer.abort()
+            raise
+        finally:
+            self._muxer = None
+            self._cleanup_gpu_resources()
 
     def _abort(self) -> None:
-        """Abort write - close resources without flushing, delete temp file."""
+        """Abort the write: free GPU state, discard output, delete the temp file."""
         if self._closed:
             return
         self._closed = True
 
         try:
-            self._cleanup_resources()
+            self._cleanup_gpu_resources()
         finally:
-            if self._temp_file is not None:
-                self._temp_file.cleanup()
-                self._temp_file = None
+            if self._muxer is not None:
+                self._muxer.abort()
+                self._muxer = None
 
     def _cleanup_gpu_resources(self) -> None:
         """Release all GPU resources (CUDA, nvJPEG, NVENC)."""
@@ -1168,18 +941,12 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         if self._decode_stream:
             driver.cuStreamSynchronize(self._decode_stream)
 
-        # Clean up NVENC
-        if self._nvenc_encoder:
-            for reg_resource in self._registered_resources:
-                self._api.nvEncUnregisterResource(self._nvenc_encoder, reg_resource)
-            self._registered_resources.clear()
-
-            for buf in self._bitstream_buffers:
-                self._api.nvEncDestroyBitstreamBuffer(self._nvenc_encoder, buf)
-            self._bitstream_buffers.clear()
-
-            self._api.nvEncDestroyEncoder(self._nvenc_encoder)
-            self._nvenc_encoder = None
+        # The session unmaps and unregisters the input buffers, so it must be
+        # closed before the underlying device memory is freed.
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+        self._registered.clear()
 
         # Clean up CUDA stream
         if self._decode_stream:
@@ -1205,18 +972,6 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         if self._owns_cuda_ctx and self._cuda_ctx:
             driver.cuCtxDestroy(self._cuda_ctx)
             self._cuda_ctx = None
-
-    def _cleanup_resources(self) -> None:
-        """Release all GPU and container resources."""
-        self._cleanup_gpu_resources()
-
-        # Clean up containers
-        if self._output_container:
-            self._output_container.close()
-            self._output_container = None
-        if self._audio_input_container:
-            self._audio_input_container.close()
-            self._audio_input_container = None
 
     def __exit__(self, exc_type: type[BaseException] | None, *args: Any) -> None:
         if exc_type is None:

@@ -1,23 +1,21 @@
 """GL texture to video writing using NVENC with PyAV muxing.
 
 NVENC encoding is done directly via the nvenc module's ctypes bindings.
-PyAV handles only the container muxing (no subprocess).
+PyAV handles only the container muxing (no subprocess), through the shared
+H264PassthroughMuxer.
 """
 
 from __future__ import annotations
 
-import itertools
 import os
-from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
-import av
 import simplepyutils as spu
 
-from ._temp_file import TempFile
+from ._h264_mux import H264PassthroughMuxer
 from .encoder_config import EncoderConfig
 from .video_writing import AbstractVideoWriter, VideoOutput
 
@@ -45,6 +43,9 @@ class GLVideoWriter(AbstractVideoWriter['moderngl.Texture'], AbstractContextMana
 
     Similar API to VideoWriter but runs synchronously (no background thread)
     because NVENC requires the OpenGL context to be current.
+
+    Ending a sequence to which no frame was written is a no-op: no output
+    file is created.
 
     Example:
         >>> with GLVideoWriter() as writer:
@@ -171,6 +172,8 @@ class GLVideoWriter(AbstractVideoWriter['moderngl.Texture'], AbstractContextMana
 class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
     """Writes a single video sequence from GL textures using NVENC with PyAV muxing.
 
+    If no frame is written, closing is a no-op and no output file is created.
+
     Usage:
         with GLSequenceWriter(path, fps=30) as writer:
             for texture in textures:
@@ -199,89 +202,47 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
         self._audio_source_path = audio_source_path
         self._encoder_config = encoder_config if encoder_config is not None else EncoderConfig()
         self._gpu = gpu
+        self._video_output = video_output
+        self._format = format
 
-        # Determine output mode: file-like or path
-        if isinstance(video_output, (str, Path)):
-            self._temp_file = TempFile(video_output)
-            self._file_output = None
-            self._format = format or Path(video_output).suffix.lstrip('.')
-        else:
-            # File-like object
-            self._temp_file = None
-            self._file_output = video_output
-            if format is None:
-                raise ValueError("format is required when writing to a file-like object")
-            self._format = format
+        if not isinstance(video_output, (str, Path)) and format is None:
+            raise ValueError('format is required when writing to a file-like object')
 
-        # State will be initialized on first frame
-        self._output_container: av.container.OutputContainer | None = None
-        self._audio_input_container: av.container.InputContainer | None = None
-        self._video_stream: av.stream.Stream | None = None
-        self._audio_stream: av.stream.Stream | None = None
-        self._audio_time_base: Fraction = Fraction(1)
-        self._audio_pkts: Iterator[av.Packet] = iter([])
+        # Encoder and muxer are created on the first frame
         self._encoder: NvencEncoderType | NvencCudaEncoderType | None = None
-        self._h264_probe: av.container.InputContainer | None = None
+        self._muxer: H264PassthroughMuxer | None = None
         self._closed: bool = False
-        self._bframes: int = 0
-        self._width: int = 0
-        self._height: int = 0
 
     def write_frame(self, texture: moderngl.Texture) -> None:
         """Write a GL texture to the video."""
         if self._closed:
             raise RuntimeError('Writer is closed, cannot write more frames.')
 
-        if self._output_container is None:
+        if self._muxer is None:
             self._open(texture)
 
-        # Encode texture to H.264 - returns list of EncodedPackets
         for encoded in self._encoder.encode(texture):
-            self._mux_encoded(encoded)
-
-    def _mux_encoded(self, encoded):
-        """Mux an encoded packet into the output container."""
-        video_time = encoded.pts / self._fps_frac
-
-        # Interleave: write audio packets up to current video time
-        if self._audio_stream is not None:
-            for audio_pkt in self._audio_pkts:
-                if audio_pkt.dts * self._audio_time_base > video_time:
-                    self._audio_pkts = itertools.chain([audio_pkt], self._audio_pkts)
-                    break
-                audio_pkt.stream = self._audio_stream
-                self._output_container.mux(audio_pkt)
-
-        packet = av.Packet(encoded.data)
-        packet.stream = self._video_stream
-        packet.pts = encoded.pts
-        packet.dts = encoded.dts - self._bframes
-        packet.time_base = 1 / self._fps_frac
-        packet.is_keyframe = encoded.is_keyframe
-        self._output_container.mux(packet)
+            self._muxer.mux(encoded)
 
     def _open(self, first_texture: moderngl.Texture) -> None:
-        """Open containers and create encoder based on first texture."""
-        # Get dimensions
+        """Create the encoder and muxer based on the first texture."""
         if hasattr(first_texture, 'size'):
-            self._width, self._height = first_texture.size
+            width, height = first_texture.size
         elif hasattr(first_texture, 'width') and hasattr(first_texture, 'height'):
-            self._width, self._height = first_texture.width, first_texture.height
+            width, height = first_texture.width, first_texture.height
         else:
             raise ValueError(
                 'Cannot determine texture size. Pass a moderngl.Texture '
                 'or an object with size/width/height attributes.'
             )
 
-        self._bframes = self._encoder_config.bframes
-
-        # Create NVENC encoder first — this is the most likely step to fail
+        # Create the NVENC encoder first - this is the most likely step to fail
         # (e.g., GL context on wrong GPU). Fail before creating files on disk.
         encoder_kwargs = dict(
             fps=self._fps_frac,
             crf=self._encoder_config.crf,
             gop=self._encoder_config.gop,
-            bframes=self._bframes,
+            bframes=self._encoder_config.bframes,
         )
         if _is_headless():
             if NvencCudaEncoder is None:
@@ -289,104 +250,71 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
                     'Headless mode requires NvencCudaEncoder. '
                     'Install cuda-python: pip install cuda-python'
                 )
-            gpu_device = self._gpu if type(self._gpu) is int else None
+            # type() rather than isinstance(): True must not count as ordinal 1
+            gpu_device = self._gpu if type(self._gpu) is int else None  # noqa: E721
             self._encoder = NvencCudaEncoder(
-                self._width, self._height, **encoder_kwargs, gpu=gpu_device)
+                width, height, **encoder_kwargs, gpu=gpu_device)
         else:
             if NvencEncoder is None:
                 raise ImportError(
                     'NVENC is not available. Ensure you have an NVIDIA GPU '
                     'with NVENC support and the NVIDIA driver installed.'
                 )
-            self._encoder = NvencEncoder(self._width, self._height, **encoder_kwargs)
+            self._encoder = NvencEncoder(width, height, **encoder_kwargs)
 
-        # Open output container with B-frame-aware muxer options
-        muxer_options = {}
-        if self._bframes > 0 and self._format in ('mp4', 'mov', 'm4v', '3gp'):
-            muxer_options['movflags'] = 'negative_cts_offsets'
-            muxer_options['use_editlist'] = '0'
-
-        if self._temp_file is not None:
-            self._output_container = av.open(
-                os.fspath(self._temp_file.temp_path), 'w', format=self._format,
-                options=muxer_options)
-        else:
-            self._output_container = av.open(
-                self._file_output, 'w', format=self._format, options=muxer_options)
-
-        # Create video stream for H.264 passthrough muxing.
-        # The mov muxer extracts SPS/PPS from the first muxed IDR packet
-        # to build the avcC box, so no extradata setup is needed here.
-        self._video_stream = self._output_container.add_stream('h264', rate=self._fps_frac)
-        self._video_stream.width = self._width
-        self._video_stream.height = self._height
-        self._video_stream.pix_fmt = 'yuv420p'
-
-        # Set up audio if provided
-        if self._audio_source_path is not None:
-            self._audio_input_container = av.open(str(self._audio_source_path))
-            if self._audio_input_container.streams.audio:
-                src_audio = self._audio_input_container.streams.audio[0]
-                self._audio_stream = self._output_container.add_stream(template=src_audio)
-                self._audio_time_base = src_audio.time_base
-                self._audio_pkts = (
-                    pkt for pkt in self._audio_input_container.demux(src_audio)
-                    if pkt.dts is not None
-                )
+        try:
+            self._muxer = H264PassthroughMuxer(
+                self._video_output,
+                fps=self._fps_frac,
+                width=width,
+                height=height,
+                bframes=self._encoder_config.bframes,
+                audio_source_path=self._audio_source_path,
+                format=self._format,
+            )
+        except BaseException:
+            self._encoder.close()
+            self._encoder = None
+            raise
 
     def close(self) -> None:
-        """Flush encoder and close containers, then rename temp to final."""
+        """Flush the encoder and finalize the output file.
+
+        On error, the output is discarded (no file at the final path) and the
+        error propagates.
+        """
         if self._closed:
             return
         self._closed = True
 
-        if self._output_container is None:
+        if self._muxer is None:
+            # No frame was ever written; nothing was opened, no file appears.
             return
 
         try:
-            # Flush encoder and mux remaining video packets
-            if self._encoder is not None:
-                for encoded in self._encoder.flush():
-                    self._mux_encoded(encoded)
-
-            # Flush remaining audio packets
-            if self._audio_stream is not None:
-                for audio_pkt in self._audio_pkts:
-                    audio_pkt.stream = self._audio_stream
-                    self._output_container.mux(audio_pkt)
+            for encoded in self._encoder.flush():
+                self._muxer.mux(encoded)
+            self._muxer.close()
+        except BaseException:
+            self._muxer.abort()
+            raise
         finally:
-            if self._encoder is not None:
-                self._encoder.close()
-            self._output_container.close()
-            if self._audio_input_container is not None:
-                self._audio_input_container.close()
-            if self._h264_probe is not None:
-                self._h264_probe.close()
-
-        if self._temp_file is not None:
-            if self._temp_file.temp_path.exists():
-                self._temp_file.finalize()
-            else:
-                # Encoder failed before writing any data
-                self._temp_file.cleanup()
+            self._encoder.close()
+            self._encoder = None
+            self._muxer = None
 
     def _abort(self) -> None:
-        """Abort write - close resources without flushing, delete temp file."""
+        """Abort the write: discard output, delete the temp file."""
         if self._closed:
             return
         self._closed = True
 
         if self._encoder is not None:
             self._encoder.close()
-        if self._output_container is not None:
-            self._output_container.close()
-        if self._audio_input_container is not None:
-            self._audio_input_container.close()
-        if self._h264_probe is not None:
-            self._h264_probe.close()
-
-        if self._temp_file is not None:
-            self._temp_file.cleanup()
+            self._encoder = None
+        if self._muxer is not None:
+            self._muxer.abort()
+            self._muxer = None
 
     def __exit__(self, exc_type: type[BaseException] | None, *args: Any) -> None:
         if exc_type is None:
@@ -398,5 +326,3 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
 def _is_headless() -> bool:
     """Check if running headless (no X11 display)."""
     return not os.environ.get('DISPLAY')
-
-

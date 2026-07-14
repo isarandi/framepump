@@ -93,6 +93,14 @@ class NvencEncodeSession:
         crf: Constant quality factor (0-51, lower is better quality).
         gop: GOP length; also used as the IDR period.
         bframes: Number of B-frames between reference frames.
+        dar_size: Display aspect ratio as (width, height); defaults to the
+            coded dimensions. Pass the display size when width/height carry
+            macroblock padding.
+        tune_config: Optional hook called with the NV_ENC_CONFIG after the
+            base configuration is built and before the encoder is
+            initialized. May adjust rate control, profile, chroma format or
+            VUI settings; the buffer rings are sized from the config as the
+            hook leaves it.
         open_error_hint: Extra text appended to a session-open failure.
     """
 
@@ -107,6 +115,8 @@ class NvencEncodeSession:
         crf: int = 15,
         gop: int = 250,
         bframes: int = 2,
+        dar_size: tuple[int, int] | None = None,
+        tune_config: Callable[[NV_ENC_CONFIG], None] | None = None,
         open_error_hint: str = '',
     ) -> None:
         self._api = NvencAPI()
@@ -125,7 +135,7 @@ class NvencEncodeSession:
         self._pending_inputs: dict[int, tuple[c_void_p, Callable[[], None] | None]] = {}
 
         self._open_session(device_type, device, open_error_hint)
-        self._configure(width, height, fps, crf, gop, bframes)
+        self._configure(width, height, fps, crf, gop, bframes, dar_size, tune_config)
 
         # Ring sizing from the *finalized* config: the encoder may hold
         # frameIntervalP - 1 frames for reordering plus lookaheadDepth for
@@ -166,7 +176,15 @@ class NvencEncodeSession:
         self._encoder = encoder
 
     def _configure(
-        self, width: int, height: int, fps: Fraction, crf: int, gop: int, bframes: int
+        self,
+        width: int,
+        height: int,
+        fps: Fraction,
+        crf: int,
+        gop: int,
+        bframes: int,
+        dar_size: tuple[int, int] | None,
+        tune_config: Callable[[NV_ENC_CONFIG], None] | None,
     ) -> None:
         codec_guid = NV_ENC_CODEC_H264_GUID
         preset_guid = NV_ENC_PRESET_P4_GUID
@@ -198,16 +216,19 @@ class NvencEncodeSession:
         # below; disable it explicitly rather than trusting the preset.
         config.rcParams.rcFlags &= ~_RC_FLAG_ENABLE_LOOKAHEAD
         config.rcParams.lookaheadDepth = 0
+        if tune_config is not None:
+            tune_config(config)
         self._config = config
 
+        dar_width, dar_height = dar_size if dar_size is not None else (width, height)
         init_params = NV_ENC_INITIALIZE_PARAMS()
         init_params.version = NV_ENC_INITIALIZE_PARAMS_VER
         init_params.encodeGUID = codec_guid
         init_params.presetGUID = preset_guid
         init_params.encodeWidth = width
         init_params.encodeHeight = height
-        init_params.darWidth = width
-        init_params.darHeight = height
+        init_params.darWidth = dar_width
+        init_params.darHeight = dar_height
         init_params.frameRateNum = fps.numerator
         init_params.frameRateDen = fps.denominator
         init_params.enableEncodeAsync = 0  # Synchronous mode (Linux only)

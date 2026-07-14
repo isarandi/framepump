@@ -105,7 +105,7 @@ class EncoderConfig:
         if gpu:
             options['rc'] = 'vbr'
             options['cq'] = str(self.crf)
-            if type(gpu) is int:
+            if type(gpu) is int:  # noqa: E721 (bool is excluded on purpose)
                 options['gpu'] = str(gpu)
         else:
             options['crf'] = str(self.crf)

@@ -4,11 +4,9 @@ import itertools
 
 import numpy as np
 import pytest
-import tempfile
-import os
 from pathlib import Path
 
-from framepump import VideoFrames, VideoWriter, VideoDecodeError, get_fps, get_duration, num_frames, video_extents
+from framepump import VideoFrames, VideoWriter, VideoDecodeError
 
 # Path to various test video directories
 FATE_DIR = Path(__file__).parent.parent / 'fate'
@@ -455,7 +453,7 @@ class TestVideoWriterEdgeCases:
         """Writing zero frames should not crash."""
         video_path = tmp_path / 'empty.mp4'
 
-        with VideoWriter(str(video_path), fps=10) as writer:
+        with VideoWriter(str(video_path), fps=10):
             pass  # Write nothing
 
         # File might or might not exist, but no crash
@@ -710,7 +708,7 @@ class TestBFrameVideos:
         # Seek to various points
         frame0 = frames[0]
         frame5 = frames[5]
-        frame9 = frames[9]
+        frames[9]
 
         # Frames should be different
         assert not np.array_equal(frame0, frame5)

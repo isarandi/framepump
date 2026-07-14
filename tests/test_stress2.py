@@ -4,10 +4,9 @@ import gc
 import numpy as np
 import pytest
 import threading
-import time
 from pathlib import Path
 
-from framepump import VideoFrames, VideoWriter, get_fps, get_duration, num_frames
+from framepump import VideoFrames, VideoWriter, get_fps
 
 
 DATA_DIR = Path(__file__).parent.parent / 'data'
@@ -120,8 +119,8 @@ class TestConcurrentAccess:
         # Interleave reads
         f1_a = next(iter1)
         f2_a = next(iter2)
-        f1_b = next(iter1)
-        f2_b = next(iter2)
+        next(iter1)
+        next(iter2)
 
         # First frames from each should be equal
         np.testing.assert_array_equal(f1_a, f2_a)
@@ -135,7 +134,7 @@ class TestConcurrentAccess:
 
         # Now do random access
         f10 = frames[10]
-        f20 = frames[20]
+        frames[20]
 
         # Continue iterating
         _ = next(iterator)

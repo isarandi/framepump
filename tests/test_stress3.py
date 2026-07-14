@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from framepump import VideoFrames, VideoWriter, num_frames, get_fps, get_duration
+from framepump import VideoFrames, VideoWriter, num_frames, get_fps
 
 DATA_DIR = Path(__file__).parent.parent / 'data'
 FATE_DIR = Path(__file__).parent.parent / 'fate'

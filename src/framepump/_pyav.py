@@ -147,7 +147,7 @@ class PyAVReader:
             options = {}
             if gpu:
                 options['hwaccel'] = 'cuda'
-                if type(gpu) is int:
+                if type(gpu) is int:  # noqa: E721 (bool is excluded on purpose)
                     options['hwaccel_device'] = str(gpu)
             try:
                 self._container = av.open(
@@ -298,7 +298,7 @@ class PyAVReader:
             options = {}
             if self._gpu:
                 options['hwaccel'] = 'cuda'
-                if type(self._gpu) is int:
+                if type(self._gpu) is int:  # noqa: E721 (bool is excluded on purpose)
                     options['hwaccel_device'] = str(self._gpu)
             try:
                 self._container = av.open(

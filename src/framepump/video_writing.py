@@ -846,7 +846,7 @@ def trim_video(
         video_stream.height = out_h
         video_stream.pix_fmt = 'yuv420p'
         options = {'rc': 'vbr', 'cq': '20'} if gpu else {'crf': '20'}
-        if type(gpu) is int:
+        if type(gpu) is int:  # noqa: E721 (bool is excluded on purpose)
             options['gpu'] = str(gpu)
         video_stream.options = options
 
@@ -857,8 +857,8 @@ def trim_video(
                 audio_stream = output_container.add_stream(template=input_audio)
             except (av.error.FFmpegError, ValueError):
                 warnings.warn(
-                    f'Audio codec is not compatible with the output format, '
-                    f'skipping audio stream.',
+                    'Audio codec is not compatible with the output format, '
+                    'skipping audio stream.',
                     RuntimeWarning,
                     stacklevel=2,
                 )

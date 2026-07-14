@@ -7,10 +7,10 @@ import os
 os.environ.setdefault('__NV_PRIME_RENDER_OFFLOAD', '1')
 os.environ.setdefault('__GLX_VENDOR_LIBRARY_NAME', 'nvidia')
 
-import numpy as np
-import pytest
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 
-from framepump import VideoWriter
+from framepump import VideoWriter  # noqa: E402
 
 
 @pytest.fixture

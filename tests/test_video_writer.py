@@ -466,7 +466,6 @@ class TestPixelRoundtrip:
         """Test GL texture roundtrip with GLX (display) context."""
         pytest.importorskip('moderngl')
         import moderngl
-        import os
 
         from framepump import GLVideoWriter
         from framepump.nvenc.exceptions import NvencError
@@ -503,7 +502,6 @@ class TestPixelRoundtrip:
         """Test GL texture roundtrip with EGL (headless) context."""
         pytest.importorskip('moderngl')
         import moderngl
-        import os
 
         from framepump import GLVideoWriter
         from framepump.nvenc.exceptions import NvencError

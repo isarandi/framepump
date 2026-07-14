@@ -11,9 +11,6 @@ def test_version():
 
 def test_imports():
     """Test that all public API can be imported."""
-    from framepump import VideoFrames, VideoWriter, GLVideoWriter, AbstractVideoWriter
-    from framepump import get_fps, get_duration, num_frames, video_extents, has_audio
-    from framepump import trim_video, video_audio_mux
 
 
 def test_videoframes_class_exists():

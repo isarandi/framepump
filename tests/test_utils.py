@@ -5,7 +5,6 @@ import pytest
 
 from framepump import (
     VideoWriter,
-    VideoFrames,
     get_fps,
     get_duration,
     num_frames,

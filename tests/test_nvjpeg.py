@@ -87,6 +87,13 @@ class _PhasedHarness:
         from framepump.nvjpeg import NvjpegPhasedDecoder
 
         self.driver = driver
+        # The harness does its own CUDA work (stream, output buffers), so it
+        # must hold a context itself: the decoder retains the same device's
+        # primary context internally but never leaves it current.
+        _cuda_check(driver.cuInit(0))
+        self._device = _cuda_check(driver.cuDeviceGet(0))
+        self._ctx = _cuda_check(driver.cuDevicePrimaryCtxRetain(self._device))
+        _cuda_check(driver.cuCtxSetCurrent(self._ctx))
         self.decoder = NvjpegPhasedDecoder(gpu=0)
         self.stream = int(_cuda_check(driver.cuStreamCreate(0)))
         self.dev_ptrs = []
@@ -143,6 +150,8 @@ class _PhasedHarness:
             self.driver.cuMemFree(ptr)
         self.driver.cuStreamDestroy(self.stream)
         self.decoder.close()
+        self.driver.cuCtxSetCurrent(None)
+        self.driver.cuDevicePrimaryCtxRelease(self._device)
 
 
 def _run_phased(jpegs, sync_per_frame, busy_stream=False):
@@ -227,21 +236,31 @@ class TestSimpleDecoder:
         jpeg = make_jpeg(640, 480, 3, subsampling=0)
         pil_yuv = np.asarray(Image.open(io.BytesIO(jpeg)).convert('YCbCr'))
 
-        with NvjpegDecoder(gpu=0) as decoder:
-            width, height, _, subsampling = decoder.get_image_info(jpeg)
-            assert (width, height, subsampling) == (640, 480, CSS_444)
-            ptrs = [int(_cuda_check(driver.cuMemAlloc(height * width))) for _ in range(3)]
-            try:
-                decoder.decode_yuv_into(jpeg, *ptrs, y_pitch=width)
-                _cuda_check(driver.cuCtxSynchronize())
-                planes = []
-                for ptr in ptrs:
-                    host = np.empty((height, width), dtype=np.uint8)
-                    _cuda_check(driver.cuMemcpyDtoH(host, ptr, height * width))
-                    planes.append(host)
-            finally:
-                for ptr in ptrs:
-                    driver.cuMemFree(ptr)
+        # The test allocates its own buffers, so it must hold a context; the
+        # decoder makes its (primary) context current only during its calls.
+        _cuda_check(driver.cuInit(0))
+        device = _cuda_check(driver.cuDeviceGet(0))
+        ctx = _cuda_check(driver.cuDevicePrimaryCtxRetain(device))
+        _cuda_check(driver.cuCtxSetCurrent(ctx))
+        try:
+            with NvjpegDecoder(gpu=0) as decoder:
+                width, height, _, subsampling = decoder.get_image_info(jpeg)
+                assert (width, height, subsampling) == (640, 480, CSS_444)
+                ptrs = [int(_cuda_check(driver.cuMemAlloc(height * width))) for _ in range(3)]
+                try:
+                    decoder.decode_yuv_into(jpeg, *ptrs, y_pitch=width)
+                    _cuda_check(driver.cuCtxSynchronize())
+                    planes = []
+                    for ptr in ptrs:
+                        host = np.empty((height, width), dtype=np.uint8)
+                        _cuda_check(driver.cuMemcpyDtoH(host, ptr, height * width))
+                        planes.append(host)
+                finally:
+                    for ptr in ptrs:
+                        driver.cuMemFree(ptr)
+        finally:
+            driver.cuCtxSetCurrent(None)
+            driver.cuDevicePrimaryCtxRelease(device)
 
         for i, name in enumerate('YUV'):
             diff = np.abs(planes[i].astype(np.int16) - pil_yuv[..., i].astype(np.int16))

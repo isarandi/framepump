@@ -1,24 +1,65 @@
-"""Compatibility layer for cuda-python 12.x and 13.x API differences."""
+"""CUDA driver-API helpers: version compatibility and context ownership.
+
+Context ownership convention (applies to all CUDA code in framepump):
+
+- framepump never leaves a different CUDA context current than it found.
+  Code that needs a context pushes it via ``cuda_ctx_pushed`` for the
+  duration of its own driver/library calls and pops it on exit.
+- Components that need a context of their own retain the device's *primary*
+  context (``retain_primary_context``) instead of creating a private one, so
+  they interoperate with callers that use the primary context themselves
+  (torch, cupy, other framepump components). Each retain has exactly one
+  release.
+- Every owned GPU resource carries its owning context (or device, for
+  primary-context retain/release). Deleters that may run on arbitrary
+  threads push that context before freeing and release their retain after,
+  so frees cannot silently fail for lack of a current context.
+"""
 
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 
+from cuda.bindings import driver
 from cuda.bindings.driver import cuCtxCreate as _cuCtxCreate
 
 
-def resolve_gpu_device(gpu: bool | int) -> int:
-    """Resolve a gpu parameter to a CUDA device ordinal.
+@contextmanager
+def cuda_ctx_pushed(ctx):
+    """Make ``ctx`` current for the duration of the block, then restore.
 
-    Args:
-        gpu: True for auto-detect (device 0), or an explicit device ordinal.
+    Uses the driver's context stack, so the caller's current context (or the
+    absence of one) is exactly restored on exit, on any thread.
+    """
+    (err,) = driver.cuCtxPushCurrent(ctx)
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f'Failed to push CUDA context: {err}')
+    try:
+        yield
+    finally:
+        driver.cuCtxPopCurrent()
+
+
+def retain_primary_context(gpu: int):
+    """Initialize CUDA and retain the primary context of device ``gpu``.
+
+    Does not make the context current. The caller must balance with
+    ``cuDevicePrimaryCtxRelease(device)``.
 
     Returns:
-        Device ordinal (int).
+        Tuple of (device handle, context handle).
     """
-    if gpu is True:
-        return 0
-    return int(gpu)
+    (err,) = driver.cuInit(0)
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f'Failed to initialize CUDA: {err}')
+    err, device = driver.cuDeviceGet(gpu)
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f'Failed to get CUDA device {gpu}: {err}')
+    err, ctx = driver.cuDevicePrimaryCtxRetain(device)
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f'Failed to retain primary context on device {gpu}: {err}')
+    return device, ctx
 
 
 def cuCtxCreate(flags, device):

@@ -8,7 +8,7 @@ nvJPEG decodes directly into NVENC-registered device buffer - no GPU copies.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -17,7 +17,7 @@ from typing import Any, Union
 import simplepyutils as spu
 from cuda.bindings import driver
 
-from ._cuda_compat import cuCtxCreate
+from ._cuda_compat import cuda_ctx_pushed, retain_primary_context
 from ._h264_mux import H264PassthroughMuxer
 from .encoder_config import EncoderConfig
 from .nvenc._session import NvencEncodeSession
@@ -531,6 +531,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
 
         # CUDA/NVENC state
         self._cuda_ctx = None
+        self._cuda_device = None
         self._owns_cuda_ctx = False
         self._jpeg_decoder: NvjpegPhasedDecoder | None = None
         self._session: NvencEncodeSession | None = None
@@ -560,7 +561,12 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._closed = False
 
     def _init_cuda(self) -> None:
-        """Initialize CUDA context and stream for async decode."""
+        """Initialize CUDA context and stream for async decode.
+
+        Reuses the caller's current context if one exists; otherwise retains
+        the primary context of the configured device. The context is made
+        current only for the duration of writer calls.
+        """
         err, = driver.cuInit(0)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise NvencError(f'Failed to initialize CUDA: {err}')
@@ -570,22 +576,25 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             self._cuda_ctx = ctx
             self._owns_cuda_ctx = False
         else:
-            err, device = driver.cuDeviceGet(self._gpu)
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise NvencError(f'Failed to get CUDA device {self._gpu}: {err}')
-
-            err, self._cuda_ctx = cuCtxCreate(0, device)
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise NvencError(f'Failed to create CUDA context: {err}')
+            try:
+                self._cuda_device, self._cuda_ctx = retain_primary_context(self._gpu)
+            except RuntimeError as e:
+                raise NvencError(str(e)) from e
             self._owns_cuda_ctx = True
 
         # Create stream for async decode (allows overlap with encode)
-        err, self._decode_stream = driver.cuStreamCreate(0)
+        with cuda_ctx_pushed(self._cuda_ctx):
+            err, self._decode_stream = driver.cuStreamCreate(0)
         if err != driver.CUresult.CUDA_SUCCESS:
-            if self._owns_cuda_ctx:
-                driver.cuCtxDestroy(self._cuda_ctx)
-                self._cuda_ctx = None
+            self._release_owned_ctx()
             raise NvencError(f'Failed to create decode stream: {err}')
+
+    def _release_owned_ctx(self) -> None:
+        if self._owns_cuda_ctx and self._cuda_device is not None:
+            driver.cuDevicePrimaryCtxRelease(self._cuda_device)
+        self._cuda_ctx = None
+        self._cuda_device = None
+        self._owns_cuda_ctx = False
 
     def _prepare_layouts(self, width: int, height: int, subsampling: int) -> None:
         """Fix the frame geometry and compute the GPU buffer layouts."""
@@ -769,39 +778,43 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         if self._closed:
             raise RuntimeError('Writer is closed')
 
-        # Initialize on first frame
-        if self._jpeg_decoder is None:
+        if self._cuda_ctx is None:
             self._init_cuda()
-            self._jpeg_decoder = NvjpegPhasedDecoder(gpu=None)
-            width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
-            self._prepare_layouts(width, height, subsampling)
-            self._init_session()
-            self._alloc_buffers()
-            self._register_buffers()
-            self._open()
-            self._jpeg_decoder.decode_host()
-        else:
-            # Wait for the previous frame's async decode to complete: its
-            # buffer is submitted to NVENC below (which reads it right away),
-            # and the phased decoder's slots are recycled every other frame.
-            driver.cuStreamSynchronize(self._decode_stream)
-            width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
-            self._check_frame_consistent(width, height, subsampling)
-            self._jpeg_decoder.decode_host()
 
-        buf_idx = self._current_buffer
-        prev_buf = (buf_idx - 1) % self._num_yuv_buffers
+        with cuda_ctx_pushed(self._cuda_ctx):
+            # Initialize on first frame
+            if self._jpeg_decoder is None:
+                self._jpeg_decoder = NvjpegPhasedDecoder(gpu=None)
+                width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+                self._prepare_layouts(width, height, subsampling)
+                self._init_session()
+                self._alloc_buffers()
+                self._register_buffers()
+                self._open()
+                self._jpeg_decoder.decode_host()
+            else:
+                # Wait for the previous frame's async decode to complete: its
+                # buffer is submitted to NVENC below (which reads it right
+                # away), and the phased decoder's slots are recycled every
+                # other frame.
+                driver.cuStreamSynchronize(self._decode_stream)
+                width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+                self._check_frame_consistent(width, height, subsampling)
+                self._jpeg_decoder.decode_host()
 
-        # Start async GPU decode into current buffer (returns immediately)
-        self._decode_gpu_into_buffer(buf_idx)
+            buf_idx = self._current_buffer
+            prev_buf = (buf_idx - 1) % self._num_yuv_buffers
 
-        # Encode previous frame while GPU decodes current frame
-        if self._frame_idx > 0:
-            self._encode_buffer(prev_buf)
+            # Start async GPU decode into current buffer (returns immediately)
+            self._decode_gpu_into_buffer(buf_idx)
 
-        # Advance to next buffer (round-robin)
-        self._current_buffer = (buf_idx + 1) % self._num_yuv_buffers
-        self._frame_idx += 1
+            # Encode previous frame while GPU decodes current frame
+            if self._frame_idx > 0:
+                self._encode_buffer(prev_buf)
+
+            # Advance to next buffer (round-robin)
+            self._current_buffer = (buf_idx + 1) % self._num_yuv_buffers
+            self._frame_idx += 1
 
     def _check_frame_consistent(self, width: int, height: int, subsampling: int) -> None:
         """All frames must match the geometry the GPU buffers were sized for."""
@@ -904,14 +917,15 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._closed = True
 
         try:
-            if self._muxer is not None:
-                # Encode the last frame (still in the previous buffer)
-                if self._frame_idx > 0:
-                    driver.cuStreamSynchronize(self._decode_stream)
-                    last_buf = (self._current_buffer - 1) % self._num_yuv_buffers
-                    self._encode_buffer(last_buf)
-                self._mux_packets(self._session.flush())
-                self._muxer.close()
+            with self._ctx_guard():
+                if self._muxer is not None:
+                    # Encode the last frame (still in the previous buffer)
+                    if self._frame_idx > 0:
+                        driver.cuStreamSynchronize(self._decode_stream)
+                        last_buf = (self._current_buffer - 1) % self._num_yuv_buffers
+                        self._encode_buffer(last_buf)
+                    self._mux_packets(self._session.flush())
+                    self._muxer.close()
         except BaseException:
             if self._muxer is not None:
                 self._muxer.abort()
@@ -919,6 +933,12 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         finally:
             self._muxer = None
             self._cleanup_gpu_resources()
+
+    def _ctx_guard(self):
+        """Push the writer's context for the duration of a call, if initialized."""
+        if self._cuda_ctx is not None:
+            return cuda_ctx_pushed(self._cuda_ctx)
+        return nullcontext()
 
     def _abort(self) -> None:
         """Abort the write: free GPU state, discard output, delete the temp file."""
@@ -935,43 +955,44 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
 
     def _cleanup_gpu_resources(self) -> None:
         """Release all GPU resources (CUDA, nvJPEG, NVENC)."""
-        # An aborted write can still have an async decode in flight;
-        # cuStreamDestroy does not wait for queued work, so synchronize before
-        # freeing the buffers and nvJPEG state that the decode writes to.
-        if self._decode_stream:
-            driver.cuStreamSynchronize(self._decode_stream)
+        if self._cuda_ctx is None:
+            return  # CUDA was never initialized (no frame written)
 
-        # The session unmaps and unregisters the input buffers, so it must be
-        # closed before the underlying device memory is freed.
-        if self._session is not None:
-            self._session.close()
-            self._session = None
-        self._registered.clear()
+        with cuda_ctx_pushed(self._cuda_ctx):
+            # An aborted write can still have an async decode in flight;
+            # cuStreamDestroy does not wait for queued work, so synchronize
+            # before freeing the buffers and nvJPEG state the decode writes to.
+            if self._decode_stream:
+                driver.cuStreamSynchronize(self._decode_stream)
 
-        # Clean up CUDA stream
-        if self._decode_stream:
-            driver.cuStreamDestroy(self._decode_stream)
-            self._decode_stream = None
+            # The session unmaps and unregisters the input buffers, so it must
+            # be closed before the underlying device memory is freed.
+            if self._session is not None:
+                self._session.close()
+                self._session = None
+            self._registered.clear()
 
-        # Clean up YUV buffers
-        for devptr in self._yuv_buffers:
-            driver.cuMemFree(devptr)
-        self._yuv_buffers.clear()
+            # Clean up CUDA stream
+            if self._decode_stream:
+                driver.cuStreamDestroy(self._decode_stream)
+                self._decode_stream = None
 
-        # Clean up UV scratch buffer (chroma downsampling)
-        if self._uv_scratch:
-            driver.cuMemFree(self._uv_scratch)
-            self._uv_scratch = 0
+            # Clean up YUV buffers
+            for devptr in self._yuv_buffers:
+                driver.cuMemFree(devptr)
+            self._yuv_buffers.clear()
 
-        # Clean up nvJPEG
-        if self._jpeg_decoder:
-            self._jpeg_decoder.close()
-            self._jpeg_decoder = None
+            # Clean up UV scratch buffer (chroma downsampling)
+            if self._uv_scratch:
+                driver.cuMemFree(self._uv_scratch)
+                self._uv_scratch = 0
 
-        # Clean up CUDA context (only if we created it)
-        if self._owns_cuda_ctx and self._cuda_ctx:
-            driver.cuCtxDestroy(self._cuda_ctx)
-            self._cuda_ctx = None
+            # Clean up nvJPEG
+            if self._jpeg_decoder:
+                self._jpeg_decoder.close()
+                self._jpeg_decoder = None
+
+        self._release_owned_ctx()
 
     def __exit__(self, exc_type: type[BaseException] | None, *args: Any) -> None:
         if exc_type is None:

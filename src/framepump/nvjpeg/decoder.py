@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 from ctypes import POINTER, byref, c_int, c_size_t, c_ubyte
 from typing import Union
 
 import numpy as np
 from cuda.bindings import driver
 
-from .._cuda_compat import cuCtxCreate
+from .._cuda_compat import cuda_ctx_pushed, retain_primary_context
 from .bindings import (
     _lib,
     nvjpegHandle_t,
@@ -60,6 +61,12 @@ class NvjpegDecoder:
 
     Decodes JPEG data directly into user-provided CUDA device buffers (zero-copy).
 
+    The decoder retains the primary CUDA context of the given device and makes
+    it current only for the duration of its own calls — the caller's current
+    context is never disturbed. Callers doing their own CUDA work (allocating
+    the output buffers, synchronizing) must hold a context themselves, e.g.
+    via ``cuDevicePrimaryCtxRetain`` on the same device or through torch.
+
     Example:
         >>> decoder = NvjpegDecoder()
         >>> width, height = decoder.decode_yuv_into(jpeg_bytes, y_ptr, u_ptr, v_ptr, ...)
@@ -74,26 +81,23 @@ class NvjpegDecoder:
         self._handle = nvjpegHandle_t()
         self._state = nvjpegJpegState_t()
         self._closed = False
-        self._cuda_ctx = None
 
-        # Initialize CUDA
-        driver.cuInit(0)
-        err, device = driver.cuDeviceGet(gpu)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'Failed to get CUDA device {gpu}: {err}')
-        err, self._cuda_ctx = cuCtxCreate(0, device)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'Failed to create CUDA context: {err}')
-
-        # Initialize nvJPEG
-        self._check(
-            _lib.nvjpegCreateSimple(byref(self._handle)),
-            'Failed to create nvJPEG handle',
-        )
-        self._check(
-            _lib.nvjpegJpegStateCreate(self._handle, byref(self._state)),
-            'Failed to create JPEG state',
-        )
+        self._cuda_device, self._cuda_ctx = retain_primary_context(gpu)
+        try:
+            with cuda_ctx_pushed(self._cuda_ctx):
+                self._check(
+                    _lib.nvjpegCreateSimple(byref(self._handle)),
+                    'Failed to create nvJPEG handle',
+                )
+                self._check(
+                    _lib.nvjpegJpegStateCreate(self._handle, byref(self._state)),
+                    'Failed to create JPEG state',
+                )
+        except Exception:
+            driver.cuDevicePrimaryCtxRelease(self._cuda_device)
+            self._cuda_ctx = None
+            self._cuda_device = None
+            raise
 
     def _cleanup_partial(self) -> None:
         """Clean up partially initialized nvJPEG resources."""
@@ -105,12 +109,9 @@ class NvjpegDecoder:
             self._handle = nvjpegHandle_t()
 
     def _check(self, status: int, msg: str) -> None:
-        """Check nvJPEG status, cleanup and raise on error."""
+        """Check nvJPEG status, cleanup nvJPEG state and raise on error."""
         if status != NVJPEG_STATUS_SUCCESS:
             self._cleanup_partial()
-            if self._cuda_ctx:
-                driver.cuCtxDestroy(self._cuda_ctx)
-                self._cuda_ctx = None
             raise RuntimeError(nvjpeg_status_message(status, msg))
 
     def get_image_info(self, jpeg_data: JpegData) -> tuple[int, int, int, int]:
@@ -130,15 +131,16 @@ class NvjpegDecoder:
         heights = (c_int * NVJPEG_MAX_COMPONENT)()
 
         data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
-        status = _lib.nvjpegGetImageInfo(
-            self._handle,
-            data_ptr,
-            c_size_t(data_size),
-            byref(n_components),
-            byref(subsampling),
-            widths,
-            heights,
-        )
+        with cuda_ctx_pushed(self._cuda_ctx):
+            status = _lib.nvjpegGetImageInfo(
+                self._handle,
+                data_ptr,
+                c_size_t(data_size),
+                byref(n_components),
+                byref(subsampling),
+                widths,
+                heights,
+            )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to get image info'))
 
@@ -189,15 +191,16 @@ class NvjpegDecoder:
         output.pitch[2] = v_pitch
 
         data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
-        status = _lib.nvjpegDecode(
-            self._handle,
-            self._state,
-            data_ptr,
-            c_size_t(data_size),
-            NVJPEG_OUTPUT_YUV,
-            byref(output),
-            stream,
-        )
+        with cuda_ctx_pushed(self._cuda_ctx):
+            status = _lib.nvjpegDecode(
+                self._handle,
+                self._state,
+                data_ptr,
+                c_size_t(data_size),
+                NVJPEG_OUTPUT_YUV,
+                byref(output),
+                stream,
+            )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to decode JPEG to YUV'))
 
@@ -209,10 +212,14 @@ class NvjpegDecoder:
             return
         self._closed = True
 
-        self._cleanup_partial()
-
-        if self._cuda_ctx:
-            driver.cuCtxDestroy(self._cuda_ctx)
+        if self._cuda_ctx is not None:
+            with cuda_ctx_pushed(self._cuda_ctx):
+                self._cleanup_partial()
+            driver.cuDevicePrimaryCtxRelease(self._cuda_device)
+            self._cuda_ctx = None
+            self._cuda_device = None
+        else:
+            self._cleanup_partial()
 
     def __del__(self):
         if not self._closed:
@@ -247,14 +254,21 @@ class NvjpegPhasedDecoder:
         ...     decoder.decode_device(y, u, v, y_pitch, u_pitch, v_pitch, stream)  # async
 
     All frames must be submitted on the same CUDA stream.
+
+    When ``gpu`` is given, the decoder retains that device's primary CUDA
+    context and makes it current only for the duration of its own calls — the
+    caller's current context is never disturbed. Callers doing their own CUDA
+    work (creating the stream, allocating output buffers) must hold a context
+    themselves, e.g. via ``cuDevicePrimaryCtxRetain`` on the same device.
     """
 
     def __init__(self, gpu: int | None = 0):
         """Initialize the phased nvJPEG decoder.
 
         Args:
-            gpu: CUDA device ordinal to create a context on. If None, the caller
-                is responsible for providing an existing CUDA context.
+            gpu: CUDA device ordinal whose primary context to retain. If None,
+                the caller is responsible for providing a current CUDA context
+                around every call.
         """
         if _lib is None:
             raise ImportError(
@@ -272,19 +286,35 @@ class NvjpegPhasedDecoder:
         self._slot = _NUM_SLOTS - 1
         self._closed = False
         self._cuda_ctx = None
+        self._cuda_device = None
         self._owns_cuda_ctx = gpu is not None
 
-        # Initialize CUDA if needed
         if gpu is not None:
-            driver.cuInit(0)
-            err, device = driver.cuDeviceGet(gpu)
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise RuntimeError(f'Failed to get CUDA device {gpu}: {err}')
-            err, self._cuda_ctx = cuCtxCreate(0, device)
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise RuntimeError(f'Failed to create CUDA context: {err}')
+            self._cuda_device, self._cuda_ctx = retain_primary_context(gpu)
 
-        # Initialize nvJPEG handle and decoder
+        try:
+            with self._ctx_guard():
+                self._init_nvjpeg()
+        except Exception:
+            if self._owns_cuda_ctx and self._cuda_device is not None:
+                driver.cuDevicePrimaryCtxRelease(self._cuda_device)
+                self._cuda_ctx = None
+                self._cuda_device = None
+            raise
+
+        # Cache for parsed image info
+        self._parsed_width = 0
+        self._parsed_height = 0
+        self._parsed_subsampling = -1
+
+    def _ctx_guard(self):
+        """Push the owned context for the duration of a call, if any."""
+        if self._owns_cuda_ctx and self._cuda_ctx is not None:
+            return cuda_ctx_pushed(self._cuda_ctx)
+        return nullcontext()
+
+    def _init_nvjpeg(self) -> None:
+        """Create all nvJPEG objects (under the owned context, if any)."""
         self._check(
             _lib.nvjpegCreateSimple(byref(self._handle)),
             'Failed to create nvJPEG handle',
@@ -335,11 +365,6 @@ class NvjpegPhasedDecoder:
                 'Failed to create JPEG stream',
             )
 
-        # Cache for parsed image info
-        self._parsed_width = 0
-        self._parsed_height = 0
-        self._parsed_subsampling = -1
-
     def _cleanup_partial(self):
         """Clean up partially initialized resources."""
         for jpeg_stream in self._jpeg_streams:
@@ -367,12 +392,9 @@ class NvjpegPhasedDecoder:
             self._handle = nvjpegHandle_t()
 
     def _check(self, status: int, msg: str) -> None:
-        """Check nvJPEG status, cleanup and raise on error."""
+        """Check nvJPEG status, cleanup nvJPEG state and raise on error."""
         if status != NVJPEG_STATUS_SUCCESS:
             self._cleanup_partial()
-            if self._owns_cuda_ctx and self._cuda_ctx:
-                driver.cuCtxDestroy(self._cuda_ctx)
-                self._cuda_ctx = None
             raise RuntimeError(nvjpeg_status_message(status, msg))
 
     def parse(self, jpeg_data: JpegData) -> tuple[int, int, int]:
@@ -391,37 +413,48 @@ class NvjpegPhasedDecoder:
 
         data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
 
-        # Rotate to the next slot and attach its pinned buffer, so this
-        # frame's CPU stages never touch the buffers that the previous
-        # frame's in-flight transfer still reads.
-        self._slot = (self._slot + 1) % _NUM_SLOTS
-        jpeg_stream = self._jpeg_streams[self._slot]
-        status = _lib.nvjpegStateAttachPinnedBuffer(self._state, self._pinned_buffers[self._slot])
-        if status != NVJPEG_STATUS_SUCCESS:
-            raise RuntimeError(nvjpeg_status_message(status, 'Failed to attach pinned buffer'))
+        with self._ctx_guard():
+            # Rotate to the next slot and attach its pinned buffer, so this
+            # frame's CPU stages never touch the buffers that the previous
+            # frame's in-flight transfer still reads.
+            self._slot = (self._slot + 1) % _NUM_SLOTS
+            jpeg_stream = self._jpeg_streams[self._slot]
+            status = _lib.nvjpegStateAttachPinnedBuffer(
+                self._state, self._pinned_buffers[self._slot]
+            )
+            if status != NVJPEG_STATUS_SUCCESS:
+                raise RuntimeError(
+                    nvjpeg_status_message(status, 'Failed to attach pinned buffer')
+                )
 
-        status = _lib.nvjpegJpegStreamParse(
-            self._handle,
-            data_ptr,
-            c_size_t(data_size),
-            1,  # save_metadata (required for phased decoding)
-            1,  # save_stream (required for phased decoding)
-            jpeg_stream,
-        )
-        if status != NVJPEG_STATUS_SUCCESS:
-            raise RuntimeError(nvjpeg_status_message(status, 'Failed to parse JPEG'))
+            status = _lib.nvjpegJpegStreamParse(
+                self._handle,
+                data_ptr,
+                c_size_t(data_size),
+                1,  # save_metadata (required for phased decoding)
+                1,  # save_stream (required for phased decoding)
+                jpeg_stream,
+            )
+            if status != NVJPEG_STATUS_SUCCESS:
+                raise RuntimeError(nvjpeg_status_message(status, 'Failed to parse JPEG'))
 
-        # Get dimensions from parsed stream
-        width = ctypes.c_uint()
-        height = ctypes.c_uint()
-        status = _lib.nvjpegJpegStreamGetFrameDimensions(jpeg_stream, byref(width), byref(height))
-        if status != NVJPEG_STATUS_SUCCESS:
-            raise RuntimeError(nvjpeg_status_message(status, 'Failed to get frame dimensions'))
+            # Get dimensions from parsed stream
+            width = ctypes.c_uint()
+            height = ctypes.c_uint()
+            status = _lib.nvjpegJpegStreamGetFrameDimensions(
+                jpeg_stream, byref(width), byref(height)
+            )
+            if status != NVJPEG_STATUS_SUCCESS:
+                raise RuntimeError(
+                    nvjpeg_status_message(status, 'Failed to get frame dimensions')
+                )
 
-        subsampling = c_int()
-        status = _lib.nvjpegJpegStreamGetChromaSubsampling(jpeg_stream, byref(subsampling))
-        if status != NVJPEG_STATUS_SUCCESS:
-            raise RuntimeError(nvjpeg_status_message(status, 'Failed to get chroma subsampling'))
+            subsampling = c_int()
+            status = _lib.nvjpegJpegStreamGetChromaSubsampling(jpeg_stream, byref(subsampling))
+            if status != NVJPEG_STATUS_SUCCESS:
+                raise RuntimeError(
+                    nvjpeg_status_message(status, 'Failed to get chroma subsampling')
+                )
 
         self._parsed_width = width.value
         self._parsed_height = height.value
@@ -437,13 +470,14 @@ class NvjpegPhasedDecoder:
         if self._closed:
             raise RuntimeError('Decoder is closed')
 
-        status = _lib.nvjpegDecodeJpegHost(
-            self._handle,
-            self._decoder,
-            self._state,
-            self._params,
-            self._jpeg_streams[self._slot],
-        )
+        with self._ctx_guard():
+            status = _lib.nvjpegDecodeJpegHost(
+                self._handle,
+                self._decoder,
+                self._state,
+                self._params,
+                self._jpeg_streams[self._slot],
+            )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to decode JPEG on host'))
 
@@ -458,21 +492,22 @@ class NvjpegPhasedDecoder:
         if self._closed:
             raise RuntimeError('Decoder is closed')
 
-        # The decoder state's device-side working memory is shared across
-        # slots, so the previous frame's GPU work must finish before new
-        # work is submitted (this also frees the slot being reused two
-        # frames later). Requires all frames to use the same stream.
-        (err,) = driver.cuStreamSynchronize(stream if stream is not None else 0)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'Failed to synchronize stream before transfer: {err}')
+        with self._ctx_guard():
+            # The decoder state's device-side working memory is shared across
+            # slots, so the previous frame's GPU work must finish before new
+            # work is submitted (this also frees the slot being reused two
+            # frames later). Requires all frames to use the same stream.
+            (err,) = driver.cuStreamSynchronize(stream if stream is not None else 0)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f'Failed to synchronize stream before transfer: {err}')
 
-        status = _lib.nvjpegDecodeJpegTransferToDevice(
-            self._handle,
-            self._decoder,
-            self._state,
-            self._jpeg_streams[self._slot],
-            ctypes.c_void_p(stream) if stream else None,
-        )
+            status = _lib.nvjpegDecodeJpegTransferToDevice(
+                self._handle,
+                self._decoder,
+                self._state,
+                self._jpeg_streams[self._slot],
+                ctypes.c_void_p(stream) if stream else None,
+            )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to transfer to device'))
 
@@ -506,13 +541,14 @@ class NvjpegPhasedDecoder:
         output.pitch[1] = u_pitch
         output.pitch[2] = v_pitch
 
-        status = _lib.nvjpegDecodeJpegDevice(
-            self._handle,
-            self._decoder,
-            self._state,
-            byref(output),
-            ctypes.c_void_p(stream) if stream else None,
-        )
+        with self._ctx_guard():
+            status = _lib.nvjpegDecodeJpegDevice(
+                self._handle,
+                self._decoder,
+                self._state,
+                byref(output),
+                ctypes.c_void_p(stream) if stream else None,
+            )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to decode JPEG on device'))
 
@@ -559,10 +595,13 @@ class NvjpegPhasedDecoder:
             return
         self._closed = True
 
-        self._cleanup_partial()
+        with self._ctx_guard():
+            self._cleanup_partial()
 
-        if self._owns_cuda_ctx and self._cuda_ctx:
-            driver.cuCtxDestroy(self._cuda_ctx)
+        if self._owns_cuda_ctx and self._cuda_device is not None:
+            driver.cuDevicePrimaryCtxRelease(self._cuda_device)
+            self._cuda_ctx = None
+            self._cuda_device = None
 
     def __del__(self):
         if not self._closed:

@@ -40,12 +40,15 @@ from __future__ import annotations
 import bisect
 import ctypes
 import itertools
+import warnings
 from pathlib import Path
 from typing import Union
 
 import numpy as np
 from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
+
+from ._cuda_compat import cuda_ctx_pushed
 
 PathLike = Union[str, Path]
 
@@ -227,6 +230,11 @@ class VideoFramesCuda:
     Frames are decoded on GPU and stay on GPU. Both iteration and indexing
     yield DLPack-compatible objects. Use ``torch.from_dlpack(frame)`` to get
     a CUDA tensor.
+
+    API gaps vs ``VideoFrames`` (intentional): ``resized()``,
+    ``repeat_each_frame()``, and ``constant_framerate`` are not supported on
+    the GPU path. Use the CPU ``VideoFrames`` class when those are needed, or
+    apply resizing/repetition on the returned CUDA tensors.
 
     Args:
         video_path: Path to video file.
@@ -583,57 +591,71 @@ class VideoFramesCuda:
         # Initialize CUDA driver API (no-op if already initialized).
         driver.cuInit(0)
 
-        # Ensure a CUDA context is active for this GPU.
+        # Retain the primary context for this GPU. It is made current only
+        # for the duration of the pipeline's own calls, never left current.
         err, device = driver.cuDeviceGet(self._gpu)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'cuDeviceGet({self._gpu}) failed: {err}')
         err, cuda_ctx = driver.cuDevicePrimaryCtxRetain(device)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
-        err, = driver.cuCtxSetCurrent(cuda_ctx)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'cuCtxSetCurrent failed: {err}')
         self._cuda_device = device
+        self._npp_cuda_ctx = cuda_ctx
 
-        self._npp_bindings = npp_bindings
+        try:
+            with cuda_ctx_pushed(cuda_ctx):
+                self._npp_bindings = npp_bindings
 
-        # Build NppStreamContext (uses default stream = 0).
-        self._npp_ctx = npp_bindings.make_npp_stream_context(self._gpu)
+                # Build NppStreamContext (uses default stream = 0).
+                self._npp_ctx = npp_bindings.make_npp_stream_context(self._gpu)
 
-        # Select color twist matrix.
-        if self._color_space == 'bt709':
-            self._twist = npp_bindings.BT709_YUV_TO_RGB_16
-        else:
-            self._twist = npp_bindings.BT601_YUV_TO_RGB_16
+                # Select color twist matrix.
+                if self._color_space == 'bt709':
+                    self._twist = npp_bindings.BT709_YUV_TO_RGB_16
+                else:
+                    self._twist = npp_bindings.BT601_YUV_TO_RGB_16
 
-        # Allocate reusable output buffer for iteration.
-        h, w = self.original_imshape
-        self._out_pitch = w * 3 * 2  # uint16 packed RGB: 3 channels * 2 bytes
-        buf_size = self._out_pitch * h
-        err, devptr = driver.cuMemAlloc(buf_size)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'Failed to allocate NPP output buffer: {err}')
-        self._iter_buf_ptr = int(devptr)
+                # Allocate reusable output buffer for iteration.
+                h, w = self.original_imshape
+                self._out_pitch = w * 3 * 2  # uint16 packed RGB: 3 ch * 2 bytes
+                buf_size = self._out_pitch * h
+                err, devptr = driver.cuMemAlloc(buf_size)
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f'Failed to allocate NPP output buffer: {err}')
+                self._iter_buf_ptr = int(devptr)
+        except Exception:
+            driver.cuDevicePrimaryCtxRelease(device)
+            del self._cuda_device
+            del self._npp_cuda_ctx
+            if hasattr(self, '_npp_ctx'):
+                del self._npp_ctx
+            raise
 
     def _cleanup_npp(self) -> None:
         """Free NPP pipeline GPU resources."""
+        ctx = getattr(self, '_npp_cuda_ctx', None)
         buf = getattr(self, '_iter_buf_ptr', None)
-        if buf is not None:
+        if buf is not None and ctx is not None:
             from cuda.bindings import driver
-            driver.cuMemFree(buf)
+            with cuda_ctx_pushed(ctx):
+                # NPP work on the default stream may still be in flight.
+                driver.cuCtxSynchronize()
+                driver.cuMemFree(buf)
             del self._iter_buf_ptr
         device = getattr(self, '_cuda_device', None)
         if device is not None:
             from cuda.bindings import driver
             driver.cuDevicePrimaryCtxRelease(device)
             del self._cuda_device
+        if ctx is not None:
+            del self._npp_cuda_ctx
 
     def _convert_frame_shared(self, frame) -> _GpuRgbBuffer:
         """Convert a frame into the reusable iteration buffer."""
         self._do_convert(frame, self._iter_buf_ptr)
         h, w = self.original_imshape
         return _GpuRgbBuffer(
-            self._iter_buf_ptr, h, w, self._out_pitch, 2, self._gpu,
+            self._iter_buf_ptr, h, w, self._out_pitch, self._gpu,
             owns_memory=False,
         )
 
@@ -643,14 +665,15 @@ class VideoFramesCuda:
 
         h, w = self.original_imshape
         pitch = w * 3 * 2
-        err, devptr = driver.cuMemAlloc(pitch * h)
+        with cuda_ctx_pushed(self._npp_cuda_ctx):
+            err, devptr = driver.cuMemAlloc(pitch * h)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'Failed to allocate frame buffer: {err}')
         devptr = int(devptr)
 
         self._do_convert(frame, devptr)
         return _GpuRgbBuffer(
-            devptr, h, w, pitch, 2, self._gpu, owns_memory=True,
+            devptr, h, w, pitch, self._gpu, owns_memory=True,
         )
 
     def _do_convert(self, frame, dst_ptr: int) -> None:
@@ -660,66 +683,145 @@ class VideoFramesCuda:
         npp = self._npp_bindings
         ctx = self._npp_ctx
 
-        if self._npp_mode == 'yuv_to_rgb16':
-            pf = self._source_format
-            if pf == nvc.Pixel_Format.P016:
-                y_ptr = frame.GetPtrToPlane(0)
-                uv_ptr = frame.GetPtrToPlane(1)
-                y_pitch = (uv_ptr - y_ptr) // h
-                npp.p016_to_rgb16(
-                    y_ptr, y_pitch, uv_ptr, y_pitch,
-                    dst_ptr, dst_pitch, w, h, self._twist, ctx,
+        with cuda_ctx_pushed(self._npp_cuda_ctx):
+            if self._npp_mode == 'yuv_to_rgb16':
+                pf = self._source_format
+                if pf == nvc.Pixel_Format.P016:
+                    (y_ptr, y_pitch), (uv_ptr, uv_pitch) = _plane_layouts(frame, 2, w * 2, h)
+                    npp.p016_to_rgb16(
+                        y_ptr, y_pitch, uv_ptr, uv_pitch,
+                        dst_ptr, dst_pitch, w, h, self._twist, ctx,
+                    )
+                elif pf == nvc.Pixel_Format.YUV444_16Bit:
+                    planes = _plane_layouts(frame, 3, w * 2, h)
+                    (y_ptr, y_pitch), (u_ptr, u_pitch), (v_ptr, v_pitch) = planes
+                    if not (y_pitch == u_pitch == v_pitch):
+                        raise RuntimeError(
+                            f'YUV444 conversion requires equal plane pitches, got '
+                            f'{y_pitch}/{u_pitch}/{v_pitch}'
+                        )
+                    npp.yuv444_16bit_to_rgb16(
+                        y_ptr, u_ptr, v_ptr, y_pitch,
+                        dst_ptr, dst_pitch, w, h, self._twist, ctx,
+                    )
+                else:
+                    raise RuntimeError(
+                        f'Unsupported source format for yuv_to_rgb16: {pf}'
+                    )
+
+            elif self._npp_mode == 'scale_8u_16u':
+                ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
+                npp.rgb8_to_rgb16(
+                    src_ptr, src_pitch, dst_ptr, dst_pitch, w, h, ctx,
                 )
-            elif pf == nvc.Pixel_Format.YUV444_16Bit:
-                y_ptr = frame.GetPtrToPlane(0)
-                u_ptr = frame.GetPtrToPlane(1)
-                v_ptr = frame.GetPtrToPlane(2)
-                plane_pitch = (u_ptr - y_ptr) // h
-                npp.yuv444_16bit_to_rgb16(
-                    y_ptr, u_ptr, v_ptr, plane_pitch,
-                    dst_ptr, dst_pitch, w, h, self._twist, ctx,
-                )
+
             else:
-                raise RuntimeError(
-                    f'Unsupported source format for yuv_to_rgb16: {pf}'
-                )
+                raise RuntimeError(f'Unknown _npp_mode: {self._npp_mode!r}')
 
-        elif self._npp_mode == 'scale_8u_16u':
-            src_ptr = frame.GetPtrToPlane(0)
-            src_pitch = w * 3  # uint8 packed RGB: 3 bytes per pixel
-            npp.rgb8_to_rgb16(
-                src_ptr, src_pitch, dst_ptr, dst_pitch, w, h, ctx,
-            )
 
+def _plane_layouts(frame, num_planes: int, min_row_bytes: int, height: int) -> list:
+    """Get (device pointer, row pitch in bytes) for each plane of a decoded frame.
+
+    Prefers the per-plane CUDA-array-interface views from ``frame.cuda()``.
+    PyNvVideoCodec's views report strides in elements in current releases
+    (a corrected release would report bytes); both units are accepted and the
+    result is validated against the row's minimum byte width, so a wrong
+    pitch raises instead of producing silently sheared output.
+
+    Falls back to inferring the pitch from plane-pointer deltas when the
+    views are unavailable — validated under the explicit assumption that the
+    planes are allocated contiguously at a common pitch.
+    """
+    try:
+        views = frame.cuda()
+        cais = [view.__cuda_array_interface__ for view in views[:num_planes]]
+        if len(cais) != num_planes:
+            raise ValueError(f'Expected {num_planes} planes, got {len(cais)}')
+    except Exception:
+        return _plane_layouts_from_deltas(frame, num_planes, min_row_bytes, height)
+
+    result = []
+    for cai in cais:
+        ptr = cai['data'][0]
+        itemsize = int(cai['typestr'][-1])
+        strides = cai.get('strides')
+        if strides:
+            s0 = strides[0]
+            pitch = s0 if s0 >= min_row_bytes else s0 * itemsize
         else:
-            raise RuntimeError(f'Unknown _npp_mode: {self._npp_mode!r}')
+            pitch = min_row_bytes
+        if pitch < min_row_bytes or pitch % itemsize:
+            raise RuntimeError(
+                f'Cannot determine plane pitch: stride {strides} (itemsize {itemsize}) '
+                f'is inconsistent with a row width of {min_row_bytes} bytes'
+            )
+        result.append((ptr, pitch))
+    return result
+
+
+def _plane_layouts_from_deltas(frame, num_planes: int, min_row_bytes: int, height: int) -> list:
+    """Infer a common plane pitch from consecutive plane-pointer deltas."""
+    ptrs = [frame.GetPtrToPlane(i) for i in range(num_planes)]
+    if num_planes == 1:
+        return [(ptrs[0], min_row_bytes)]
+    delta = ptrs[1] - ptrs[0]
+    if delta <= 0 or delta % height:
+        raise RuntimeError(
+            f'Cannot infer plane pitch: plane delta {delta} is not a positive '
+            f'multiple of the plane height {height} (planes not contiguous?)'
+        )
+    pitch = delta // height
+    if pitch < min_row_bytes or pitch % 2:
+        raise RuntimeError(
+            f'Inferred plane pitch {pitch} is inconsistent with a row width of '
+            f'{min_row_bytes} bytes'
+        )
+    return [(ptr, pitch) for ptr in ptrs]
 
 
 # ── GPU RGB buffer with DLPack export ────────────────────────────────
 
 class _GpuRgbBuffer:
-    """DLPack-compatible wrapper around a GPU-resident packed RGB buffer.
+    """DLPack-compatible wrapper around a GPU-resident packed uint16 RGB buffer.
 
     For iteration: ``owns_memory=False``, the buffer is shared and reused.
     For indexing: ``owns_memory=True``, freed when the consumer releases it.
+
+    An owning buffer retains the primary context of its device so the free —
+    which may run on any thread, at any time, via ``__del__`` or the DLPack
+    deleter — always has a valid context to run under, even after the parent
+    ``VideoFramesCuda`` released its own retain.
     """
 
     __slots__ = (
-        '_devptr', '_height', '_width', '_pitch', '_bytes_per_ch',
-        '_gpu_id', '_owns_memory', '_shape_arr', '_strides_arr',
+        '_devptr', '_height', '_width', '_pitch',
+        '_gpu_id', '_owns_memory', '_own_device', '_own_ctx',
+        '_shape_arr', '_strides_arr',
     )
 
     def __init__(
         self, devptr: int, height: int, width: int, pitch: int,
-        bytes_per_ch: int, gpu_id: int, *, owns_memory: bool,
+        gpu_id: int, *, owns_memory: bool,
     ) -> None:
         self._devptr = devptr
         self._height = height
         self._width = width
         self._pitch = pitch
-        self._bytes_per_ch = bytes_per_ch
         self._gpu_id = gpu_id
         self._owns_memory = owns_memory
+        self._own_device = None
+        self._own_ctx = None
+        if owns_memory:
+            from cuda.bindings import driver
+
+            err, device = driver.cuDeviceGet(gpu_id)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f'cuDeviceGet({gpu_id}) failed: {err}')
+            err, ctx = driver.cuDevicePrimaryCtxRetain(device)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
+            self._own_device = device
+            self._own_ctx = ctx
         # Must outlive any DLPack capsule (DLTensor holds raw pointers).
         self._shape_arr = (ctypes.c_int64 * 3)(height, width, 3)
         self._strides_arr = (ctypes.c_int64 * 3)(width * 3, 3, 1)
@@ -729,10 +831,7 @@ class _GpuRgbBuffer:
         mt.dl_tensor.data = self._devptr
         mt.dl_tensor.device = _DLDevice(2, self._gpu_id)  # kDLCUDA
         mt.dl_tensor.ndim = 3
-        if self._bytes_per_ch == 1:
-            mt.dl_tensor.dtype = _DLDataType(1, 8, 1)   # kDLUInt 8-bit
-        else:
-            mt.dl_tensor.dtype = _DLDataType(1, 16, 1)  # kDLUInt 16-bit
+        mt.dl_tensor.dtype = _DLDataType(1, 16, 1)  # kDLUInt 16-bit
         mt.dl_tensor.shape = ctypes.cast(
             self._shape_arr, ctypes.POINTER(ctypes.c_int64)
         )
@@ -744,17 +843,23 @@ class _GpuRgbBuffer:
         key = next(_prevent_gc_counter)
 
         if self._owns_memory:
+            # Hand the allocation and its primary-context retain over to the
+            # DLPack consumer's deleter.
             devptr = self._devptr
+            device, ctx = self._own_device, self._own_ctx
             self._devptr = 0
             self._owns_memory = False
+            self._own_device = None
+            self._own_ctx = None
             mt.deleter = _GPU_BUFFER_FREE_DELETER
         else:
             devptr = 0  # sentinel: don't free
+            device, ctx = None, None
             mt.deleter = _GPU_BUFFER_NOFREE_DELETER
 
         mt.manager_ctx = key
         _prevent_gc_store[key] = (
-            devptr, mt, self._shape_arr, self._strides_arr,
+            devptr, mt, self._shape_arr, self._strides_arr, device, ctx,
         )
 
         return _PyCapsule_New(ctypes.addressof(mt), b'dltensor', None)
@@ -764,8 +869,7 @@ class _GpuRgbBuffer:
 
     def __del__(self):
         if self._owns_memory and self._devptr:
-            from cuda.bindings import driver
-            driver.cuMemFree(self._devptr)
+            _free_owned_buffer(self._devptr, self._own_device, self._own_ctx)
 
 
 class _FrameWithDecoder:
@@ -859,13 +963,36 @@ _prevent_gc_counter = itertools.count()
 
 # ── _GpuRgbBuffer deleters (module-level to survive GC) ──────────────
 
+def _free_owned_buffer(devptr, device, ctx) -> None:
+    """Free an owned allocation under its owning primary context.
+
+    May run on any thread (GC, or a DLPack consumer's deleter), so the
+    owning context is pushed for the free and the retain released after.
+    Failures are reported as warnings — deleters cannot raise.
+    """
+    from cuda.bindings import driver
+
+    if ctx is not None:
+        (err,) = driver.cuCtxPushCurrent(ctx)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            warnings.warn(f'Failed to push context to free GPU buffer: {err}')
+            return
+    try:
+        (err,) = driver.cuMemFree(devptr)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            warnings.warn(f'Failed to free GPU frame buffer: {err}')
+    finally:
+        if ctx is not None:
+            driver.cuCtxPopCurrent()
+            driver.cuDevicePrimaryCtxRelease(device)
+
+
 def _gpu_buffer_free_deleter_impl(managed_ptr):
     """DLPack deleter for owned GPU buffers: frees the allocation."""
     mt = _DLManagedTensor.from_address(managed_ptr)
-    ctx = _prevent_gc_store.pop(mt.manager_ctx, None)
-    if ctx is not None and ctx[0]:
-        from cuda.bindings import driver
-        driver.cuMemFree(ctx[0])
+    entry = _prevent_gc_store.pop(mt.manager_ctx, None)
+    if entry is not None and entry[0]:
+        _free_owned_buffer(entry[0], entry[4], entry[5])
 
 
 def _gpu_buffer_nofree_deleter_impl(managed_ptr):

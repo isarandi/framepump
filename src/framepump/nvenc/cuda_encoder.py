@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 from cuda.bindings import driver  # type: ignore[attr-defined]
 
-from .._cuda_compat import cuCtxCreate
+from .._cuda_compat import cuda_ctx_pushed
 from ._session import EncodedPacket, NvencEncodeSession
 from .bindings import (
     NV_ENC_BUFFER_FORMAT_ABGR,
@@ -93,18 +93,24 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         self._registered_staging: list[c_void_p] = []
 
         # Initialize CUDA context
+        self._cuda_device = None
+        self._owns_cuda_ctx = False
         self._cuda_ctx = self._ensure_cuda_context()
 
-        self._session = NvencEncodeSession(
-            device_type=NV_ENC_DEVICE_TYPE_CUDA,
-            device=int(self._cuda_ctx),
-            width=width,
-            height=height,
-            fps=fps,
-            crf=crf,
-            gop=gop,
-            bframes=bframes,
-        )
+        try:
+            self._session = NvencEncodeSession(
+                device_type=NV_ENC_DEVICE_TYPE_CUDA,
+                device=int(self._cuda_ctx),
+                width=width,
+                height=height,
+                fps=fps,
+                crf=crf,
+                gop=gop,
+                bframes=bframes,
+            )
+        except Exception:
+            self._release_owned_ctx()
+            raise
 
     def _ensure_cuda_context(self) -> Any:
         """Ensure CUDA is initialized on the correct device.
@@ -113,6 +119,10 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         1. Existing CUDA context on the current thread (reuse it)
         2. Explicit gpu device ordinal (if self._gpu is set)
         3. Auto-detect from GL context via cuGLGetDevices
+
+        In cases 2 and 3 the encoder retains the device's primary context; it
+        is made current only for the duration of encoder calls, so the
+        caller's current context (or the absence of one) is preserved.
         """
         (err,) = driver.cuInit(0)
         if err != driver.CUresult.CUDA_SUCCESS:
@@ -135,10 +145,18 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         else:
             device = self._detect_gl_cuda_device()
 
-        err, ctx = cuCtxCreate(0, device)
+        err, ctx = driver.cuDevicePrimaryCtxRetain(device)
         if err != driver.CUresult.CUDA_SUCCESS:
-            raise NvencError(f'Failed to create CUDA context: {err}')
+            raise NvencError(f'Failed to retain primary CUDA context: {err}')
+        self._cuda_device = device
+        self._owns_cuda_ctx = True
         return ctx
+
+    def _release_owned_ctx(self) -> None:
+        if self._owns_cuda_ctx and self._cuda_device is not None:
+            driver.cuDevicePrimaryCtxRelease(self._cuda_device)
+            self._cuda_device = None
+            self._owns_cuda_ctx = False
 
     def _detect_gl_cuda_device(self) -> Any:
         """Detect which CUDA device the current GL context is on.
@@ -228,40 +246,41 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
 
         texture_id = self._get_texture_id(texture)
 
-        # Get or create GL-CUDA mapper
-        if texture_id not in self._texture_mappers:
-            w, h = self._get_texture_size(texture)
-            mapper = _GLTextureToCUDA(texture_id, w, h)
-            mapper.register()
-            self._texture_mappers[texture_id] = mapper
+        with cuda_ctx_pushed(self._cuda_ctx):
+            # Get or create GL-CUDA mapper
+            if texture_id not in self._texture_mappers:
+                w, h = self._get_texture_size(texture)
+                mapper = _GLTextureToCUDA(texture_id, w, h)
+                mapper.register()
+                self._texture_mappers[texture_id] = mapper
 
-        mapper = self._texture_mappers[texture_id]
+            mapper = self._texture_mappers[texture_id]
 
-        if self._staging_arrays is None:
-            self._create_staging_arrays()
+            if self._staging_arrays is None:
+                self._create_staging_arrays()
 
-        slot = self._session.next_submit_index % len(self._staging_arrays)
+            slot = self._session.next_submit_index % len(self._staging_arrays)
 
-        # Copy the mapped GL texture into the staging array, then release the
-        # GL mapping immediately (cuMemcpy2D is synchronous).
-        cu_array = mapper.map_and_get_array()
-        try:
-            copy = driver.CUDA_MEMCPY2D()
-            copy.srcMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_ARRAY
-            copy.srcArray = cu_array
-            copy.dstMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_ARRAY
-            copy.dstArray = self._staging_arrays[slot]
-            copy.WidthInBytes = self._width * 4
-            copy.Height = self._height
-            (err,) = driver.cuMemcpy2D(copy)
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise NvencError(f'Failed to copy texture into staging array: {err}')
-        finally:
-            mapper.unmap()
+            # Copy the mapped GL texture into the staging array, then release
+            # the GL mapping immediately (cuMemcpy2D is synchronous).
+            cu_array = mapper.map_and_get_array()
+            try:
+                copy = driver.CUDA_MEMCPY2D()
+                copy.srcMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_ARRAY
+                copy.srcArray = cu_array
+                copy.dstMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_ARRAY
+                copy.dstArray = self._staging_arrays[slot]
+                copy.WidthInBytes = self._width * 4
+                copy.Height = self._height
+                (err,) = driver.cuMemcpy2D(copy)
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise NvencError(f'Failed to copy texture into staging array: {err}')
+            finally:
+                mapper.unmap()
 
-        return self._session.submit(
-            self._registered_staging[slot], self._width, self._height, self._width * 4
-        )
+            return self._session.submit(
+                self._registered_staging[slot], self._width, self._height, self._width * 4
+            )
 
     def _create_staging_arrays(self) -> None:
         """Allocate and register the staging CUDA array ring."""
@@ -312,7 +331,8 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         """
         if self._closed or self._session is None:
             return []
-        return self._session.flush()
+        with cuda_ctx_pushed(self._cuda_ctx):
+            return self._session.flush()
 
     def close(self) -> None:
         """Release encoder resources.
@@ -323,19 +343,22 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
             return
         self._closed = True
 
-        if self._session is not None:
-            self._session.close()
-        self._registered_staging.clear()
+        with cuda_ctx_pushed(self._cuda_ctx):
+            if self._session is not None:
+                self._session.close()
+            self._registered_staging.clear()
 
-        if self._staging_arrays is not None:
-            for array in self._staging_arrays:
-                driver.cuArrayDestroy(array)
-            self._staging_arrays = None
+            if self._staging_arrays is not None:
+                for array in self._staging_arrays:
+                    driver.cuArrayDestroy(array)
+                self._staging_arrays = None
 
-        # Unregister GL textures from CUDA
-        for mapper in self._texture_mappers.values():
-            mapper.unregister()
-        self._texture_mappers.clear()
+            # Unregister GL textures from CUDA
+            for mapper in self._texture_mappers.values():
+                mapper.unregister()
+            self._texture_mappers.clear()
+
+        self._release_owned_ctx()
 
     def __del__(self) -> None:
         if not self._closed:

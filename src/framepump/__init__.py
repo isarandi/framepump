@@ -13,7 +13,14 @@ from ._core import (
     num_frames,
     video_extents,
 )
-from ._pyav import FramePumpError, NoAudioStreamError, VideoDecodeError, VideoEncodeError
+from ._pyav import (
+    FilterConfigError,
+    FramePumpError,
+    IndexBuildError,
+    NoAudioStreamError,
+    VideoDecodeError,
+    VideoEncodeError,
+)
 from .encoder_config import EncoderConfig
 
 from .video_writing import AbstractVideoWriter, VideoWriter, trim_video, video_audio_mux
@@ -45,6 +52,8 @@ __all__ = [
     'VideoDecodeError',
     'VideoEncodeError',
     'NoAudioStreamError',
+    'IndexBuildError',
+    'FilterConfigError',
     'AbstractVideoWriter',
     'VideoWriter',
     'GLVideoWriter',

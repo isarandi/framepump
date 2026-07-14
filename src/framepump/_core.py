@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import operator
+from bisect import bisect_left
 from collections import deque
 from collections.abc import Generator
 from fractions import Fraction
@@ -58,7 +61,10 @@ class VideoFrames:
         Args:
             video_path: Path to video file (str or Path), or a seekable file-like
                 object (must support read, seek, tell). File-like objects cannot
-                be used with ``gpu=True``.
+                be used with ``gpu=True``. ``BytesIO`` sources support any number
+                of concurrently active iterators (each gets an independent view);
+                other file-like objects allow only one active iterator at a time,
+                since all iterators share the object's read position.
             seekable: Whether the video stream supports seeking. ``None``
                 (default) auto-detects by probing. ``True``/``False`` skips the
                 probe, which saves one seek+decode per reader creation.
@@ -75,7 +81,6 @@ class VideoFrames:
         width, height = self._reader.resolution
         self.original_imshape: tuple[int, int] = (height, width)
         self.original_fps = self._reader.fps
-        self._original_fps_frac = self._reader.fps_fraction
         self.resized_imshape: tuple[int, int] | None = None
         self.repeat_count = 1
 
@@ -89,11 +94,9 @@ class VideoFrames:
         if isinstance(constant_framerate, bool):
             self.constant_framerate = constant_framerate
             self.target_fps = self.original_fps
-            self._target_fps_frac = self._original_fps_frac
         else:
             self.constant_framerate = True
             self.target_fps = float(constant_framerate)
-            self._target_fps_frac = Fraction(constant_framerate).limit_denominator(100000)
 
         # Build frame index upfront
         self._index = FrameIndexPyAV(self.path, reader=self._reader)
@@ -106,10 +109,13 @@ class VideoFrames:
         self._reader.close()
         self._reader = None
 
-        # Compute total frame count
+        # In CFR mode, all behavior (count, indexing, iteration, seeking) derives
+        # from this single output-index -> source-index map.
         if self.constant_framerate:
-            n_frames = self._count_cfr_frames()
+            self._cfr_source_map: list[int] | None = self._build_cfr_source_map()
+            n_frames = len(self._cfr_source_map)
         else:
+            self._cfr_source_map = None
             n_frames = self._index.frame_count
 
         # Store frame range - slicing applies directly to this
@@ -122,43 +128,15 @@ class VideoFrames:
         if len(frame_range) == 0:
             return
 
-        slice_start = frame_range.start
-        slice_stop = frame_range.stop
-        slice_step = frame_range.step
-
         # Create a fresh reader for this iteration
         reader = self._create_reader()
         try:
-            # Large step: more efficient to seek to each frame individually
-            # Threshold is lower with PyAV since seeking is fast (~10ms vs ~100ms)
-            if slice_step > 30:
-                yield from self._iter_with_individual_seeks(
-                    reader, slice_start, slice_stop, slice_step, internal_dtype
-                )
-                return
-
-            # Use index-based seeking if we have an offset
-            if slice_start > 0:
-                yield from self._iter_with_seek(
-                    reader, slice_start, slice_stop, slice_step, internal_dtype
-                )
-                return
-
-            # Standard iteration (no seeking) - use PyAV directly
-            reader.seek_to_time(Fraction(0))
-            frames = self._decode_frames_cfr_aware(reader, internal_dtype)
-
-            # Apply step and stop
-            if slice_step == 1:
-                sliced_frames = more_itertools.islice_extended(frames, slice_stop)
-            else:
-                sliced_frames = more_itertools.islice_extended(frames, 0, slice_stop, slice_step)
-
-            cast_frames = map(self._maybe_to_float, sliced_frames)
+            raw_frames = self._iter_decoded(reader, frame_range, internal_dtype)
+            frames = map(self._maybe_to_float, raw_frames)
             if self.repeat_count == 1:
-                yield from cast_frames
+                yield from frames
             else:
-                yield from spu.repeat_n(cast_frames, self.repeat_count)
+                yield from spu.repeat_n(frames, self.repeat_count)
         finally:
             reader.close()
 
@@ -179,9 +157,11 @@ class VideoFrames:
             if item < 0 or item >= length:
                 raise IndexError(f'Frame index {item} out of range for video with {length} frames')
 
-            # Get absolute frame index from the range
-            abs_idx = self._frame_range[item]
-            return self._get_frame_indexed(abs_idx)
+            # The bounds check above uses the repeat-inclusive length, so after
+            # dividing out the repeat factor the index is always within range.
+            abs_idx = self._frame_range[item // self.repeat_count]
+            source_idx = self._abs_to_source(abs_idx)
+            return self._maybe_to_float(self._decode_frame_at_source(source_idx))
         elif isinstance(item, slice):
             if self.repeat_count != 1:
                 raise NotImplementedError(
@@ -238,40 +218,16 @@ class VideoFrames:
         return result
 
     def repeat_each_frame(self, n: int) -> 'VideoFrames':
+        try:
+            n = operator.index(n)
+        except TypeError:
+            raise TypeError(
+                f'The repeat count must be an integer, got {type(n).__name__}') from None
         if n < 1:
             raise ValueError('The repeat count must be at least 1.')
         result = self._clone()
         result.repeat_count *= n
         return result
-
-    def _clone(self) -> 'VideoFrames':
-        result = VideoFrames.__new__(VideoFrames)
-        result.path = self.path
-        result.original_imshape = self.original_imshape
-        result.resized_imshape = self.resized_imshape
-        result._frame_range = self._frame_range
-        result.original_fps = self.original_fps
-        result._original_fps_frac = self._original_fps_frac
-        result.repeat_count = self.repeat_count
-        result.dtype = self.dtype
-        result.gpu = self.gpu
-        result.constant_framerate = self.constant_framerate
-        result.target_fps = self.target_fps
-        result._target_fps_frac = self._target_fps_frac
-        # Share index with clones (read-only, thread-safe)
-        result._index = self._index
-        result._is_fileobj = self._is_fileobj
-        result._seekable = self._seekable
-        result._reader = None  # Each clone gets its own reader on iteration
-        return result
-
-    def _create_reader(self) -> PyAVReader:
-        """Create a new reader for iteration."""
-        if self._is_fileobj:
-            self.path.seek(0)
-        reader = PyAVReader(self.path, gpu=self.gpu)
-        reader._seekable = self._seekable
-        return reader
 
     def close(self) -> None:
         """Close the video reader. Call when done with this VideoFrames."""
@@ -284,6 +240,85 @@ class VideoFrames:
     def __exit__(self, *args) -> None:
         self.close()
 
+    def _clone(self) -> 'VideoFrames':
+        result = VideoFrames.__new__(VideoFrames)
+        result.path = self.path
+        result.original_imshape = self.original_imshape
+        result.resized_imshape = self.resized_imshape
+        result._frame_range = self._frame_range
+        result.original_fps = self.original_fps
+        result.repeat_count = self.repeat_count
+        result.dtype = self.dtype
+        result.gpu = self.gpu
+        result.constant_framerate = self.constant_framerate
+        result.target_fps = self.target_fps
+        # Share index and CFR map with clones (read-only, thread-safe)
+        result._index = self._index
+        result._cfr_source_map = self._cfr_source_map
+        result._is_fileobj = self._is_fileobj
+        result._seekable = self._seekable
+        result._reader = None  # Each clone gets its own reader on iteration
+        return result
+
+    def _create_reader(self) -> PyAVReader:
+        """Create a new reader for iteration."""
+        if self._is_fileobj:
+            if hasattr(self.path, 'getbuffer'):
+                # BytesIO: give each reader an independent view so concurrently
+                # active iterators can't disturb each other's read position
+                # (costs one in-memory copy per reader).
+                source = io.BytesIO(self.path.getbuffer())
+            else:
+                # Generic file-like object: all readers share its read position,
+                # so only one iterator may be active at a time (see __init__).
+                self.path.seek(0)
+                source = self.path
+        else:
+            source = self.path
+        reader = PyAVReader(source, gpu=self.gpu)
+        reader._seekable = self._seekable
+        return reader
+
+    def _iter_decoded(
+        self,
+        reader: PyAVReader,
+        frame_range: range,
+        internal_dtype: DTypeLike,
+    ) -> Generator[NDArray, None, None]:
+        """Decode the sliced frames in internal dtype (no repetition, no conversion)."""
+        slice_start = frame_range.start
+        slice_stop = frame_range.stop
+        slice_step = frame_range.step
+
+        # Large step: more efficient to seek to each frame individually
+        # Threshold is lower with PyAV since seeking is fast (~10ms vs ~100ms)
+        if slice_step > 30:
+            return self._iter_with_individual_seeks(
+                reader, slice_start, slice_stop, slice_step, internal_dtype
+            )
+
+        # Use index-based seeking if we have an offset
+        if slice_start > 0:
+            return self._iter_with_seek(
+                reader, slice_start, slice_stop, slice_step, internal_dtype
+            )
+
+        return self._iter_sequential(reader, slice_stop, slice_step, internal_dtype)
+
+    def _iter_sequential(
+        self,
+        reader: PyAVReader,
+        slice_stop: int,
+        slice_step: int,
+        internal_dtype: DTypeLike,
+    ) -> Generator[NDArray, None, None]:
+        """Standard iteration from the beginning of the video (no seeking)."""
+        reader.seek_to_time(Fraction(0))
+        frames = self._decode_frames_cfr_aware(reader, internal_dtype)
+        if slice_step == 1:
+            return more_itertools.islice_extended(frames, slice_stop)
+        return more_itertools.islice_extended(frames, 0, slice_stop, slice_step)
+
     def _iter_with_individual_seeks(
         self,
         reader: PyAVReader,
@@ -293,13 +328,9 @@ class VideoFrames:
         internal_dtype: DTypeLike,
     ) -> Generator[NDArray, None, None]:
         """Iterate by seeking to each frame individually (efficient for large steps)."""
-        for idx in range(slice_start, slice_stop, slice_step):
-            frame = self._get_frame_indexed(idx, internal_dtype, reader=reader)
-            if self.repeat_count == 1:
-                yield frame
-            else:
-                for _ in range(self.repeat_count):
-                    yield frame
+        for abs_idx in range(slice_start, slice_stop, slice_step):
+            source_idx = self._abs_to_source(abs_idx)
+            yield self._decode_frame_at_source(source_idx, internal_dtype, reader=reader)
 
     def _iter_with_seek(
         self,
@@ -346,15 +377,9 @@ class VideoFrames:
             # Process frame through filter graph
             graph.push(frame)
             filtered_frame = graph.pull()
-            arr = filtered_frame.to_ndarray()
 
             if frame_count % slice_step == 0:
-                converted = self._maybe_to_float(arr)
-                if self.repeat_count == 1:
-                    yield converted
-                else:
-                    for _ in range(self.repeat_count):
-                        yield converted
+                yield filtered_frame.to_ndarray()
 
             frame_count += 1
             if frame_count >= max_frames:
@@ -368,15 +393,9 @@ class VideoFrames:
         slice_step: int,
         internal_dtype: DTypeLike,
     ) -> Generator[NDArray, None, None]:
-        """Iterate with seeking in CFR mode.
-
-        Maps output indices through the CFR source map and seeks to the
-        first needed source frame.
-        """
-        source_map = self._build_cfr_source_map()
-
-        # Find the range of source frames we need
-        first_source = source_map[slice_start] if slice_start < len(source_map) else 0
+        """Iterate with seeking in CFR mode: walk the source map from the slice start."""
+        source_map = self._cfr_source_map
+        first_source = source_map[slice_start]
         safe_pts_frac = self._index.safe_seek_pts[first_source]
         target_pts_frac = self._index.frame_pts[first_source]
         reader.seek_to_time(safe_pts_frac)
@@ -387,8 +406,12 @@ class VideoFrames:
         target_pts_float = float(target_pts_frac)
         time_base = reader.time_base
 
+        # The map is non-decreasing, so the first output slot fed by first_source
+        # is its leftmost occurrence. That can precede slice_start when the source
+        # frame is duplicated across several output slots; emission is gated on
+        # slice_start below.
+        output_idx = bisect_left(source_map, first_source)
         source_idx = 0
-        output_idx = 0
         reached_target = False
         prev_frame_arr = None
 
@@ -408,12 +431,7 @@ class VideoFrames:
             while output_idx < len(source_map) and source_map[output_idx] == source_idx:
                 if slice_start <= output_idx < slice_stop:
                     if (output_idx - slice_start) % slice_step == 0:
-                        converted = self._maybe_to_float(frame_arr)
-                        if self.repeat_count == 1:
-                            yield converted
-                        else:
-                            for _ in range(self.repeat_count):
-                                yield converted
+                        yield frame_arr
                 output_idx += 1
                 if output_idx >= slice_stop:
                     return
@@ -421,38 +439,78 @@ class VideoFrames:
             prev_frame_arr = frame_arr
             source_idx += 1
 
-        # Handle remaining output frames (EOF duplication)
+        # Handle remaining output frames (EOF duplication, or a truncated stream
+        # that decoded fewer frames than the index recorded)
         while output_idx < len(source_map) and output_idx < slice_stop:
-            if prev_frame_arr is not None and (output_idx - slice_start) % slice_step == 0:
-                converted = self._maybe_to_float(prev_frame_arr)
-                if self.repeat_count == 1:
-                    yield converted
-                else:
-                    for _ in range(self.repeat_count):
-                        yield converted
+            if (prev_frame_arr is not None and slice_start <= output_idx
+                    and (output_idx - slice_start) % slice_step == 0):
+                yield prev_frame_arr
             output_idx += 1
 
-    def _get_frame_indexed(
+    def _decode_frames_cfr_aware(
+        self, reader: PyAVReader, dtype: DTypeLike
+    ) -> Generator[NDArray, None, None]:
+        """Decode frames from the start, with CFR simulation if enabled."""
+        if not self.constant_framerate:
+            # VFR mode: pass through directly
+            yield from reader.decode_frames(
+                output_shape=self.resized_imshape,
+                dtype=dtype,
+            )
+            return
+
+        # CFR mode: walk the source map from the beginning
+        source_map = self._cfr_source_map
+        target_format = 'rgb48' if dtype == np.uint16 else 'rgb24'
+
+        # Build filter graph for exact FFmpeg compatibility
+        graph = reader._build_filter_graph(self.resized_imshape, target_format)
+
+        source_idx = 0
+        output_idx = 0
+        prev_frame_arr = None
+
+        for frame in reader._container.decode(reader._stream):
+            # Process through filter graph for exact color conversion
+            graph.push(frame)
+            filtered_frame = graph.pull()
+            frame_arr = filtered_frame.to_ndarray()
+
+            # Output this frame for all output indices that map to this source index
+            while output_idx < len(source_map) and source_map[output_idx] == source_idx:
+                yield frame_arr
+                output_idx += 1
+
+            prev_frame_arr = frame_arr
+            source_idx += 1
+
+        # Handle any remaining output frames (EOF duplication)
+        while output_idx < len(source_map):
+            if prev_frame_arr is not None:
+                yield prev_frame_arr
+            output_idx += 1
+
+    def _abs_to_source(self, abs_idx: int) -> int:
+        """Map an absolute output-frame index to the source frame that fills it."""
+        if self.constant_framerate:
+            return self._cfr_source_map[abs_idx]
+        return abs_idx
+
+    def _decode_frame_at_source(
         self,
-        abs_idx: int,
+        source_idx: int,
         internal_dtype: DTypeLike | None = None,
         reader: PyAVReader | None = None,
     ) -> NDArray:
-        """Get frame using index for fast seeking.
+        """Seek to and decode a single source frame (in internal dtype, unconverted).
 
         Args:
-            abs_idx: Absolute frame index in the original video.
+            source_idx: Source frame index in the original video.
             internal_dtype: Internal dtype for decoding (uint8 or uint16).
             reader: Optional reader to use. If None, creates a temporary one.
         """
         if internal_dtype is None:
             internal_dtype = np.uint8 if self.dtype == np.uint8 else np.uint16
-
-        if self.constant_framerate:
-            # CFR mode: find source frame using FFmpeg's vsync algorithm
-            source_idx = self._find_source_frame_for_cfr_output(abs_idx)
-        else:
-            source_idx = abs_idx
 
         # Get safe seek point and target PTS
         safe_pts_frac = self._index.safe_seek_pts[source_idx]
@@ -483,37 +541,36 @@ class VideoFrames:
                     frame_pts) >= target_pts_float - 1e-6) or frame_count == source_idx:
                     graph.push(frame)
                     filtered_frame = graph.pull()
-                    return self._maybe_to_float(filtered_frame.to_ndarray())
+                    return filtered_frame.to_ndarray()
                 frame_count += 1
 
             raise VideoDecodeError(
-                self.path, abs_idx,
-                RuntimeError(f'Failed to decode frame {abs_idx}'))
+                self.path, source_idx,
+                RuntimeError(f'Failed to decode frame {source_idx}'))
         finally:
             if own_reader:
                 reader.close()
 
-    def _find_source_frame_for_cfr_output(self, output_idx: int) -> int:
-        """Find which source frame is displayed at CFR output index."""
-        source_map = self._build_cfr_source_map()
-        if output_idx < len(source_map):
-            return source_map[output_idx]
-        return len(self._index.frame_pts) - 1
-
     def _build_cfr_source_map(self) -> list[int]:
-        """Build mapping from CFR output frame index to source frame index.
+        """Build the mapping from CFR output frame index to source frame index.
 
-        Simulates FFmpeg's vsync=1 algorithm to determine which source frame
-        is displayed at each output position.
+        Simulates FFmpeg's vsync=1 algorithm to determine which source frame is
+        displayed at each output position. This map is the single source of truth
+        for CFR mode: frame count is its length, and indexing, iteration, and
+        seeking all read from it, so they cannot disagree with each other.
+
+        The arithmetic deliberately uses floats: FFmpeg computes vsync in doubles,
+        so float — not exact rational — arithmetic reproduces its output. PTS are
+        taken relative to the first frame (as ffmpeg does via the stream start
+        time), so streams that start late (e.g. MPEG-TS) produce no phantom
+        leading frames.
         """
-        if hasattr(self, '_cfr_source_map'):
-            return self._cfr_source_map
-
         fps = self.target_fps
         frame_pts = self._index.frame_pts
+        start_pts = frame_pts[0] if frame_pts else Fraction(0)
 
         # Convert PTS to output timebase (integer frame units)
-        sync_ipts_list = [round(pts * fps) for pts in frame_pts]
+        sync_ipts_list = [round(float(pts - start_pts) * fps) for pts in frame_pts]
         duration = 1  # Each source frame has duration=1 in output timebase
 
         next_pts = 0
@@ -552,108 +609,17 @@ class VideoFrames:
         for _ in range(eof_frames):
             source_map.append(len(frame_pts) - 1)
 
-        self._cfr_source_map = source_map
         return source_map
-
-    def _decode_frames_cfr_aware(
-        self, reader: PyAVReader, dtype: DTypeLike, max_frames: int | None = None
-    ) -> Generator[NDArray, None, None]:
-        """Decode frames with CFR simulation if enabled.
-
-        If constant_framerate is True, simulates FFmpeg's vsync=1 algorithm
-        to duplicate/drop frames as needed.
-        """
-        if not self.constant_framerate:
-            # VFR mode: pass through directly
-            yield from reader.decode_frames(
-                max_frames=max_frames,
-                output_shape=self.resized_imshape,
-                dtype=dtype,
-            )
-            return
-
-        # CFR mode: simulate vsync=1 algorithm
-        source_map = self._build_cfr_source_map()
-        target_format = 'rgb48' if dtype == np.uint16 else 'rgb24'
-
-        # Build filter graph for exact FFmpeg compatibility
-        graph = reader._build_filter_graph(self.resized_imshape, target_format)
-
-        source_idx = 0
-        output_idx = 0
-        prev_frame_arr = None
-
-        for frame in reader._container.decode(reader._stream):
-            # Process through filter graph for exact color conversion
-            graph.push(frame)
-            filtered_frame = graph.pull()
-            frame_arr = filtered_frame.to_ndarray()
-
-            # Output this frame for all output indices that map to this source index
-            while output_idx < len(source_map) and source_map[output_idx] == source_idx:
-                yield frame_arr
-                output_idx += 1
-                if max_frames is not None and output_idx >= max_frames:
-                    return
-
-            prev_frame_arr = frame_arr
-            source_idx += 1
-
-        # Handle any remaining output frames (EOF duplication)
-        while output_idx < len(source_map):
-            if prev_frame_arr is not None:
-                yield prev_frame_arr
-            output_idx += 1
-            if max_frames is not None and output_idx >= max_frames:
-                return
-
-    def _count_cfr_frames(self) -> int:
-        """Count frames that will be output in CFR mode (vsync=1 simulation)."""
-        fps_frac = self._target_fps_frac
-        frame_pts_list = self._index.frame_pts  # List of Fraction
-
-        # Convert PTS to output timebase (integer frame units)
-        sync_ipts_list = [round(float(pts * fps_frac)) for pts in frame_pts_list]
-        duration = 1  # Each source frame has duration=1 in output timebase
-
-        next_pts = 0
-        total_frames = 0
-        frames_prev_hist = [0, 0, 0]
-
-        for sync_ipts in sync_ipts_list:
-            delta0 = sync_ipts - next_pts
-            delta = delta0 + duration
-
-            nb_frames = 1
-            nb_frames_prev = 0
-
-            if delta < -1.1:
-                nb_frames = 0
-            elif delta > 1.1:
-                nb_frames = round(delta)
-                if delta0 > 1.1:
-                    nb_frames_prev = round(delta0 - 0.6)
-
-            total_frames += nb_frames
-            next_pts += nb_frames
-            frames_prev_hist = [nb_frames_prev] + frames_prev_hist[:2]
-
-        # At EOF, FFmpeg outputs median of last 3 nb_frames_prev values
-        eof_frames = sorted(frames_prev_hist)[1]
-        total_frames += eof_frames
-
-        return total_frames
 
     def _maybe_to_float(self, value: NDArray) -> NDArray:
         if self.dtype == np.uint8 or self.dtype == np.uint16:
             return value
 
-        if value.dtype == np.uint16 and self.dtype == np.float16:
-            x = value.clip(0, 65504).astype(np.float16)
-            x /= 65504.0
-            return x
-
         maxval = np.iinfo(value.dtype).max
+        if self.dtype == np.float16:
+            # float16 cannot represent the division in-type (uint16 values above
+            # ~65519 overflow to inf), so normalize in float32 first.
+            return (value.astype(np.float32) / maxval).astype(np.float16)
         return value.astype(self.dtype) / maxval
 
 
@@ -707,5 +673,3 @@ def has_audio(video_path: PathLike) -> bool:
     """Check if video has an audio stream using PyAV."""
     with PyAVReader(video_path) as reader:
         return reader.has_audio()
-
-

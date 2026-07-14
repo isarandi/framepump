@@ -738,6 +738,8 @@ class FrameIndexPyAV:
             pts = pkt.pts
             if pts is None:
                 pts = pkt.dts
+            # Negative-PTS packets are discard-flagged preroll (edit-list trims)
+            # that libavcodec also drops, so index and decode agree by construction.
             if pts is None or pts < 0:
                 continue
 
@@ -779,6 +781,7 @@ class FrameIndexPyAV:
             pts = pkt.pts
             if pts is None:
                 pts = pkt.dts
+            # Negative PTS = discard-flagged preroll; see _build_from_packets.
             if pts is None or pts < 0:
                 continue
             file_order_pts.append(pts)

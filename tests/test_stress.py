@@ -1,5 +1,7 @@
 """Stress tests to break framepump - find weak spots in the library."""
 
+import itertools
+
 import numpy as np
 import pytest
 import tempfile
@@ -123,15 +125,30 @@ PARTIAL_FATE_FILES = {
     'zmbv/wc2_001-partial.avi',
 }
 
+# Conformance-corner files from which the system libavcodec itself decodes
+# zero frames (packets demux fine; the decoder produces no output and no
+# error). framepump cannot yield frames that libav does not produce.
+UNDECODABLE_FATE_FILES = {
+    'h264/H264_might_overflow.mkv',
+}
+
 
 def find_videos_in_fate(extensions=None, max_count=50):
-    """Find video files in fate/ directory for testing exotic formats."""
+    """Find video files in fate/ directory for testing exotic formats.
+
+    Deterministic (set iteration and rglob order are not stable across
+    processes) and format-diverse: files are taken round-robin across the
+    extensions, sorted within each.
+    """
     if extensions is None:
         extensions = {'.avi', '.mov', '.mp4', '.mkv', '.webm', '.flv'}
 
+    per_ext = [sorted(FATE_DIR.rglob(f'*{ext}')) for ext in sorted(extensions)]
     videos = []
-    for ext in extensions:
-        for p in FATE_DIR.rglob(f'*{ext}'):
+    for group in itertools.zip_longest(*per_ext):
+        for p in group:
+            if p is None:
+                continue
             videos.append(p)
             if len(videos) >= max_count:
                 return videos
@@ -189,6 +206,7 @@ class TestExoticFormats:
         rel_path = str(video_path.relative_to(FATE_DIR))
         is_audio_only = rel_path in AUDIO_ONLY_FATE_FILES
         is_partial = rel_path in PARTIAL_FATE_FILES
+        may_be_empty = rel_path in UNDECODABLE_FATE_FILES
 
         try:
             frames = VideoFrames(str(video_path))
@@ -199,7 +217,7 @@ class TestExoticFormats:
                 count += 1
                 if count >= 5:
                     break
-            assert count > 0, f'No frames yielded from {video_path.name}'
+            assert count > 0 or may_be_empty, f'No frames yielded from {video_path.name}'
             if is_audio_only:
                 pytest.fail(f'{video_path.name} should have raised "No video stream" error')
         except ValueError as e:

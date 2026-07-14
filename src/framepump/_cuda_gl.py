@@ -60,12 +60,16 @@ class CudaToGLUploader:
         """Copy a CUDA tensor to the GL texture (GPU-to-GPU).
 
         Args:
-            tensor: Any object with a ``.data_ptr()`` method returning a
-                CUdeviceptr (e.g., a ``torch.Tensor`` on CUDA). Expected
-                shape is ``(H, W, C)`` with contiguous row-major layout.
+            tensor: A uint8 CUDA tensor of shape ``(height, width, channels)``
+                matching the registered texture, C-contiguous, exposing
+                ``dtype``/``shape``/``device``/``is_contiguous()``/``data_ptr()``
+                (e.g., a ``torch.Tensor``). Other dtypes or strided layouts are
+                rejected: the copy is a raw 2D DMA whose pitch assumes one byte
+                per channel, and the GL texture's internal format must match.
         """
         if self._resource is None:
             raise RuntimeError('Uploader has been closed.')
+        _validate_upload_tensor(tensor, self._height, self._width, self._channels)
 
         src_ptr = tensor.data_ptr()
         row_bytes = self._width * self._channels
@@ -112,3 +116,27 @@ class CudaToGLUploader:
 
     def __exit__(self, *args) -> None:
         self.close()
+
+
+def _validate_upload_tensor(tensor, height: int, width: int, channels: int) -> None:
+    dtype = getattr(tensor, 'dtype', None)
+    shape = getattr(tensor, 'shape', None)
+    device = getattr(tensor, 'device', None)
+    is_contiguous = getattr(tensor, 'is_contiguous', None)
+    if dtype is None or shape is None or device is None or not callable(is_contiguous):
+        raise TypeError(
+            'upload() expects a CUDA tensor exposing dtype, shape, device and '
+            f'is_contiguous(), e.g. a torch.Tensor; got {type(tensor).__name__}')
+    if str(dtype).rsplit('.', 1)[-1] != 'uint8':
+        raise ValueError(
+            'upload() requires a uint8 tensor (the GL texture stores one byte per '
+            f'channel), got dtype {dtype}')
+    if getattr(device, 'type', None) != 'cuda':
+        raise ValueError(f'upload() requires a tensor on a CUDA device, got {device}')
+    if tuple(shape) != (height, width, channels):
+        raise ValueError(
+            'upload() expects shape (height, width, channels) = '
+            f'({height}, {width}, {channels}) matching the registered texture, '
+            f'got {tuple(shape)}')
+    if not is_contiguous():
+        raise ValueError('upload() requires a C-contiguous tensor; call .contiguous() first')

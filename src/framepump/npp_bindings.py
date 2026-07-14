@@ -6,12 +6,17 @@ import ctypes
 from ctypes import c_float, c_int, c_size_t, c_uint, c_uint16, c_void_p, Structure
 
 # ---------------------------------------------------------------------------
-# Libraries
+# Libraries (import stays safe without them; first use raises, see _require_npp)
 # ---------------------------------------------------------------------------
-_nppicc = ctypes.CDLL('libnppicc.so')    # color conversion
-_nppidei = ctypes.CDLL('libnppidei.so')  # data exchange and initialization
-_nppial = ctypes.CDLL('libnppial.so')    # arithmetic and logical
-_nppig = ctypes.CDLL('libnppig.so')      # geometry transforms (resize)
+try:
+    _nppicc = ctypes.CDLL('libnppicc.so')    # color conversion
+    _nppidei = ctypes.CDLL('libnppidei.so')  # data exchange and initialization
+    _nppial = ctypes.CDLL('libnppial.so')    # arithmetic and logical
+    _nppig = ctypes.CDLL('libnppig.so')      # geometry transforms (resize)
+    _load_error: OSError | None = None
+except OSError as _e:
+    _nppicc = _nppidei = _nppial = _nppig = None
+    _load_error = _e
 
 
 # ---------------------------------------------------------------------------
@@ -134,112 +139,114 @@ _TwistMatrix = _TwistRow * 3
 # 8-bit function bindings (_Ctx variants — compatible with CUDA 12.x and 13.x)
 # ---------------------------------------------------------------------------
 
-# nppiRGBToYCbCr420_8u_C3P3R_Ctx
-_nppicc.nppiRGBToYCbCr420_8u_C3P3R_Ctx.argtypes = [
-    c_void_p, c_int, c_void_p * 3, c_int * 3, NppiSize, NppStreamContext,
-]
-_nppicc.nppiRGBToYCbCr420_8u_C3P3R_Ctx.restype = c_int
+if _load_error is None:
+    # nppiRGBToYCbCr420_8u_C3P3R_Ctx
+    _nppicc.nppiRGBToYCbCr420_8u_C3P3R_Ctx.argtypes = [
+        c_void_p, c_int, c_void_p * 3, c_int * 3, NppiSize, NppStreamContext,
+    ]
+    _nppicc.nppiRGBToYCbCr420_8u_C3P3R_Ctx.restype = c_int
 
-# nppiYCbCr420_8u_P3P2R_Ctx
-_nppicc.nppiYCbCr420_8u_P3P2R_Ctx.argtypes = [
-    c_void_p * 3, c_int * 3, c_void_p, c_int, c_void_p, c_int, NppiSize,
-    NppStreamContext,
-]
-_nppicc.nppiYCbCr420_8u_P3P2R_Ctx.restype = c_int
+    # nppiYCbCr420_8u_P3P2R_Ctx
+    _nppicc.nppiYCbCr420_8u_P3P2R_Ctx.argtypes = [
+        c_void_p * 3, c_int * 3, c_void_p, c_int, c_void_p, c_int, NppiSize,
+        NppStreamContext,
+    ]
+    _nppicc.nppiYCbCr420_8u_P3P2R_Ctx.restype = c_int
 
-# nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx
-_nppicc.nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx.argtypes = [
-    c_void_p * 2,      # pSrc[2]: Y ptr, UV ptr
-    c_int * 2,         # aSrcStep[2]: Y pitch, UV pitch (bytes)
-    c_void_p,          # pDst: packed RGB8
-    c_int,             # nDstStep (bytes)
-    NppiSize,          # oSizeROI
-    _TwistMatrix,      # aTwist[3][4]
-    NppStreamContext,   # nppStreamCtx (by value)
-]
-_nppicc.nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx.restype = c_int
+    # nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx
+    _nppicc.nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx.argtypes = [
+        c_void_p * 2,      # pSrc[2]: Y ptr, UV ptr
+        c_int * 2,         # aSrcStep[2]: Y pitch, UV pitch (bytes)
+        c_void_p,          # pDst: packed RGB8
+        c_int,             # nDstStep (bytes)
+        NppiSize,          # oSizeROI
+        _TwistMatrix,      # aTwist[3][4]
+        NppStreamContext,   # nppStreamCtx (by value)
+    ]
+    _nppicc.nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx.restype = c_int
 
-# nppiResize_8u_C1R_Ctx (geometry library — single-channel 8-bit resize)
-_nppig.nppiResize_8u_C1R_Ctx.argtypes = [
-    c_void_p, c_int, NppiSize, NppiRect,  # src ptr, src pitch, src size, src ROI
-    c_void_p, c_int, NppiSize, NppiRect,  # dst ptr, dst pitch, dst size, dst ROI
-    c_int,                                  # interpolation mode
-    NppStreamContext,
-]
-_nppig.nppiResize_8u_C1R_Ctx.restype = c_int
+    # nppiResize_8u_C1R_Ctx (geometry library — single-channel 8-bit resize)
+    _nppig.nppiResize_8u_C1R_Ctx.argtypes = [
+        c_void_p, c_int, NppiSize, NppiRect,  # src ptr, src pitch, src size, src ROI
+        c_void_p, c_int, NppiSize, NppiRect,  # dst ptr, dst pitch, dst size, dst ROI
+        c_int,                                  # interpolation mode
+        NppStreamContext,
+    ]
+    _nppig.nppiResize_8u_C1R_Ctx.restype = c_int
 
 
 # ---------------------------------------------------------------------------
 # 16-bit function bindings
 # ---------------------------------------------------------------------------
 
-# nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx
-# P016 (NV12 16-bit, 2 planes) -> packed RGB16
-_nppicc.nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx.argtypes = [
-    c_void_p * 2,      # pSrc[2]: Y ptr, UV ptr
-    c_int * 2,         # aSrcStep[2]: Y pitch, UV pitch (bytes)
-    c_void_p,          # pDst: packed RGB16
-    c_int,             # nDstStep (bytes)
-    NppiSize,          # oSizeROI
-    _TwistMatrix,      # aTwist[3][4]
-    NppStreamContext,   # nppStreamCtx (by value)
-]
-_nppicc.nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx.restype = c_int
+if _load_error is None:
+    # nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx
+    # P016 (NV12 16-bit, 2 planes) -> packed RGB16
+    _nppicc.nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx.argtypes = [
+        c_void_p * 2,      # pSrc[2]: Y ptr, UV ptr
+        c_int * 2,         # aSrcStep[2]: Y pitch, UV pitch (bytes)
+        c_void_p,          # pDst: packed RGB16
+        c_int,             # nDstStep (bytes)
+        NppiSize,          # oSizeROI
+        _TwistMatrix,      # aTwist[3][4]
+        NppStreamContext,   # nppStreamCtx (by value)
+    ]
+    _nppicc.nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx.restype = c_int
 
-# nppiColorTwist32f_16u_C3IR_Ctx
-# In-place color twist on packed 16-bit 3-channel data
-_nppicc.nppiColorTwist32f_16u_C3IR_Ctx.argtypes = [
-    c_void_p,          # pSrcDst
-    c_int,             # nSrcDstStep (bytes)
-    NppiSize,          # oSizeROI
-    _TwistMatrix,      # aTwist[3][4]
-    NppStreamContext,   # nppStreamCtx
-]
-_nppicc.nppiColorTwist32f_16u_C3IR_Ctx.restype = c_int
+    # nppiColorTwist32f_16u_C3IR_Ctx
+    # In-place color twist on packed 16-bit 3-channel data
+    _nppicc.nppiColorTwist32f_16u_C3IR_Ctx.argtypes = [
+        c_void_p,          # pSrcDst
+        c_int,             # nSrcDstStep (bytes)
+        NppiSize,          # oSizeROI
+        _TwistMatrix,      # aTwist[3][4]
+        NppStreamContext,   # nppStreamCtx
+    ]
+    _nppicc.nppiColorTwist32f_16u_C3IR_Ctx.restype = c_int
 
-# nppiCopy_16u_P3C3R_Ctx
-# Interleave 3 planar 16-bit channels into packed (H,W,3)
-_nppidei.nppiCopy_16u_P3C3R_Ctx.argtypes = [
-    c_void_p * 3,      # aSrc[3]
-    c_int,             # nSrcStep (bytes, same for all planes)
-    c_void_p,          # pDst: packed output
-    c_int,             # nDstStep (bytes)
-    NppiSize,          # oSizeROI
-    NppStreamContext,   # nppStreamCtx
-]
-_nppidei.nppiCopy_16u_P3C3R_Ctx.restype = c_int
+    # nppiCopy_16u_P3C3R_Ctx
+    # Interleave 3 planar 16-bit channels into packed (H,W,3)
+    _nppidei.nppiCopy_16u_P3C3R_Ctx.argtypes = [
+        c_void_p * 3,      # aSrc[3]
+        c_int,             # nSrcStep (bytes, same for all planes)
+        c_void_p,          # pDst: packed output
+        c_int,             # nDstStep (bytes)
+        NppiSize,          # oSizeROI
+        NppStreamContext,   # nppStreamCtx
+    ]
+    _nppidei.nppiCopy_16u_P3C3R_Ctx.restype = c_int
 
-# nppiConvert_8u16u_C3R_Ctx
-# Widen uint8 -> uint16 (zero-extend: 128 -> 128)
-_nppidei.nppiConvert_8u16u_C3R_Ctx.argtypes = [
-    c_void_p, c_int,   # pSrc, nSrcStep
-    c_void_p, c_int,   # pDst, nDstStep
-    NppiSize,          # oSizeROI
-    NppStreamContext,   # nppStreamCtx
-]
-_nppidei.nppiConvert_8u16u_C3R_Ctx.restype = c_int
+    # nppiConvert_8u16u_C3R_Ctx
+    # Widen uint8 -> uint16 (zero-extend: 128 -> 128)
+    _nppidei.nppiConvert_8u16u_C3R_Ctx.argtypes = [
+        c_void_p, c_int,   # pSrc, nSrcStep
+        c_void_p, c_int,   # pDst, nDstStep
+        NppiSize,          # oSizeROI
+        NppStreamContext,   # nppStreamCtx
+    ]
+    _nppidei.nppiConvert_8u16u_C3R_Ctx.restype = c_int
 
-# nppiConvert_8u16u_C1R_Ctx
-# Widen single-channel uint8 -> uint16 (zero-extend)
-_nppidei.nppiConvert_8u16u_C1R_Ctx.argtypes = [
-    c_void_p, c_int,   # pSrc, nSrcStep
-    c_void_p, c_int,   # pDst, nDstStep
-    NppiSize,          # oSizeROI
-    NppStreamContext,   # nppStreamCtx
-]
-_nppidei.nppiConvert_8u16u_C1R_Ctx.restype = c_int
+    # nppiConvert_8u16u_C1R_Ctx
+    # Widen single-channel uint8 -> uint16 (zero-extend)
+    _nppidei.nppiConvert_8u16u_C1R_Ctx.argtypes = [
+        c_void_p, c_int,   # pSrc, nSrcStep
+        c_void_p, c_int,   # pDst, nDstStep
+        NppiSize,          # oSizeROI
+        NppStreamContext,   # nppStreamCtx
+    ]
+    _nppidei.nppiConvert_8u16u_C1R_Ctx.restype = c_int
 
-# nppiMulC_16u_C3IRSfs_Ctx
-# In-place multiply 3-channel uint16 by per-channel constants
-_nppial.nppiMulC_16u_C3IRSfs_Ctx.argtypes = [
-    c_uint16 * 3,      # aConstants[3] (Npp16u)
-    c_void_p,          # pSrcDst
-    c_int,             # nSrcDstStep (bytes)
-    NppiSize,          # oSizeROI
-    c_int,             # nScaleFactor
-    NppStreamContext,   # nppStreamCtx
-]
-_nppial.nppiMulC_16u_C3IRSfs_Ctx.restype = c_int
+    # nppiMulC_16u_C3IRSfs_Ctx
+    # In-place multiply 3-channel uint16 by per-channel constants
+    _nppial.nppiMulC_16u_C3IRSfs_Ctx.argtypes = [
+        c_uint16 * 3,      # aConstants[3] (Npp16u)
+        c_void_p,          # pSrcDst
+        c_int,             # nSrcDstStep (bytes)
+        NppiSize,          # oSizeROI
+        c_int,             # nScaleFactor
+        NppStreamContext,   # nppStreamCtx
+    ]
+    _nppial.nppiMulC_16u_C3IRSfs_Ctx.restype = c_int
 
 
 # ---------------------------------------------------------------------------
@@ -298,15 +305,42 @@ def _check(status: int, name: str) -> None:
         raise RuntimeError(f'NPP {name} failed with status {status}')
 
 
-_default_npp_ctx: NppStreamContext | None = None
+def _require_npp() -> None:
+    if _load_error is not None:
+        raise RuntimeError(
+            'NPP libraries (libnpp*) could not be loaded; GPU color conversion '
+            f'is unavailable: {_load_error}')
+
+
+def _require_even_dims(width: int, height: int, what: str) -> None:
+    if width % 2 or height % 2:
+        raise ValueError(
+            f'{what} requires even width and height (4:2:0 chroma is subsampled '
+            f'2x2), got {width}x{height}')
+
+
+_default_ctx_cache: dict[int, NppStreamContext] = {}
 
 
 def _get_default_ctx() -> NppStreamContext:
-    """Lazily create a default NppStreamContext (GPU 0, default stream)."""
-    global _default_npp_ctx
-    if _default_npp_ctx is None:
-        _default_npp_ctx = make_npp_stream_context(0)
-    return _default_npp_ctx
+    """Context for the current CUDA device, default stream (cached per device).
+
+    The returned struct is shared — callers must not mutate it. To use a
+    different stream, pass an explicit ``make_npp_stream_context`` result.
+    """
+    from cuda.bindings import driver
+
+    err, dev = driver.cuCtxGetDevice()
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            'No current CUDA context; create one first or pass an explicit '
+            f'NppStreamContext (cuCtxGetDevice failed: {err})')
+    device_id = int(dev)
+    ctx = _default_ctx_cache.get(device_id)
+    if ctx is None:
+        ctx = make_npp_stream_context(device_id)
+        _default_ctx_cache[device_id] = ctx
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +356,8 @@ def yuv420_to_nv12(
     ctx: NppStreamContext | None = None,
 ) -> None:
     """Convert YUV420 planar (3 planes) to NV12 (2 planes) on GPU."""
+    _require_npp()
+    _require_even_dims(width, height, 'yuv420_to_nv12')
     if ctx is None:
         ctx = _get_default_ctx()
     size = NppiSize(width, height)
@@ -343,6 +379,8 @@ def rgb_to_nv12(
     ctx: NppStreamContext | None = None,
 ) -> None:
     """Convert RGB to NV12 on GPU (two-step via YCbCr420 intermediate)."""
+    _require_npp()
+    _require_even_dims(width, height, 'rgb_to_nv12')
     if ctx is None:
         ctx = _get_default_ctx()
     size = NppiSize(width, height)
@@ -374,6 +412,8 @@ def nv12_to_rgb8(
     ctx: NppStreamContext | None = None,
 ) -> None:
     """Convert NV12 to packed RGB uint8 with a color twist matrix."""
+    _require_npp()
+    _require_even_dims(width, height, 'nv12_to_rgb8')
     if ctx is None:
         ctx = _get_default_ctx()
     size = NppiSize(width, height)
@@ -401,6 +441,8 @@ def nv12_to_p016(
     The UV plane is treated as single-channel with width equal to the luma
     width (since NV12 UV is interleaved U0V0U1V1... = width bytes per row).
     """
+    _require_npp()
+    _require_even_dims(width, height, 'nv12_to_p016')
     if ctx is None:
         ctx = _get_default_ctx()
 
@@ -425,6 +467,7 @@ def resize_plane_8u(
     ctx: NppStreamContext | None = None,
 ) -> None:
     """Resize a single-channel 8-bit plane on GPU using area averaging."""
+    _require_npp()
     if ctx is None:
         ctx = _get_default_ctx()
     src_size = NppiSize(src_w, src_h)
@@ -547,6 +590,7 @@ def p016_to_rgb16(
     Step 1: NV12 → packed YCbCr16 (identity twist — just unpack + upsample).
     Step 2: In-place color twist on packed data (standard semantics, stable).
     """
+    _require_npp()
     size = NppiSize(width, height)
     src_ptrs = (c_void_p * 2)(y_ptr, uv_ptr)
     src_steps = (c_int * 2)(y_pitch, uv_pitch)
@@ -582,6 +626,7 @@ def yuv444_16bit_to_rgb16(
     The destination buffer is used for both steps (interleave target,
     then in-place twist), so it must be pre-allocated.
     """
+    _require_npp()
     size = NppiSize(width, height)
     src_ptrs = (c_void_p * 3)(y_ptr, u_ptr, v_ptr)
 
@@ -612,6 +657,7 @@ def rgb8_to_rgb16(
     Step 2: Multiply by 257 to fill the full uint16 range (128 -> 32896).
     This matches FFmpeg's rgb24->rgb48 conversion behavior.
     """
+    _require_npp()
     size = NppiSize(width, height)
 
     # Step 1: Widen 8u -> 16u

@@ -46,6 +46,9 @@ class EncoderConfig:
         gop: Group of Pictures size (keyframe interval). Larger = better
             compression but slower seeking. Default 250.
         codec: 'h264' or 'hevc'. HEVC is ~30% smaller but slower to decode.
+
+    Invalid values raise TypeError/ValueError at construction rather than
+    failing (or being silently reinterpreted) inside the encoder.
     """
 
     crf: int = 15
@@ -53,6 +56,19 @@ class EncoderConfig:
     bframes: int = 2
     gop: int = 250
     codec: Literal['h264', 'hevc'] = 'h264'
+
+    def __post_init__(self) -> None:
+        _check_int_field('crf', self.crf, 0, 51)
+        _check_int_field('bframes', self.bframes, 0, 4)
+        _check_int_field('gop', self.gop, 1, None)
+        if self.codec not in ('h264', 'hevc'):
+            raise ValueError(f"codec must be 'h264' or 'hevc', got {self.codec!r}")
+        if self.preset is not None:
+            known_presets = NVENC_TO_X264.keys() | X264_TO_NVENC.keys()
+            if self.preset not in known_presets:
+                raise ValueError(
+                    f'preset must be None or one of {sorted(known_presets)}, '
+                    f'got {self.preset!r}')
 
     def with_overrides(self, **kwargs) -> EncoderConfig:
         """Return a new config with the given overrides."""
@@ -101,3 +117,12 @@ class EncoderConfig:
         options['g'] = str(self.gop)
 
         return options
+
+
+def _check_int_field(name: str, value, lo: int, hi: int | None) -> None:
+    # bool is an int subtype but is always a bug in these fields
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f'{name} must be an int, got {type(value).__name__}')
+    if value < lo or (hi is not None and value > hi):
+        bound = f'in [{lo}, {hi}]' if hi is not None else f'>= {lo}'
+        raise ValueError(f'{name} must be {bound}, got {value}')

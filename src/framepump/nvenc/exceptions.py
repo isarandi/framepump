@@ -32,8 +32,14 @@ NVENC_STATUS_CODES = {
 }
 
 
-def nvenc_status_message(status: int, context: str = '') -> str:
-    """Convert NVENC status code to a human-readable message."""
+def nvenc_status_message(status: int, context: str = '', detail: str | None = None) -> str:
+    """Convert NVENC status code to a human-readable message.
+
+    Args:
+        status: NVENC status code.
+        context: What operation failed.
+        detail: Driver-provided detail (from nvEncGetLastErrorString).
+    """
     name = NVENC_STATUS_CODES.get(status, f'UNKNOWN_ERROR_{status}')
 
     # Add helpful hints for common errors
@@ -49,7 +55,10 @@ def nvenc_status_message(status: int, context: str = '') -> str:
         hint = ''
 
     prefix = f'{context}: ' if context else ''
-    return f'{prefix}{name}{hint}'
+    message = f'{prefix}{name}{hint}'
+    if detail:
+        message += f'\nDriver detail: {detail}'
+    return message
 
 
 class NvencError(Exception):

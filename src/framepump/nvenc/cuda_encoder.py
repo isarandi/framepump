@@ -1,18 +1,22 @@
-"""Zero-copy NVENC encoder via CUDA path (works with EGL and GLX).
+"""NVENC encoder via CUDA path (works with EGL and GLX).
 
-This encoder uses CUDA-GL interop to access GL textures as CUarray,
-then registers the CUarray directly with NVENC. True zero-copy path:
+This encoder uses CUDA-GL interop to access GL textures as CUarray, copies
+each frame into an internal ring of staging CUDA arrays, and encodes those
+with NVENC in CUDA device mode:
 
-    GL texture → CUarray (same memory) → NVENC CUDA mode (same memory) → H.264
+    GL texture → CUarray → staging CUarray ring → NVENC CUDA mode → H.264
 
-No intermediate copies. Works with both EGL (headless) and GLX contexts.
+The staging copy decouples the caller's texture from the encoder pipeline:
+the caller may re-render into the source texture immediately after encode()
+returns, even with B-frames enabled (NVENC reads inputs asynchronously while
+frames are buffered for reordering). Works with both EGL (headless) and GLX
+contexts.
 """
 
 from __future__ import annotations
 
-import ctypes
 from contextlib import AbstractContextManager
-from ctypes import byref, c_void_p, c_uint32
+from ctypes import c_void_p
 from fractions import Fraction
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -20,69 +24,47 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import moderngl
 
-# OpenGL constant
-GL_TEXTURE_2D = 0x0DE1
-
 from cuda.bindings import driver  # type: ignore[attr-defined]
 
 from .._cuda_compat import cuCtxCreate
-from .encoder import EncodedPacket
-from .exceptions import NvencError, TextureFormatError, EncoderNotInitialized, nvenc_status_message
+from ._session import EncodedPacket, NvencEncodeSession
 from .bindings import (
-    NvencAPI,
-    NVENCAPI_VERSION,
-    NV_ENC_DEVICE_TYPE_CUDA,
-    NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
     NV_ENC_BUFFER_FORMAT_ABGR,
-    NV_ENC_PIC_STRUCT_FRAME,
-    NV_ENC_PIC_FLAG_EOS,
-    NV_ENC_SUCCESS,
-    NV_ENC_ERR_NEED_MORE_INPUT,
+    NV_ENC_DEVICE_TYPE_CUDA,
     NV_ENC_INPUT_IMAGE,
-    NV_ENC_PIC_TYPE_IDR,
-    NV_ENC_TUNING_INFO_HIGH_QUALITY,
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-    NV_ENC_INITIALIZE_PARAMS_VER,
-    NV_ENC_CONFIG_VER,
-    NV_ENC_PRESET_CONFIG_VER,
-    NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
-    NV_ENC_PIC_PARAMS_VER,
-    NV_ENC_LOCK_BITSTREAM_VER,
-    NV_ENC_REGISTER_RESOURCE_VER,
-    NV_ENC_MAP_INPUT_RESOURCE_VER,
-    GUID,
-    NV_ENC_CODEC_H264_GUID,
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
-    NV_ENC_CONFIG,
-    NV_ENC_PRESET_CONFIG,
-    NV_ENC_INITIALIZE_PARAMS,
-    NV_ENC_CREATE_BITSTREAM_BUFFER,
+    NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
     NV_ENC_REGISTER_RESOURCE,
-    NV_ENC_MAP_INPUT_RESOURCE,
-    NV_ENC_PIC_PARAMS,
-    NV_ENC_LOCK_BITSTREAM,
+    NV_ENC_REGISTER_RESOURCE_VER,
 )
-from .presets import DEFAULT_PRESET
+from .exceptions import EncoderNotInitialized, NvencError
+
+__all__ = ['NvencCudaEncoder', 'EncodedPacket']
+
+# OpenGL constant
+GL_TEXTURE_2D = 0x0DE1
 
 
 class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
-    """Zero-copy NVENC encoder via CUDA path (EGL + GLX support).
+    """NVENC encoder via CUDA path (EGL + GLX support).
 
-    Uses CUDA-GL interop to map GL textures directly to NVENC without
-    any memory copies. Works with both EGL (headless) and GLX contexts.
+    Uses CUDA-GL interop to read GL textures and NVENC's CUDA device mode
+    for encoding. Each frame is copied into an internal staging CUDA array,
+    so the source texture is free to be re-rendered as soon as encode()
+    returns. Works with both EGL (headless) and GLX contexts.
 
     Args:
         width: Frame width in pixels
         height: Frame height in pixels
         fps: Frame rate (default: 30)
         crf: Constant quality factor (0-51, lower = better quality, default: 15)
-        gop: GOP length / keyframe interval (default: 250)
+        gop: GOP length / keyframe (IDR) interval (default: 250)
         bframes: Number of B-frames (default: 2)
+        gpu: CUDA device ordinal; None auto-detects from the GL context.
 
     Example:
         >>> ctx = moderngl.create_standalone_context()  # EGL headless
         >>> with NvencCudaEncoder(640, 480, fps=30, crf=18) as encoder:
-        ...     packet = encoder.encode(texture)
+        ...     packets = encoder.encode(texture)
         ...     # packet.data contains H.264 NAL units
     """
 
@@ -98,34 +80,31 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
     ) -> None:
         self._width = width
         self._height = height
-        self._fps: Fraction = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(100000)
-        self._crf = crf
-        self._gop = gop
-        self._bframes = bframes
+        fps = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(100000)
         self._gpu = gpu
-        self._preset_config = DEFAULT_PRESET
-        self._frame_idx = 0  # Input frame counter (PTS / display order)
-        self._output_idx = 0  # Output packet counter (DTS / decode order)
         self._closed = False
-
-        # Initialize CUDA context
-        self._cuda_ctx = self._ensure_cuda_context()
+        self._session: NvencEncodeSession | None = None
 
         # Texture mappers (texture_id -> mapper)
         self._texture_mappers: dict[int, _GLTextureToCUDA] = {}
 
-        # NVENC state
-        self._api = NvencAPI()
-        self._encoder = None
-        self._registered_arrays: dict[int, tuple] = {}  # cu_array_ptr -> (registered, cu_array)
+        # Staging arrays and their NVENC registrations, filled lazily.
+        self._staging_arrays: list[Any] | None = None
+        self._registered_staging: list[c_void_p] = []
 
-        # Multiple bitstream buffers for B-frame reordering.
-        self._num_bs_buffers = bframes + 2
-        self._bitstream_buffers: list = []
-        self._next_submit = 0
-        self._next_read = 0
+        # Initialize CUDA context
+        self._cuda_ctx = self._ensure_cuda_context()
 
-        self._init_encoder()
+        self._session = NvencEncodeSession(
+            device_type=NV_ENC_DEVICE_TYPE_CUDA,
+            device=int(self._cuda_ctx),
+            width=width,
+            height=height,
+            fps=fps,
+            crf=crf,
+            gop=gop,
+            bframes=bframes,
+        )
 
     def _ensure_cuda_context(self) -> Any:
         """Ensure CUDA is initialized on the correct device.
@@ -135,7 +114,7 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         2. Explicit gpu device ordinal (if self._gpu is set)
         3. Auto-detect from GL context via cuGLGetDevices
         """
-        err, = driver.cuInit(0)
+        (err,) = driver.cuInit(0)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise NvencError(f'Failed to initialize CUDA: {err}')
 
@@ -174,8 +153,7 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         # cuda-python 13+ returns (err, count, devices_list) directly
         max_devices = 16
         err, count, devices = driver.cuGLGetDevices(
-            max_devices,
-            driver.CUGLDeviceList.CU_GL_DEVICE_LIST_ALL
+            max_devices, driver.CUGLDeviceList.CU_GL_DEVICE_LIST_ALL
         )
 
         if err != driver.CUresult.CUDA_SUCCESS:
@@ -206,12 +184,15 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         for i in range(count):
             device = devices[i]
             err, name_bytes = driver.cuDeviceGetName(256, device)
-            name = name_bytes.decode().rstrip('\x00') if err == driver.CUresult.CUDA_SUCCESS else f'device {i}'
+            name = (
+                name_bytes.decode().rstrip('\x00')
+                if err == driver.CUresult.CUDA_SUCCESS
+                else f'device {i}'
+            )
 
             # Check compute capability (NVENC requires >= 3.0, i.e. Kepler+)
             err, major = driver.cuDeviceGetAttribute(
-                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                device
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device
             )
             if err == driver.CUresult.CUDA_SUCCESS and major >= 3:
                 return device  # Found a good one
@@ -221,127 +202,19 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         raise NvencError(
             f'No NVENC-capable GPU found for the current OpenGL context.\n\n'
             f'Found {count} CUDA device(s) compatible with GL, but none support NVENC:\n'
-            + '\n'.join(f'  - {name}' for name in devices_without_nvenc) +
-            '\n\nNVENC requires compute capability >= 3.0:\n'
+            + '\n'.join(f'  - {name}' for name in devices_without_nvenc)
+            + '\n\nNVENC requires compute capability >= 3.0:\n'
             '  - GeForce GTX 600 series and newer\n'
             '  - Quadro K series and newer\n'
             '  - Tesla K series and newer'
         )
 
-    def _init_encoder(self) -> None:
-        """Initialize NVENC encoder in CUDA device mode."""
-        # Open session with CUDA device
-        params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS()
-        params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER
-        params.deviceType = NV_ENC_DEVICE_TYPE_CUDA
-        params.device = int(self._cuda_ctx)
-        params.apiVersion = NVENCAPI_VERSION
-
-        encoder = c_void_p()
-        status = self._api.nvEncOpenEncodeSessionEx(byref(params), byref(encoder))
-        if status != NV_ENC_SUCCESS:
-            raise NvencError(nvenc_status_message(status, 'Failed to open CUDA encode session'))
-        self._encoder = encoder
-
-        # Get codec and preset GUIDs
-        codec_guid = NV_ENC_CODEC_H264_GUID
-        preset_count = c_uint32()
-        self._api.nvEncGetEncodePresetCount(self._encoder, codec_guid, byref(preset_count))
-        preset_guids = (GUID * preset_count.value)()
-        actual_count = c_uint32()
-        self._api.nvEncGetEncodePresetGUIDs(
-            self._encoder, codec_guid, preset_guids, preset_count.value, byref(actual_count)
-        )
-        preset_guid = preset_guids[0]
-
-        # Get preset config (use Ex API with tuning info, required by newer drivers)
-        tuning_info = NV_ENC_TUNING_INFO_HIGH_QUALITY
-        preset_config = NV_ENC_PRESET_CONFIG()
-        preset_config.version = NV_ENC_PRESET_CONFIG_VER
-        preset_config.presetCfg.version = NV_ENC_CONFIG_VER
-        self._api.nvEncGetEncodePresetConfigEx(
-            self._encoder, codec_guid, preset_guid,
-            tuning_info, byref(preset_config))
-
-        # Configure encoder
-        config = NV_ENC_CONFIG()
-        ctypes.memmove(byref(config), byref(preset_config.presetCfg), ctypes.sizeof(NV_ENC_CONFIG))
-        config.version = NV_ENC_CONFIG_VER
-        config.gopLength = self._gop
-        config.frameIntervalP = self._bframes + 1  # frameIntervalP = 1 + num_b_frames
-        config.rcParams.rateControlMode = self._preset_config['rate_control']
-        # VBR with targetQuality (CQ mode) - similar to CRF
-        config.rcParams.targetQuality = self._crf
-        config.rcParams.averageBitRate = 0  # Uncapped
-        config.rcParams.maxBitRate = 0  # Uncapped
-
-        self._config = config
-
-        # Initialize
-        init_params = NV_ENC_INITIALIZE_PARAMS()
-        init_params.version = NV_ENC_INITIALIZE_PARAMS_VER
-        init_params.encodeGUID = codec_guid
-        init_params.presetGUID = preset_guid
-        init_params.encodeWidth = self._width
-        init_params.encodeHeight = self._height
-        init_params.darWidth = self._width
-        init_params.darHeight = self._height
-        init_params.frameRateNum = self._fps.numerator
-        init_params.frameRateDen = self._fps.denominator
-        init_params.enableEncodeAsync = 0
-        init_params.enablePTD = 1
-        init_params.tuningInfo = tuning_info
-        init_params.encodeConfig = ctypes.pointer(config)
-
-        status = self._api.nvEncInitializeEncoder(self._encoder, byref(init_params))
-        if status != NV_ENC_SUCCESS:
-            raise NvencError(nvenc_status_message(status, 'Failed to initialize encoder'))
-
-        # Create bitstream buffers
-        for i in range(self._num_bs_buffers):
-            bs_params = NV_ENC_CREATE_BITSTREAM_BUFFER()
-            bs_params.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER
-            status = self._api.nvEncCreateBitstreamBuffer(self._encoder, byref(bs_params))
-            if status != NV_ENC_SUCCESS:
-                raise NvencError(nvenc_status_message(status, f'Failed to create bitstream buffer {i}'))
-            self._bitstream_buffers.append(bs_params.bitstreamBuffer)
-
-    def _get_texture_id(self, texture: moderngl.Texture | int) -> int:
-        if isinstance(texture, int):
-            return texture
-        return texture.glo
-
-    def _get_texture_size(self, texture: moderngl.Texture | int) -> tuple[int, int]:
-        if isinstance(texture, int):
-            return self._width, self._height
-        return texture.size
-
-    def _register_cuarray(self, cu_array: Any) -> c_void_p:
-        """Register CUarray with NVENC."""
-        ptr = int(cu_array)
-        if ptr in self._registered_arrays:
-            return self._registered_arrays[ptr][0]
-
-        reg = NV_ENC_REGISTER_RESOURCE()
-        reg.version = NV_ENC_REGISTER_RESOURCE_VER
-        reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY
-        reg.width = self._width
-        reg.height = self._height
-        reg.pitch = self._width * 4
-        reg.resourceToRegister = ptr
-        reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR
-        reg.bufferUsage = NV_ENC_INPUT_IMAGE
-
-        status = self._api.nvEncRegisterResource(self._encoder, byref(reg))
-        if status != NV_ENC_SUCCESS:
-            raise TextureFormatError(nvenc_status_message(status, 'Failed to register CUarray'))
-
-        registered = reg.registeredResource
-        self._registered_arrays[ptr] = (registered, cu_array)
-        return registered
-
     def encode(self, texture: moderngl.Texture | int) -> list[EncodedPacket]:
-        """Encode a frame from an OpenGL texture (zero-copy).
+        """Encode a frame from an OpenGL texture.
+
+        The texture content is copied into an internal staging CUDA array
+        before submission, so the caller may modify or re-render the source
+        texture immediately after this call returns.
 
         Args:
             texture: A moderngl.Texture or OpenGL texture ID (int). Must be RGBA8.
@@ -364,89 +237,72 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
 
         mapper = self._texture_mappers[texture_id]
 
-        # Map GL texture to CUarray
+        if self._staging_arrays is None:
+            self._create_staging_arrays()
+
+        slot = self._session.next_submit_index % len(self._staging_arrays)
+
+        # Copy the mapped GL texture into the staging array, then release the
+        # GL mapping immediately (cuMemcpy2D is synchronous).
         cu_array = mapper.map_and_get_array()
-
-        # Register CUarray with NVENC
-        registered_resource = self._register_cuarray(cu_array)
-
-        # Map the resource
-        map_params = NV_ENC_MAP_INPUT_RESOURCE()
-        map_params.version = NV_ENC_MAP_INPUT_RESOURCE_VER
-        map_params.registeredResource = registered_resource
-
-        status = self._api.nvEncMapInputResource(self._encoder, byref(map_params))
-        if status != NV_ENC_SUCCESS:
-            mapper.unmap()
-            raise NvencError(nvenc_status_message(status, 'Failed to map resource'))
-
-        mapped_resource = map_params.mappedResource
-        mapped_format = map_params.mappedBufferFmt
-
-        bs_idx = self._next_submit
-        self._next_submit += 1
-
         try:
-            pic_params = NV_ENC_PIC_PARAMS()
-            pic_params.version = NV_ENC_PIC_PARAMS_VER
-            pic_params.inputWidth = self._width
-            pic_params.inputHeight = self._height
-            pic_params.inputPitch = self._width * 4
-            pic_params.inputBuffer = mapped_resource
-            pic_params.outputBitstream = self._bitstream_buffers[bs_idx % self._num_bs_buffers]
-            pic_params.bufferFmt = mapped_format
-            pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME
-            pic_params.frameIdx = self._frame_idx
-            pic_params.inputTimeStamp = self._frame_idx  # PTS = display order
-
-            status = self._api.nvEncEncodePicture(self._encoder, byref(pic_params))
-            if status == NV_ENC_ERR_NEED_MORE_INPUT:
-                self._frame_idx += 1
-                return []
-            if status != NV_ENC_SUCCESS:
-                raise NvencError(nvenc_status_message(status, f'Failed to encode frame {self._frame_idx}'))
+            copy = driver.CUDA_MEMCPY2D()
+            copy.srcMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_ARRAY
+            copy.srcArray = cu_array
+            copy.dstMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_ARRAY
+            copy.dstArray = self._staging_arrays[slot]
+            copy.WidthInBytes = self._width * 4
+            copy.Height = self._height
+            (err,) = driver.cuMemcpy2D(copy)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise NvencError(f'Failed to copy texture into staging array: {err}')
         finally:
-            self._api.nvEncUnmapInputResource(self._encoder, mapped_resource)
             mapper.unmap()
 
-        self._frame_idx += 1
+        return self._session.submit(
+            self._registered_staging[slot], self._width, self._height, self._width * 4
+        )
 
-        # Read all pending bitstream buffers in submission order
-        return self._read_pending(bs_idx)
+    def _create_staging_arrays(self) -> None:
+        """Allocate and register the staging CUDA array ring."""
+        desc = driver.CUDA_ARRAY_DESCRIPTOR()
+        desc.Width = self._width
+        desc.Height = self._height
+        desc.Format = driver.CUarray_format.CU_AD_FORMAT_UNSIGNED_INT8
+        desc.NumChannels = 4
 
-    def _read_pending(self, up_to_idx: int) -> list[EncodedPacket]:
-        """Read all pending bitstream buffers in submission order up to up_to_idx."""
-        result = []
-        while self._next_read <= up_to_idx:
-            buf = self._bitstream_buffers[self._next_read % self._num_bs_buffers]
-            lock_bs = NV_ENC_LOCK_BITSTREAM()
-            lock_bs.version = NV_ENC_LOCK_BITSTREAM_VER
-            lock_bs.outputBitstream = buf
-            lock_bs.doNotWait = 0
+        arrays = []
+        for i in range(self._session.ring_size):
+            err, array = driver.cuArrayCreate(desc)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise NvencError(f'Failed to allocate staging array {i}: {err}')
+            arrays.append(array)
+        self._staging_arrays = arrays
 
-            status = self._api.nvEncLockBitstream(self._encoder, byref(lock_bs))
-            if status != NV_ENC_SUCCESS:
-                raise NvencError(
-                    f'nvEncLockBitstream failed: {nvenc_status_message(status)}'
-                )
+        for array in arrays:
+            reg = NV_ENC_REGISTER_RESOURCE()
+            reg.version = NV_ENC_REGISTER_RESOURCE_VER
+            reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY
+            reg.width = self._width
+            reg.height = self._height
+            reg.pitch = self._width * 4
+            reg.resourceToRegister = int(array)
+            reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR
+            reg.bufferUsage = NV_ENC_INPUT_IMAGE
+            self._registered_staging.append(self._session.register_input(reg))
 
-            try:
-                data = ctypes.string_at(lock_bs.bitstreamBufferPtr, lock_bs.bitstreamSizeInBytes)
-                if data:
-                    result.append(EncodedPacket(
-                        data=data,
-                        pts=lock_bs.outputTimeStamp,
-                        dts=self._output_idx,
-                        is_keyframe=lock_bs.pictureType == NV_ENC_PIC_TYPE_IDR,
-                    ))
-                    self._output_idx += 1
-            finally:
-                self._api.nvEncUnlockBitstream(self._encoder, buf)
-            self._next_read += 1
-        return result
+    def _get_texture_id(self, texture: moderngl.Texture | int) -> int:
+        if isinstance(texture, int):
+            return texture
+        return texture.glo
+
+    def _get_texture_size(self, texture: moderngl.Texture | int) -> tuple[int, int]:
+        if isinstance(texture, int):
+            return self._width, self._height
+        return texture.size
 
     def flush(self) -> list[EncodedPacket]:
-        """Flush any buffered frames from the encoder.
+        """Flush any buffered frames from the encoder. Idempotent.
 
         Call this before close() to retrieve remaining packets when using
         B-frames.
@@ -454,17 +310,9 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         Returns:
             List of EncodedPackets for any frames still in the reorder buffer.
         """
-        if self._closed or self._encoder is None:
+        if self._closed or self._session is None:
             return []
-
-        # Send EOS to signal end of stream
-        pic_params = NV_ENC_PIC_PARAMS()
-        pic_params.version = NV_ENC_PIC_PARAMS_VER
-        pic_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS
-        self._api.nvEncEncodePicture(self._encoder, byref(pic_params))
-
-        # Read all remaining buffers
-        return self._read_pending(self._next_submit - 1)
+        return self._session.flush()
 
     def close(self) -> None:
         """Release encoder resources.
@@ -475,26 +323,19 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
             return
         self._closed = True
 
-        if self._encoder:
-            # Unregister CUarrays
-            for registered, _ in self._registered_arrays.values():
-                self._api.nvEncUnregisterResource(self._encoder, registered)
-            self._registered_arrays.clear()
+        if self._session is not None:
+            self._session.close()
+        self._registered_staging.clear()
 
-            # Destroy bitstream buffers
-            for buf in self._bitstream_buffers:
-                self._api.nvEncDestroyBitstreamBuffer(self._encoder, buf)
-            self._bitstream_buffers.clear()
-
-            # Destroy encoder
-            self._api.nvEncDestroyEncoder(self._encoder)
-            self._encoder = None
+        if self._staging_arrays is not None:
+            for array in self._staging_arrays:
+                driver.cuArrayDestroy(array)
+            self._staging_arrays = None
 
         # Unregister GL textures from CUDA
         for mapper in self._texture_mappers.values():
             mapper.unregister()
         self._texture_mappers.clear()
-
 
     def __del__(self) -> None:
         if not self._closed:
@@ -525,7 +366,7 @@ class _GLTextureToCUDA(AbstractContextManager['_GLTextureToCUDA']):
         err, resource = driver.cuGraphicsGLRegisterImage(
             self._texture_id,
             GL_TEXTURE_2D,
-            driver.CUgraphicsRegisterFlags.CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY
+            driver.CUgraphicsRegisterFlags.CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY,
         )
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'Failed to register GL texture with CUDA: {err}')
@@ -535,7 +376,7 @@ class _GLTextureToCUDA(AbstractContextManager['_GLTextureToCUDA']):
         if self._resource is None:
             raise RuntimeError('Texture not registered')
         if not self._is_mapped:
-            err, = driver.cuGraphicsMapResources(1, self._resource, 0)
+            (err,) = driver.cuGraphicsMapResources(1, self._resource, 0)
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f'Failed to map GL resource: {err}')
             self._is_mapped = True

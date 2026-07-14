@@ -31,15 +31,28 @@ from .bindings import (
 JpegData = Union[np.ndarray, bytes]
 BytePointer = POINTER(c_ubyte)
 
+# Number of internal slots (JPEG stream + pinned buffer pairs) in the phased
+# decoder. Two slots let the CPU stages of frame N+1 run while frame N's
+# transfer is still in flight.
+_NUM_SLOTS = 2
 
-def _get_data_ptr(data: JpegData) -> BytePointer:
-    """Get ctypes pointer to data without copying."""
+
+def _get_data_ptr_and_size(data: JpegData) -> tuple[BytePointer, int]:
+    """Get a ctypes pointer to the JPEG bytes and their byte length, without copying.
+
+    Accepts bytes-like objects or uint8 C-contiguous numpy arrays. The caller
+    must keep ``data`` alive for the duration of the native call.
+    """
     if isinstance(data, np.ndarray):
-        return data.ctypes.data_as(POINTER(ctypes.c_ubyte))
+        if data.dtype != np.uint8:
+            raise ValueError(f'JPEG data array must have dtype uint8, got {data.dtype}')
+        if not data.flags.c_contiguous:
+            raise ValueError('JPEG data array must be C-contiguous')
+        arr = data
     else:
-        # For bytes, we need to wrap in numpy array (zero-copy via buffer protocol)
+        # Bytes-like objects are wrapped via the buffer protocol (zero-copy).
         arr = np.frombuffer(data, dtype=np.uint8)
-        return arr.ctypes.data_as(POINTER(ctypes.c_ubyte))
+    return arr.ctypes.data_as(BytePointer), arr.nbytes
 
 
 class NvjpegDecoder:
@@ -60,7 +73,6 @@ class NvjpegDecoder:
             )
         self._handle = nvjpegHandle_t()
         self._state = nvjpegJpegState_t()
-        self._params = nvjpegDecodeParams_t()
         self._closed = False
         self._cuda_ctx = None
 
@@ -82,20 +94,9 @@ class NvjpegDecoder:
             _lib.nvjpegJpegStateCreate(self._handle, byref(self._state)),
             'Failed to create JPEG state',
         )
-        self._check(
-            _lib.nvjpegDecodeParamsCreate(self._handle, byref(self._params)),
-            'Failed to create decode params',
-        )
-        self._check(
-            _lib.nvjpegDecodeParamsSetOutputFormat(self._params, NVJPEG_OUTPUT_YUV),
-            'Failed to set output format',
-        )
 
     def _cleanup_partial(self) -> None:
         """Clean up partially initialized nvJPEG resources."""
-        if self._params:
-            _lib.nvjpegDecodeParamsDestroy(self._params)
-            self._params = nvjpegDecodeParams_t()
         if self._state:
             _lib.nvjpegJpegStateDestroy(self._state)
             self._state = nvjpegJpegState_t()
@@ -128,10 +129,11 @@ class NvjpegDecoder:
         widths = (c_int * NVJPEG_MAX_COMPONENT)()
         heights = (c_int * NVJPEG_MAX_COMPONENT)()
 
+        data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
         status = _lib.nvjpegGetImageInfo(
             self._handle,
-            _get_data_ptr(jpeg_data),
-            c_size_t(len(jpeg_data)),
+            data_ptr,
+            c_size_t(data_size),
             byref(n_components),
             byref(subsampling),
             widths,
@@ -186,11 +188,12 @@ class NvjpegDecoder:
         output.pitch[1] = u_pitch
         output.pitch[2] = v_pitch
 
+        data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
         status = _lib.nvjpegDecode(
             self._handle,
             self._state,
-            _get_data_ptr(jpeg_data),
-            c_size_t(len(jpeg_data)),
+            data_ptr,
+            c_size_t(data_size),
             NVJPEG_OUTPUT_YUV,
             byref(output),
             stream,
@@ -231,15 +234,19 @@ class NvjpegPhasedDecoder:
     3. decode_transfer() - Transfer to GPU (async)
     4. decode_device() - IDCT/color on GPU (async)
 
-    This allows CPU work on frame N+1 while GPU processes frame N.
+    JPEG streams and pinned buffers are double-buffered internally, and
+    decode_transfer() synchronizes the stream before submitting new work, so
+    the CPU stages of the next frame may safely run while the previous
+    frame's GPU work is still in flight:
 
-    Example:
         >>> decoder = NvjpegPhasedDecoder()
-        >>> decoder.parse(jpeg_bytes)
-        >>> decoder.decode_host()
-        >>> decoder.decode_transfer(stream)  # async
-        >>> decoder.decode_device(output, stream)  # async
-        >>> # GPU is now working, CPU can parse next frame
+        >>> for jpeg_bytes in jpegs:
+        ...     decoder.parse(jpeg_bytes)
+        ...     decoder.decode_host()  # overlaps previous frame's GPU work
+        ...     decoder.decode_transfer(stream)  # async
+        ...     decoder.decode_device(y, u, v, y_pitch, u_pitch, v_pitch, stream)  # async
+
+    All frames must be submitted on the same CUDA stream.
     """
 
     def __init__(self, gpu: int | None = 0):
@@ -258,9 +265,11 @@ class NvjpegPhasedDecoder:
         self._decoder = nvjpegJpegDecoder_t()
         self._state = nvjpegJpegState_t()
         self._params = nvjpegDecodeParams_t()
-        self._jpeg_stream = nvjpegJpegStream_t()
-        self._pinned_buffer = nvjpegBufferPinned_t()
+        self._jpeg_streams = [nvjpegJpegStream_t() for _ in range(_NUM_SLOTS)]
+        self._pinned_buffers = [nvjpegBufferPinned_t() for _ in range(_NUM_SLOTS)]
         self._device_buffer = nvjpegBufferDevice_t()
+        # parse() rotates first, so the first frame lands in slot 0.
+        self._slot = _NUM_SLOTS - 1
         self._closed = False
         self._cuda_ctx = None
         self._owns_cuda_ctx = gpu is not None
@@ -289,21 +298,21 @@ class NvjpegPhasedDecoder:
             'Failed to create decoder state',
         )
 
-        # Create internal buffers for phased decoding
-        self._check(
-            _lib.nvjpegBufferPinnedCreate(self._handle, None, byref(self._pinned_buffer)),
-            'Failed to create pinned buffer',
-        )
+        # Create internal buffers for phased decoding. Pinned buffers and JPEG
+        # streams are per-slot so that the CPU stages of the next frame never
+        # touch what the previous frame's in-flight transfer still reads.
+        for pinned_buffer in self._pinned_buffers:
+            self._check(
+                _lib.nvjpegBufferPinnedCreate(self._handle, None, byref(pinned_buffer)),
+                'Failed to create pinned buffer',
+            )
         self._check(
             _lib.nvjpegBufferDeviceCreate(self._handle, None, byref(self._device_buffer)),
             'Failed to create device buffer',
         )
 
-        # Attach buffers to state (required for phased decode)
-        self._check(
-            _lib.nvjpegStateAttachPinnedBuffer(self._state, self._pinned_buffer),
-            'Failed to attach pinned buffer',
-        )
+        # The device buffer is attached once and shared across slots; the
+        # active slot's pinned buffer is (re)attached by parse().
         self._check(
             _lib.nvjpegStateAttachDeviceBuffer(self._state, self._device_buffer),
             'Failed to attach device buffer',
@@ -319,11 +328,12 @@ class NvjpegPhasedDecoder:
             'Failed to set output format',
         )
 
-        # Create JPEG stream for parsing
-        self._check(
-            _lib.nvjpegJpegStreamCreate(self._handle, byref(self._jpeg_stream)),
-            'Failed to create JPEG stream',
-        )
+        # Create JPEG streams for parsing (one per slot)
+        for jpeg_stream in self._jpeg_streams:
+            self._check(
+                _lib.nvjpegJpegStreamCreate(self._handle, byref(jpeg_stream)),
+                'Failed to create JPEG stream',
+            )
 
         # Cache for parsed image info
         self._parsed_width = 0
@@ -332,18 +342,20 @@ class NvjpegPhasedDecoder:
 
     def _cleanup_partial(self):
         """Clean up partially initialized resources."""
-        if self._jpeg_stream:
-            _lib.nvjpegJpegStreamDestroy(self._jpeg_stream)
-            self._jpeg_stream = nvjpegJpegStream_t()
+        for jpeg_stream in self._jpeg_streams:
+            if jpeg_stream:
+                _lib.nvjpegJpegStreamDestroy(jpeg_stream)
+        self._jpeg_streams = []
         if self._params:
             _lib.nvjpegDecodeParamsDestroy(self._params)
             self._params = nvjpegDecodeParams_t()
         if self._device_buffer:
             _lib.nvjpegBufferDeviceDestroy(self._device_buffer)
             self._device_buffer = nvjpegBufferDevice_t()
-        if self._pinned_buffer:
-            _lib.nvjpegBufferPinnedDestroy(self._pinned_buffer)
-            self._pinned_buffer = nvjpegBufferPinned_t()
+        for pinned_buffer in self._pinned_buffers:
+            if pinned_buffer:
+                _lib.nvjpegBufferPinnedDestroy(pinned_buffer)
+        self._pinned_buffers = []
         if self._state:
             _lib.nvjpegJpegStateDestroy(self._state)
             self._state = nvjpegJpegState_t()
@@ -377,13 +389,24 @@ class NvjpegPhasedDecoder:
         if self._closed:
             raise RuntimeError('Decoder is closed')
 
+        data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
+
+        # Rotate to the next slot and attach its pinned buffer, so this
+        # frame's CPU stages never touch the buffers that the previous
+        # frame's in-flight transfer still reads.
+        self._slot = (self._slot + 1) % _NUM_SLOTS
+        jpeg_stream = self._jpeg_streams[self._slot]
+        status = _lib.nvjpegStateAttachPinnedBuffer(self._state, self._pinned_buffers[self._slot])
+        if status != NVJPEG_STATUS_SUCCESS:
+            raise RuntimeError(nvjpeg_status_message(status, 'Failed to attach pinned buffer'))
+
         status = _lib.nvjpegJpegStreamParse(
             self._handle,
-            _get_data_ptr(jpeg_data),
-            c_size_t(len(jpeg_data)),
+            data_ptr,
+            c_size_t(data_size),
             1,  # save_metadata (required for phased decoding)
             1,  # save_stream (required for phased decoding)
-            self._jpeg_stream,
+            jpeg_stream,
         )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to parse JPEG'))
@@ -391,16 +414,12 @@ class NvjpegPhasedDecoder:
         # Get dimensions from parsed stream
         width = ctypes.c_uint()
         height = ctypes.c_uint()
-        status = _lib.nvjpegJpegStreamGetFrameDimensions(
-            self._jpeg_stream, byref(width), byref(height)
-        )
+        status = _lib.nvjpegJpegStreamGetFrameDimensions(jpeg_stream, byref(width), byref(height))
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to get frame dimensions'))
 
         subsampling = c_int()
-        status = _lib.nvjpegJpegStreamGetChromaSubsampling(
-            self._jpeg_stream, byref(subsampling)
-        )
+        status = _lib.nvjpegJpegStreamGetChromaSubsampling(jpeg_stream, byref(subsampling))
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to get chroma subsampling'))
 
@@ -423,7 +442,7 @@ class NvjpegPhasedDecoder:
             self._decoder,
             self._state,
             self._params,
-            self._jpeg_stream,
+            self._jpeg_streams[self._slot],
         )
         if status != NVJPEG_STATUS_SUCCESS:
             raise RuntimeError(nvjpeg_status_message(status, 'Failed to decode JPEG on host'))
@@ -439,11 +458,19 @@ class NvjpegPhasedDecoder:
         if self._closed:
             raise RuntimeError('Decoder is closed')
 
+        # The decoder state's device-side working memory is shared across
+        # slots, so the previous frame's GPU work must finish before new
+        # work is submitted (this also frees the slot being reused two
+        # frames later). Requires all frames to use the same stream.
+        (err,) = driver.cuStreamSynchronize(stream if stream is not None else 0)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'Failed to synchronize stream before transfer: {err}')
+
         status = _lib.nvjpegDecodeJpegTransferToDevice(
             self._handle,
             self._decoder,
             self._state,
-            self._jpeg_stream,
+            self._jpeg_streams[self._slot],
             ctypes.c_void_p(stream) if stream else None,
         )
         if status != NVJPEG_STATUS_SUCCESS:

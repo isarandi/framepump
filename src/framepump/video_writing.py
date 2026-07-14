@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from enum import Enum
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, BinaryIO, Generic, TypeVar, Union
@@ -94,6 +95,20 @@ class Message:
     pass
 
 
+class _WriterState(Enum):
+    """Lifecycle of the writer/worker pair.
+
+    FAILED is sticky: producer calls keep raising until start_sequence()
+    deliberately restarts the worker (which resets all lifecycle state).
+    There is no separate CLOSED state because a closed writer is reusable
+    by design; IDLE covers both never-started and cleanly-closed.
+    """
+
+    IDLE = 'idle'
+    RUNNING = 'running'
+    FAILED = 'failed'
+
+
 class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWriter']):
     """Threaded video writer with queue-based frame buffering using PyAV.
 
@@ -132,8 +147,11 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         self._feedback_queue: queue.Queue[FeedbackMessage] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._accepts_new_frames: bool = False
-        self._thread_exception: Exception | None = None  # For close() path
+        self._state: _WriterState = _WriterState.IDLE
+        self._state_lock = threading.Lock()
+        self._worker_error: Exception | None = None
         self._failed_video_path: PathLike | None = None  # For error reporting
+        self._error_reported: bool = False
         self._shutdown_event: threading.Event = threading.Event()  # For immediate shutdown
         self._default_fps = fps
         self._default_gpu = gpu
@@ -175,8 +193,9 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
             encoder_config: Encoder configuration (crf, preset, bframes, gop, codec).
             format: Container format (e.g., 'mp4'). Required for file-like objects.
         """
-        self._raise_if_thread_has_raised()
-        self._ensure_thread_started()
+        if self._state is _WriterState.FAILED and not self._error_reported:
+            self._raise_worker_failure()
+        self._ensure_worker_running()
 
         if fps is None:
             if self._default_fps is None:
@@ -189,7 +208,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         if encoder_config is None:
             encoder_config = self._default_encoder_config
 
-        self._queue.put(
+        self._put_checked(
             StartSequence(
                 video_output,
                 fps,
@@ -211,10 +230,9 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                 - uint16: High precision 10-bit encoding
                 - float16/float32/float64: Auto-converted to uint16 ([0,1] -> [0,65535])
         """
-        self._raise_if_thread_has_raised()
         if not self._accepts_new_frames:
             raise ValueError('start_sequence has to be called before appending data')
-        self._queue.put(AppendFrame(data))
+        self._put_checked(AppendFrame(data))
 
     def end_sequence(self, block=True) -> None:
         """Request to end the current video sequence (once all pending frames have been processed).
@@ -225,56 +243,74 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         if not self._accepts_new_frames:
             raise ValueError('start_sequence has to be called before ending the sequence')
 
+        self._consume_stale_feedback()
         msg = EndSequence()
-        self._queue.put(msg)
+        self._put_checked(msg)
         self._accepts_new_frames = False
 
-        if block:
-            while True:
-                try:
-                    feedback = self._feedback_queue.get(timeout=1.0)
-                    if isinstance(feedback, ExceptionRaised):
-                        self._raise_if_thread_has_raised()
-                        assert False, "Unreachable"
-
-                    if isinstance(feedback, EndSequenceDone) and feedback.initial_msg is msg:
-                        # This is the confirmation we were waiting for
-                        return
-                except queue.Empty:
-                    if self._thread is None or not self._thread.is_alive():
-                        raise RuntimeError("VideoWriter thread died unexpectedly")
+        if not block:
+            return
+        while True:
+            try:
+                feedback = self._feedback_queue.get(timeout=0.5)
+            except queue.Empty:
+                self._check_worker_failure()
+                continue
+            if isinstance(feedback, ExceptionRaised):
+                self._note_worker_failure(feedback.error, feedback.video_path)
+                self._raise_worker_failure()
+            if isinstance(feedback, EndSequenceDone) and feedback.initial_msg is msg:
+                # This is the confirmation we were waiting for
+                return
+            # Confirmations of earlier non-blocking end_sequence calls: drop
 
     def close(self) -> None:
-        """Close the writer, waiting for pending frames to be written."""
-        if self._thread is not None:
-            self._queue.put(Quit())
-            # Timeout proportional to queue size (assume ~0.5s per frame for encoding)
-            timeout = max(10.0, self._queue.maxsize * 2.0)
-            self._thread.join(timeout=timeout)
-            if self._thread.is_alive():
-                warnings.warn(
-                    f"VideoWriter did not finish within {timeout:.0f}s timeout, "
-                    "forcing shutdown. Some frames may not have been written.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                # Graceful quit didn't work, force shutdown
-                self._shutdown_event.set()
-                self._thread.join(timeout=3.0)
-                if self._thread.is_alive():
-                    raise RuntimeError("VideoWriter thread did not exit in time")
+        """Close the writer, waiting for pending frames to be written.
 
-            self._raise_if_thread_has_raised()
+        If the worker failed and the error was not yet raised by another
+        call, it is raised here; an error that was already reported is not
+        raised a second time (so ``try/finally: close()`` never masks it).
+        """
+        try:
+            thread = self._thread
+            if thread is not None and thread.is_alive() and self._state is _WriterState.RUNNING:
+                self._put_checked(Quit())
+                # Timeout proportional to queue size (assume ~0.5s per frame for encoding)
+                timeout = max(10.0, self._queue.maxsize * 2.0)
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    warnings.warn(
+                        f'VideoWriter did not finish within {timeout:.0f}s timeout, '
+                        'forcing shutdown. Some frames may not have been written.',
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    # Graceful quit didn't work, force shutdown
+                    self._shutdown_event.set()
+                    thread.join(timeout=3.0)
+                    if thread.is_alive():
+                        raise RuntimeError('VideoWriter thread did not exit in time')
+            elif thread is not None:
+                thread.join(timeout=3.0)
+        finally:
             self._thread = None
-        self._accepts_new_frames = False
+            self._accepts_new_frames = False
+            self._consume_stale_feedback()
+        if self._state is _WriterState.FAILED:
+            if not self._error_reported:
+                self._raise_worker_failure()
+        else:
+            self._state = _WriterState.IDLE
 
     def shutdown(self) -> None:
         """Immediately stop the background thread without waiting for pending work.
 
-        Warning: any frames still queued will be discarded. Use ``close()``
-        to wait for all pending frames to be written.
+        Warning: any frames still queued will be discarded and the current
+        output file is aborted (deleted), not finalized. Use ``close()`` to
+        wait for all pending frames to be written.
         """
-        if self._thread is not None:
+        thread = self._thread
+        if thread is not None:
             n_pending = self._queue.qsize()
             if n_pending > 0:
                 warnings.warn(
@@ -285,37 +321,130 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                     stacklevel=2,
                 )
             self._shutdown_event.set()
-            self._thread.join(timeout=3.0)
+            thread.join(timeout=3.0)
             self._thread = None
         self._accepts_new_frames = False
+        self._consume_stale_feedback()
+        if self._state is not _WriterState.FAILED:
+            self._state = _WriterState.IDLE
 
-    def _raise_if_thread_has_raised(self) -> None:
-        # Check if the background thread has raised an exception
-        if self._thread_exception is not None:
-            exc = self._thread_exception
+    def __exit__(
+        self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any
+    ) -> None:
+        if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
+            # On Ctrl+C, don't wait for pending work
+            self.shutdown()
+        else:
+            self.close()
+
+    def __del__(self) -> None:
+        try:
+            thread = getattr(self, '_thread', None)
+            if thread is not None and thread.is_alive():
+                warnings.warn(
+                    'VideoWriter was garbage-collected without close(); pending frames '
+                    'are discarded and the current output file is not finalized.',
+                    ResourceWarning,
+                    stacklevel=2,
+                )
+                self._shutdown_event.set()
+        except Exception:
+            # Interpreter shutdown can leave globals in a torn-down state
+            pass
+
+    def _put_checked(self, msg: Message) -> None:
+        """Put a message on the work queue without ever blocking indefinitely.
+
+        Bounded wait that re-checks worker health each round: if the worker
+        failed (or died silently), this raises instead of deadlocking on a
+        queue that nobody consumes anymore.
+        """
+        while True:
+            self._check_worker_failure()
+            try:
+                self._queue.put(msg, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+    def _check_worker_failure(self) -> None:
+        if self._state is _WriterState.FAILED:
+            self._raise_worker_failure()
+        if self._state is _WriterState.RUNNING and (
+            self._thread is None or not self._thread.is_alive()
+        ):
+            # Worker died without going through its error handler
+            self._note_worker_failure(None, None)
+            self._raise_worker_failure()
+
+    def _raise_worker_failure(self) -> None:
+        with self._state_lock:
+            exc = self._worker_error
             failed_path = self._failed_video_path
-            # Clear exception state so close() doesn't re-raise
-            self._thread_exception = None
-            self._failed_video_path = None
-            # Include the cause's message for better error reporting
-            cause_msg = str(exc)
-            if failed_path is not None:
-                raise RuntimeError(
-                    f"VideoWriter thread raised while creating "
-                    f"{failed_path}: {cause_msg}"
-                ) from exc
-            else:
-                raise RuntimeError(
-                    f"VideoWriter thread raised an exception: {cause_msg}"
-                ) from exc
+            self._error_reported = True
+        if exc is None:
+            raise RuntimeError('VideoWriter thread died unexpectedly')
+        # Include the cause's message for better error reporting
+        cause_msg = str(exc)
+        if failed_path is not None:
+            raise RuntimeError(
+                f'VideoWriter thread raised while creating {failed_path}: {cause_msg}'
+            ) from exc
+        raise RuntimeError(f'VideoWriter thread raised an exception: {cause_msg}') from exc
 
-    def _ensure_thread_started(self) -> None:
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._main_video_writer, daemon=True)
-            self._thread.start()
+    def _note_worker_failure(self, error: Exception | None, video_path) -> None:
+        with self._state_lock:
+            if self._worker_error is None:
+                self._worker_error = error
+                self._failed_video_path = video_path
+            self._state = _WriterState.FAILED
+
+    def _consume_stale_feedback(self) -> None:
+        """Drop confirmations nobody waited for; record any worker failure."""
+        while True:
+            try:
+                feedback = self._feedback_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(feedback, ExceptionRaised):
+                self._note_worker_failure(feedback.error, feedback.video_path)
+
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
+
+    def _ensure_worker_running(self) -> None:
+        """(Re)start the worker thread; owns resetting all lifecycle state."""
+        if (
+            self._state is _WriterState.RUNNING
+            and self._thread is not None
+            and self._thread.is_alive()
+        ):
+            return
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                raise RuntimeError('VideoWriter worker thread is stuck; cannot restart')
+        self._shutdown_event.clear()
+        self._drain_queue(self._queue)
+        self._drain_queue(self._feedback_queue)
+        with self._state_lock:
+            self._worker_error = None
+            self._failed_video_path = None
+            self._error_reported = False
+            self._state = _WriterState.RUNNING
+        self._thread = threading.Thread(target=self._main_video_writer, daemon=True)
+        self._thread.start()
 
     def _main_video_writer(self) -> None:
-        # This is the main loop running in the background thread
+        # Main loop of the background thread. Exactly two kinds of exit:
+        # clean (Quit / graceful close -> finalize the output file) and
+        # error/shutdown (-> abort: a partial file is never promoted to the
+        # final path).
         writer: SequenceWriter | None = None
         try:
             while not self._shutdown_event.is_set():
@@ -333,7 +462,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                         # We allow directly sending StartSequence without EndSequence
                         # so we should close the previous writer first
                         writer.close()
-
+                        writer = None
                     if isinstance(msg.video_output, (str, Path)):
                         spu.ensure_parent_dir_exists(msg.video_output)
                     writer = SequenceWriter(
@@ -348,30 +477,29 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                 elif isinstance(msg, EndSequence):
                     if writer is not None:
                         writer.close()
+                        writer = None
                     self._feedback_queue.put(EndSequenceDone(msg))
                 elif isinstance(msg, Quit):
+                    if writer is not None:
+                        writer.close()
+                        writer = None
                     return
                 else:
                     raise ValueError(f'Unexpected message type: {type(msg)}')
 
+            # Shutdown requested: abort the current sequence without finalizing
+            if writer is not None:
+                writer._abort()
+                writer = None
         except Exception as e:
-            # Store exception to re-raise in main thread
-            self._thread_exception = e
+            failed_path = writer.output_path if writer is not None else None
             if writer is not None:
-                self._failed_video_path = writer.output_path
-            self._feedback_queue.put(ExceptionRaised())
-        finally:
-            if writer is not None:
-                writer.close()
-
-    def __exit__(
-        self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any
-    ) -> None:
-        if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
-            # On Ctrl+C, don't wait for pending work
-            self.shutdown()
-        else:
-            self.close()
+                try:
+                    writer._abort()
+                except Exception:
+                    pass
+            self._note_worker_failure(e, failed_path)
+            self._feedback_queue.put(ExceptionRaised(e, failed_path))
 
 
 class SequenceWriter(AbstractContextManager['SequenceWriter']):
@@ -558,7 +686,11 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             )
 
     def close(self) -> None:
-        """Flush encoder and close containers, then rename temp to final."""
+        """Flush encoder and close containers, then rename temp to final.
+
+        If flushing or muxing fails, the temp file is deleted (a partial
+        file is never promoted to the final path) and the error propagates.
+        """
         if self._closed:
             return
         self._closed = True
@@ -568,18 +700,23 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             return
 
         try:
-            # Flush video encoder
-            for packet in self._video_stream.encode():
-                self._output_container.mux(packet)
+            try:
+                # Flush video encoder
+                for packet in self._video_stream.encode():
+                    self._output_container.mux(packet)
 
-            # Flush remaining audio packets
-            for audio_pkt in self._audio_pkts:
-                audio_pkt.stream = self._audio_stream
-                self._output_container.mux(audio_pkt)
-        finally:
-            self._output_container.close()
-            if self._audio_input_container is not None:
-                self._audio_input_container.close()
+                # Flush remaining audio packets
+                for audio_pkt in self._audio_pkts:
+                    audio_pkt.stream = self._audio_stream
+                    self._output_container.mux(audio_pkt)
+            finally:
+                self._output_container.close()
+                if self._audio_input_container is not None:
+                    self._audio_input_container.close()
+        except BaseException:
+            if self._temp_file is not None:
+                self._temp_file.cleanup()
+            raise
 
         if self._temp_file is not None:
             self._temp_file.finalize()
@@ -850,5 +987,13 @@ class EndSequenceDone(FeedbackMessage):
     initial_msg: EndSequence
 
 
+@dataclass
 class ExceptionRaised(FeedbackMessage):
-    pass
+    """Worker failure notification.
+
+    Carries the exception itself so consuming the message is sufficient —
+    there is no separate stored state that could be consumed twice.
+    """
+
+    error: Exception
+    video_path: PathLike | None = None

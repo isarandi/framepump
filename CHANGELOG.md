@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Random access on streams whose containers misreport keyframes (screen codecs like
+  FIC/VMware, open-GOP MPEG-1/2 in TS/raw containers, packed-B MPEG-4) silently
+  returned different pixels than iteration — up to near-garbage frames. `VideoFrames`
+  now verifies at open time that seeking reproduces sequential decoding for these
+  codecs and transparently falls back to decode-from-start access when it does not.
+  Consistent files (the vast majority) keep fast seeking.
+- On such streams the packet index could also count frames the decoder never produces,
+  so `len()` disagreed with iteration and indexing was misaligned; the index is rebuilt
+  from actual decoder output when the verification fails. A file whose frames cannot be
+  decoded at all now raises `VideoDecodeError` instead of silently yielding nothing.
+- `trim_video` auto-detection picked NVENC for videos below the hardware's minimum
+  encode size (145x49) — including videos framepump itself writes — and died with a raw
+  `[Errno 22] Invalid argument`; auto-detection now falls back to CPU encoding, and an
+  explicit `gpu=True` raises a clear `ValueError`.
+- Opening a file whose codec has no decoder in the FFmpeg build (JPEG-XL, VVC, EVC, ...)
+  crashed with `AttributeError`; now raises the new `UnsupportedCodecError`. Audio-only
+  files raise the new `NoVideoStreamError` instead of a plain `ValueError` (both are
+  `FramePumpError` subclasses and exported). Streams probing with no valid dimensions
+  (e.g. animated WebP without decoder support) raise a clean `VideoDecodeError` at open.
+- All FFmpeg-level decode failures (unknown decoder errors, unimplemented features,
+  DRM permission errors, ...) are wrapped into `VideoDecodeError` — previously only
+  invalid-data errors were, and the rest leaked as raw `av.error.*` internals.
+
+- Writing float16 frames produced an all-black video on numpy >= 2 (NEP 50 promotion
+  overflowed the scaling to inf inside float16); scaling now happens in float32.
+- `VideoFrames(path, seekable=False)` raised on any integer index or positive-start slice
+  (the frame index was built before the caller's `seekable` value was applied); an explicit
+  `seekable` value now also actually skips the seek probe, as documented.
+- Timestampless streams (raw H.264/HEVC elementary streams): positive-start slices
+  (`frames[5:10]`) silently yielded zero frames in both VFR and CFR modes; the seek loops
+  now fall back to frame counting like integer indexing already did.
+- Numeric CFR (`constant_framerate=<fps>`) duplicated/dropped the wrong source frames:
+  same frame count as ffmpeg but displaced duplicates. The vsync simulation now mirrors
+  ffmpeg's exact rational rescale, midpoint bias and early-frame clipping, and is verified
+  frame-exact against the ffmpeg CLI for up- and downsampling, including NTSC rates.
+- `trim_video` always dropped the final frame when `end_time` was at or past the last
+  frame (e.g. `trim_video(src, out, 0, get_duration(src))`); it also let one pre-start
+  audio packet through with negative timestamps. Both `trim_video` and `video_audio_mux`
+  now write through a temp file, so errors leave nothing at the destination.
+- NVENC bindings: `NV_ENC_PIC_PARAMS` was declared 528 bytes smaller than the SDK 13.0
+  struct (undersized codec-params union), so the driver read out of bounds on every
+  encoded frame; layouts are now byte-verified against the SDK header by regression tests.
+- `JpegVideoWriterCUDA`: an exception inside `with writer.start_sequence(path):` finalized
+  the partial file instead of discarding it; a failed first frame (corrupt or unsupported
+  JPEG) left the writer in a broken state that crashed retries with `ZeroDivisionError`.
+- 4:4:4 chroma downsampling used Lanczos instead of the intended area averaging (the
+  bound `NPPI_INTER_SUPER` constant was actually `NPPI_INTER_LANCZOS`); 4:2:0 now uses
+  true area averaging and 4:2:2 a linear 2-tap average (NPP rejects SUPER there).
+- The first `torch.from_dlpack` export of a GPU frame per process permanently leaked its
+  NVDEC decoder session (keepalive key 0 became a NULL pointer); re-exporting a buffer
+  that already handed off its memory now raises instead of producing a NULL-data tensor.
+- The GL/CUDA writers' muxer silently produced a video without audio when the audio
+  source had no audio stream; it now raises `NoAudioStreamError` like `VideoWriter`.
+- `VideoWriter`: Ctrl+C during `close()` could leave the worker thread consuming the
+  queue behind a restarted worker; worker death by a non-`Exception` no longer lets
+  `close()` report success; an encoding-error cleanup that itself failed (e.g. disk full)
+  could strand the temp file; `queue_size` is validated (0 meant unbounded).
+- nvJPEG decoders: `close()` synchronizes in-flight async work before freeing buffers; a
+  failed `parse()` no longer advances the internal slot rotation (a retry could overwrite
+  an in-flight slot) and `decode_host()` after a failed parse raises instead of decoding a
+  stale frame; constructor failures no longer emit `AttributeError` noise from `__del__`.
+- NVENC encoders: a failed construction no longer leaks the encode session (sessions are
+  capped on GeForce); a failed submission no longer desyncs the bitstream ring (flush
+  could lock a never-filled buffer); oversized source textures raise instead of being
+  silently cropped; partial staging-ring allocation failures no longer leak GPU objects;
+  an explicit `gpu=` ordinal is honored even when another CUDA context is current.
+- The chroma-interleave kernel cache is keyed by context id instead of context address
+  (stale kernels after context destroy/re-create at the same address), and its PTX
+  declares version 7.0 instead of 13.1-era 9.1, so CUDA 12/13.0 drivers can load it.
+- `dtype='float32'`, `dtype=float` and other `DTypeLike` spellings are accepted by
+  `VideoFrames` instead of being rejected as unsupported.
+- Damaged-but-indexable files: sliced/indexed/CFR access now wraps decoder errors into
+  `VideoDecodeError` and tolerates malformed EOF markers, like sequential iteration.
+- On CPU-only machines, instantiating `JpegVideoWriterCUDA`/`VideoFramesCuda`/
+  `CudaToGLUploader` raises an ImportError naming the missing CUDA dependencies instead
+  of `TypeError: 'NoneType' object is not callable`.
 - CFR mode (`constant_framerate`): windowed reads (`frames[a:b]`) with a positive start
   returned copies of the wrong frame; `len()` could disagree with the number of frames
   iteration yields; streams with a late start PTS (e.g. MPEG-TS) reported phantom leading
@@ -56,6 +132,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `VideoFrames` and `VideoFramesCuda` constructor options (`dtype`, `gpu`,
+  `constant_framerate`, `seekable`, ...) are keyword-only: the two classes previously
+  disagreed on positional order, so positional calls migrated between them silently
+  misassigned arguments.
+- `GLVideoWriter` raises `ValueError` for `EncoderConfig` values it cannot honor
+  (`codec` other than `'h264'`, `preset` other than `'p4'`/None) instead of silently
+  encoding H.264 at P4.
+- `AbstractVideoWriter.start_sequence` signature now matches the implementations
+  (first parameter `video_output`, optional `fps`, `encoder_config` parameter).
 - Errors and forced shutdown during video writing leave no output file at the destination
   path (previously a partial file could appear and look like a successful write).
 - GL/CUDA NVENC encoders use preset P4 with high-quality tuning instead of whatever the
@@ -77,10 +162,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- File-like objects (anything with `read`/`seek`/`tell`, e.g. `BytesIO`) are accepted as
+  video sources by `VideoFrames`. `BytesIO` sources support multiple concurrently active
+  iterators; other file-like objects support one.
 - `IndexBuildError` and `FilterConfigError` are exported from the package root.
-- Initial public release
-- `VideoFrames` class for lazy, sliceable video frame access
-- `VideoWriter` class for threaded video writing
-- GPU decoding/encoding support via `gpu=True` or `gpu=<device_ordinal>`
+
+## [0.2.0] - 2026-03-09
+
+### Added
+
+- Full implementation released: lazy sliceable decoding with frame indexing and seeking,
+  constant-framerate (CFR) mode, documentation and test suite.
+- GPU decoding via `gpu=True` or `gpu=<device_ordinal>` (`VideoFramesCuda`)
+- GPU encoders: `GLVideoWriter` (OpenGL → NVENC) and `JpegVideoWriterCUDA`
+  (nvJPEG → NVENC), configured via `EncoderConfig`
 - High bit depth (10-bit) video support
 - Audio muxing support in `VideoWriter`
+
+## [0.1.3] - 2025-05-21
+
+### Fixed
+
+- Packaging fixes (also 0.1.2, same day).
+
+## [0.1.1] - 2025-05-21
+
+### Added
+
+- Initial public release: `VideoFrames` for lazy, sliceable video frame access and
+  threaded `VideoWriter`.

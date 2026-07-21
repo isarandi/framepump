@@ -406,17 +406,13 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
     def _raise_worker_failure(self) -> None:
         with self._state_lock:
             exc = self._worker_error
-            failed_path = self._failed_video_path
             self._error_reported = True
         if exc is None:
             raise RuntimeError('VideoWriter thread died unexpectedly')
-        # Include the cause's message for better error reporting
-        cause_msg = str(exc)
-        if failed_path is not None:
-            raise RuntimeError(
-                f'VideoWriter thread raised while creating {failed_path}: {cause_msg}'
-            ) from exc
-        raise RuntimeError(f'VideoWriter thread raised an exception: {cause_msg}') from exc
+        # Re-raise the worker's exception as-is: callers can catch the type
+        # that append/open actually raised (e.g. ValueError for a bad frame),
+        # and the traceback shows the original failure site in the worker.
+        raise exc
 
     def _note_worker_failure(self, error: Exception | None, video_path) -> None:
         with self._state_lock:

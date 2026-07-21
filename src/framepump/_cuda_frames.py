@@ -466,9 +466,12 @@ class VideoFramesCuda:
             if item < 0:
                 item = length + item
             if item < 0 or item >= length:
-                raise IndexError(
-                    f'Frame index {item} out of range for video with ' f'{length} frames'
-                )
+                total = self._index.frame_count
+                if len(self._resolved_range()) != total:
+                    detail = f'view with {length} frames (source video has {total})'
+                else:
+                    detail = f'video with {length} frames'
+                raise IndexError(f'Frame index {item} out of range for {detail}')
             abs_idx = self._resolved_range()[item]
             return self._get_frame_by_abs_idx(abs_idx, owns_memory=True)
 

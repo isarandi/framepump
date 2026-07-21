@@ -95,7 +95,7 @@ class TestNoDeadlock:
 
         # Every subsequent producer call must return promptly, either
         # succeeding or raising the worker's error - never deadlocking.
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError):
             call_with_timeout(lambda: writer.end_sequence(block=False))
         call_with_timeout(writer.close)
 
@@ -105,7 +105,7 @@ class TestNoDeadlock:
         writer = VideoWriter(queue_size=1)
         kill_worker_with_bad_frame(writer, video_path)
 
-        with pytest.raises(RuntimeError, match='shape'):
+        with pytest.raises(ValueError, match='shape'):
             for _ in range(5):
                 call_with_timeout(lambda: writer.append_data(good_frame()))
         call_with_timeout(writer.close)
@@ -116,7 +116,7 @@ class TestNoDeadlock:
         writer = VideoWriter()
         kill_worker_with_bad_frame(writer, video_path)
 
-        with pytest.raises(RuntimeError, match='shape'):
+        with pytest.raises(ValueError, match='shape'):
             call_with_timeout(lambda: writer.end_sequence(block=True))
         call_with_timeout(writer.close)
 
@@ -132,7 +132,7 @@ class TestNoPartialOutput:
         writer.append_data(bad_frame())
         wait_for_worker_death(writer)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError):
             call_with_timeout(writer.close)
 
         assert not video_path.exists()
@@ -198,7 +198,7 @@ class TestReuse:
         writer = VideoWriter()
         kill_worker_with_bad_frame(writer, video1)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError):
             call_with_timeout(lambda: writer.end_sequence(block=True))
 
         writer.start_sequence(str(video2), fps=30)
@@ -242,12 +242,12 @@ class TestErrorReporting:
         writer = VideoWriter()
         kill_worker_with_bad_frame(writer, video_path)
 
-        with pytest.raises(RuntimeError, match='shape'):
+        with pytest.raises(ValueError, match='shape'):
             call_with_timeout(lambda: writer.end_sequence(block=True))
         call_with_timeout(writer.close)
 
     def test_never_assertion_error(self, tmp_path):
-        """Consuming the error twice must give RuntimeError, never AssertionError."""
+        """Consuming the error twice must give the worker error, never AssertionError."""
         video_path = tmp_path / 'out.mp4'
         writer = VideoWriter()
         kill_worker_with_bad_frame(writer, video_path)
@@ -264,7 +264,7 @@ class TestErrorReporting:
                 errors.append(e)
             except AssertionError as e:
                 pytest.fail(f'AssertionError leaked to caller: {e}')
-        assert any(isinstance(e, RuntimeError) for e in errors)
+        assert errors, 'the worker error must surface to producer calls'
         call_with_timeout(writer.close)
 
     def test_unreported_error_raises_in_close(self, tmp_path):
@@ -276,7 +276,7 @@ class TestErrorReporting:
         writer.append_data(bad_frame())
         wait_for_worker_death(writer)
 
-        with pytest.raises(RuntimeError, match='shape'):
+        with pytest.raises(ValueError, match='shape'):
             call_with_timeout(writer.close)
 
 
@@ -328,3 +328,24 @@ class TestNormalOperation:
         call_with_timeout(writer.close)
         assert not video_path.exists()
         assert no_temp_files(tmp_path)
+
+
+class TestWorkerErrorTypePreserved:
+    """Producer calls re-raise the worker's exception with its original type."""
+
+    def test_framepump_error_type_survives(self, tmp_path):
+        from framepump import NoAudioStreamError, VideoFrames
+
+        silent = tmp_path / 'silent.mp4'
+        with VideoWriter(str(silent), fps=30) as w:
+            for _ in range(3):
+                w.append_data(good_frame())
+        assert len(VideoFrames(str(silent))) == 3
+
+        writer = VideoWriter()
+        writer.start_sequence(str(tmp_path / 'out.mp4'), fps=30, audio_source_path=str(silent))
+        writer.append_data(good_frame())
+        wait_for_worker_death(writer)
+        with pytest.raises(NoAudioStreamError):
+            call_with_timeout(lambda: writer.end_sequence(block=True))
+        call_with_timeout(writer.close)

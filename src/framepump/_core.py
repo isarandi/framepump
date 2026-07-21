@@ -350,7 +350,12 @@ class VideoFrames:
             if item < 0:
                 item = length + item
             if item < 0 or item >= length:
-                raise IndexError(f'Frame index {item} out of range for video with {length} frames')
+                total = self._n_frames_total()
+                if len(self._resolved_range()) != total or self.repeat_count != 1:
+                    detail = f'view with {length} frames (source video has {total})'
+                else:
+                    detail = f'video with {length} frames'
+                raise IndexError(f'Frame index {item} out of range for {detail}')
 
             # The bounds check above uses the repeat-inclusive length, so after
             # dividing out the repeat factor the index is always within range.

@@ -143,6 +143,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Errors from `VideoWriter`'s background thread are re-raised with their original
+  exception type (e.g. `ValueError` for a bad frame, `VideoEncodeError` for encoder
+  failures) instead of being wrapped in a `RuntimeError`; the worker traceback is
+  preserved. Out-of-range `IndexError` messages on sliced views now blame the view and
+  report the source video's frame count.
 - `VideoFrames` and `VideoFramesCuda` constructor options (`dtype`, `gpu`,
   `constant_framerate`, `seekable`, ...) are keyword-only: the two classes previously
   disagreed on positional order, so positional calls migrated between them silently

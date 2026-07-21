@@ -289,3 +289,19 @@ class TestDtypeSpellings:
         video_path, _, _, _ = sample_video
         with pytest.raises(ValueError, match='Unsupported dtype'):
             VideoFrames(video_path, dtype='int32')
+
+
+class TestIndexErrorWording:
+    def test_empty_view_blames_the_view(self, sample_video):
+        video_path, _, n_frames, _ = sample_video
+        vf = VideoFrames(video_path)
+        with pytest.raises(
+            IndexError, match=rf'view with 0 frames \(source video has {n_frames}\)'
+        ):
+            vf[10:10][0]
+
+    def test_whole_video_message_unchanged(self, sample_video):
+        video_path, _, n_frames, _ = sample_video
+        vf = VideoFrames(video_path)
+        with pytest.raises(IndexError, match=f'video with {n_frames} frames'):
+            vf[n_frames]

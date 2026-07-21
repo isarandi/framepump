@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import os
 
-from framepump import VideoWriter, VideoFrames, get_fps, get_duration
+from framepump import VideoEncodeError, VideoFrames, VideoWriter, get_duration, get_fps
 
 
 class TestVideoWriterBasic:
@@ -430,7 +430,7 @@ class TestPixelRoundtrip:
         writer.start_sequence(str(video_path), fps=30, gpu=True)
         writer.append_data(frame)
 
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(Exception) as exc_info:
             writer.end_sequence()
 
         msg = str(exc_info.value).lower()
@@ -440,6 +440,8 @@ class TestPixelRoundtrip:
                 pytest.skip(f'NVENC not available: {exc_info.value}')
             raise exc_info.value
 
+        # Worker errors surface with their original type
+        assert isinstance(exc_info.value, VideoEncodeError)
         writer.close()
 
     def test_gl_small_frame_error(self, tmp_path):

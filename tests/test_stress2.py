@@ -163,7 +163,7 @@ class TestConcurrentAccess:
 
         threads = []
         for i in range(3):
-            t = threading.Thread(target=read_frames, args=(frames, i*10, (i+1)*10, i))
+            t = threading.Thread(target=read_frames, args=(frames, i * 10, (i + 1) * 10, i))
             threads.append(t)
             t.start()
 

@@ -68,7 +68,8 @@ class EncoderConfig:
             if self.preset not in known_presets:
                 raise ValueError(
                     f'preset must be None or one of {sorted(known_presets)}, '
-                    f'got {self.preset!r}')
+                    f'got {self.preset!r}'
+                )
 
     def with_overrides(self, **kwargs) -> EncoderConfig:
         """Return a new config with the given overrides."""

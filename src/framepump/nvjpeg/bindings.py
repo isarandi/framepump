@@ -47,6 +47,7 @@ NVJPEG_CSS_UNKNOWN = -1
 
 class nvjpegImage_t(Structure):
     """Output image descriptor."""
+
     _fields_ = [
         ('channel', c_void_p * NVJPEG_MAX_COMPONENT),  # Device pointers
         ('pitch', c_size_t * NVJPEG_MAX_COMPONENT),

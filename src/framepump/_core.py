@@ -141,12 +141,10 @@ class VideoFrames:
             reader.close()
 
     @overload
-    def __getitem__(self, item: int) -> NDArray:
-        ...
+    def __getitem__(self, item: int) -> NDArray: ...
 
     @overload
-    def __getitem__(self, item: slice) -> VideoFrames:
-        ...
+    def __getitem__(self, item: slice) -> VideoFrames: ...
 
     def __getitem__(self, item: int | slice) -> NDArray | VideoFrames:
         if isinstance(item, int):
@@ -168,7 +166,8 @@ class VideoFrames:
                     'Slicing after repeat_each_frame() is not supported. '
                     'Apply slicing before repeat_each_frame(), e.g. '
                     'frames[::2].repeat_each_frame(3) instead of '
-                    'frames.repeat_each_frame(3)[::2].')
+                    'frames.repeat_each_frame(3)[::2].'
+                )
 
             if item.step is not None and item.step < 0:
                 raise ValueError('Negative step not supported. Use list(frames)[::-1] instead.')
@@ -209,10 +208,12 @@ class VideoFrames:
                 Note: this is the opposite order of ``video_extents()``, which
                 returns (width, height).
         """
-        if (not isinstance(shape, tuple) or len(shape) != 2
-                or not all(isinstance(x, int) for x in shape)):
-            raise TypeError(
-                f'shape must be a (height, width) tuple of two ints, got {shape!r}')
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) != 2
+            or not all(isinstance(x, int) for x in shape)
+        ):
+            raise TypeError(f'shape must be a (height, width) tuple of two ints, got {shape!r}')
         result = self._clone()
         result.resized_imshape = shape
         return result
@@ -222,7 +223,8 @@ class VideoFrames:
             n = operator.index(n)
         except TypeError:
             raise TypeError(
-                f'The repeat count must be an integer, got {type(n).__name__}') from None
+                f'The repeat count must be an integer, got {type(n).__name__}'
+            ) from None
         if n < 1:
             raise ValueError('The repeat count must be at least 1.')
         result = self._clone()
@@ -442,8 +444,11 @@ class VideoFrames:
         # Handle remaining output frames (EOF duplication, or a truncated stream
         # that decoded fewer frames than the index recorded)
         while output_idx < len(source_map) and output_idx < slice_stop:
-            if (prev_frame_arr is not None and slice_start <= output_idx
-                    and (output_idx - slice_start) % slice_step == 0):
+            if (
+                prev_frame_arr is not None
+                and slice_start <= output_idx
+                and (output_idx - slice_start) % slice_step == 0
+            ):
                 yield prev_frame_arr
             output_idx += 1
 
@@ -537,16 +542,17 @@ class VideoFrames:
             for frame in reader._container.decode(reader._stream):
                 frame_pts = Fraction(frame.pts) * time_base if frame.pts is not None else None
                 # Match by PTS if available, otherwise by frame count (for attached pictures etc.)
-                if (frame_pts is not None and float(
-                    frame_pts) >= target_pts_float - 1e-6) or frame_count == source_idx:
+                if (
+                    frame_pts is not None and float(frame_pts) >= target_pts_float - 1e-6
+                ) or frame_count == source_idx:
                     graph.push(frame)
                     filtered_frame = graph.pull()
                     return filtered_frame.to_ndarray()
                 frame_count += 1
 
             raise VideoDecodeError(
-                self.path, source_idx,
-                RuntimeError(f'Failed to decode frame {source_idx}'))
+                self.path, source_idx, RuntimeError(f'Failed to decode frame {source_idx}')
+            )
         finally:
             if own_reader:
                 reader.close()

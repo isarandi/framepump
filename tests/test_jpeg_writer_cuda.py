@@ -98,9 +98,7 @@ CHROMA_CASES = [
 @needs_gpu
 @pytest.mark.parametrize('bframes', [0, 2])
 @pytest.mark.parametrize('jpeg_subsampling,chroma', CHROMA_CASES)
-def test_roundtrip_unaligned_height_matches_control(
-    tmp_path, jpeg_subsampling, chroma, bframes
-):
+def test_roundtrip_unaligned_height_matches_control(tmp_path, jpeg_subsampling, chroma, bframes):
     """Height 1080 (padded to 1088 for NVENC) must round-trip as cleanly as 1072."""
     width, n_frames = 640, 8
     results = {}
@@ -115,9 +113,9 @@ def test_roundtrip_unaligned_height_matches_control(
 
     control, unaligned = results['control'], results['unaligned']
     assert control < 12.0, f'control round-trip is broken: mean diff {control}'
-    assert unaligned <= control * 2.0 + 1.0, (
-        f'unaligned-height round-trip diff {unaligned:.2f} vs control {control:.2f}'
-    )
+    assert (
+        unaligned <= control * 2.0 + 1.0
+    ), f'unaligned-height round-trip diff {unaligned:.2f} vs control {control:.2f}'
 
 
 @needs_gpu

@@ -21,13 +21,19 @@ from ._cuda_compat import cuda_ctx_pushed, retain_primary_context
 from ._h264_mux import H264PassthroughMuxer
 from .encoder_config import EncoderConfig
 from .nvenc._session import NvencEncodeSession
-from .nvenc.bindings import (NV_ENC_BUFFER_FORMAT_IYUV, NV_ENC_BUFFER_FORMAT_NV16,
-                             NV_ENC_BUFFER_FORMAT_YUV444, NV_ENC_DEVICE_TYPE_CUDA,
-                             NV_ENC_H264_PROFILE_HIGH_422_GUID,
-                             NV_ENC_H264_PROFILE_HIGH_444_GUID, NV_ENC_INPUT_IMAGE,
-                             NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                             NV_ENC_PARAMS_RC_CONSTQP, NV_ENC_REGISTER_RESOURCE,
-                             NV_ENC_REGISTER_RESOURCE_VER)
+from .nvenc.bindings import (
+    NV_ENC_BUFFER_FORMAT_IYUV,
+    NV_ENC_BUFFER_FORMAT_NV16,
+    NV_ENC_BUFFER_FORMAT_YUV444,
+    NV_ENC_DEVICE_TYPE_CUDA,
+    NV_ENC_H264_PROFILE_HIGH_422_GUID,
+    NV_ENC_H264_PROFILE_HIGH_444_GUID,
+    NV_ENC_INPUT_IMAGE,
+    NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+    NV_ENC_PARAMS_RC_CONSTQP,
+    NV_ENC_REGISTER_RESOURCE,
+    NV_ENC_REGISTER_RESOURCE_VER,
+)
 from .nvenc.exceptions import NvencError
 from .nvjpeg import NvjpegPhasedDecoder
 from .nvjpeg.bindings import NVJPEG_CSS_420, NVJPEG_CSS_444
@@ -43,8 +49,10 @@ PathLike = Union[str, Path]
 # all chroma formats (notably 422). We parse the SPS NAL, find the
 # frame_cropping_flag bit, set it to 1, and insert crop offsets.
 
+
 class _BitReader:
     """Read individual bits from a byte buffer."""
+
     __slots__ = ('_data', '_pos', '_len')
 
     def __init__(self, data: bytes | bytearray):
@@ -86,8 +94,7 @@ def _nal_to_rbsp(data: bytes) -> bytearray:
     out = bytearray()
     i = 0
     while i < len(data):
-        if (i + 2 < len(data) and data[i] == 0 and data[i + 1] == 0
-                and data[i + 2] == 3):
+        if i + 2 < len(data) and data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 3:
             out.append(0)
             out.append(0)
             i += 3
@@ -218,11 +225,15 @@ def _patch_sps_crop(data: bytes, crop_right: int, crop_bottom: int) -> bytes:
     i = 0
     while i < len(buf):
         # Find start code
-        if (i + 3 < len(buf) and buf[i] == 0 and buf[i + 1] == 0
-                and buf[i + 2] == 0 and buf[i + 3] == 1):
+        if (
+            i + 3 < len(buf)
+            and buf[i] == 0
+            and buf[i + 1] == 0
+            and buf[i + 2] == 0
+            and buf[i + 3] == 1
+        ):
             sc_len = 4
-        elif (i + 2 < len(buf) and buf[i] == 0 and buf[i + 1] == 0
-              and buf[i + 2] == 1):
+        elif i + 2 < len(buf) and buf[i] == 0 and buf[i + 1] == 0 and buf[i + 2] == 1:
             sc_len = 3
         else:
             result.append(buf[i])
@@ -246,14 +257,16 @@ def _patch_sps_crop(data: bytes, crop_right: int, crop_bottom: int) -> bytes:
         if nal_type == 7:  # SPS
             nal_bytes = _set_sps_crop(nal_bytes, crop_right, crop_bottom)
 
-        result.extend(buf[i:i + sc_len])
+        result.extend(buf[i : i + sc_len])
         result.extend(nal_bytes)
         i = nal_end
 
     return bytes(result)
 
 
-class JpegVideoWriterCUDA(AbstractVideoWriter[bytes], AbstractContextManager['JpegVideoWriterCUDA']):
+class JpegVideoWriterCUDA(
+    AbstractVideoWriter[bytes], AbstractContextManager['JpegVideoWriterCUDA']
+):
     """Zero-copy JPEG to video writer using nvJPEG decoder and NVENC encoder.
 
     Decodes JPEG to YUV420 on GPU with nvJPEG and encodes with NVENC using
@@ -293,8 +306,7 @@ class JpegVideoWriterCUDA(AbstractVideoWriter[bytes], AbstractContextManager['Jp
                 encoded as 4:2:0, 4:4:4 input as 4:4:4).
         """
         if chroma not in (None, '420', '422', '444'):
-            raise ValueError(
-                f"chroma must be None, '420', '422' or '444', got {chroma!r}")
+            raise ValueError(f"chroma must be None, '420', '422' or '444', got {chroma!r}")
         del queue_size
         self._writer: _CudaSequenceWriter | None = None
         self._accepts_new_frames: bool = False
@@ -306,8 +318,9 @@ class JpegVideoWriterCUDA(AbstractVideoWriter[bytes], AbstractContextManager['Jp
         if video_path is not None:
             if fps is None:
                 raise ValueError('fps must be provided if video_path is provided')
-            self.start_sequence(video_path, fps, audio_source_path=audio_source_path,
-                                encoder_config=encoder_config)
+            self.start_sequence(
+                video_path, fps, audio_source_path=audio_source_path, encoder_config=encoder_config
+            )
 
     @property
     def accepts_new_frames(self) -> bool:
@@ -390,8 +403,6 @@ class SequenceContext(AbstractContextManager['SequenceContext']):
 
     def __exit__(self, *args: Any, **kwargs: Any) -> None:
         self.multiwriter.end_sequence()
-
-
 
 
 @dataclass(frozen=True)
@@ -486,7 +497,8 @@ def _build_scratch_layout(
         resized_u = _Plane(full_v.end, half_pitch, height)
         resized_v = _Plane(resized_u.end, half_pitch, height)
         return _ScratchLayout(
-            resized_v.end, full_u, full_v, resized_u, resized_v, chroma_width, height)
+            resized_v.end, full_u, full_v, resized_u, resized_v, chroma_width, height
+        )
     return _ScratchLayout(full_v.end, full_u, full_v, None, None, chroma_width, height // 2)
 
 
@@ -567,7 +579,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         the primary context of the configured device. The context is made
         current only for the duration of writer calls.
         """
-        err, = driver.cuInit(0)
+        (err,) = driver.cuInit(0)
         if err != driver.CUresult.CUDA_SUCCESS:
             raise NvencError(f'Failed to initialize CUDA: {err}')
 
@@ -614,10 +626,12 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._encode_height = ((height + 15) // 16) * 16
 
         self._layout = _build_encode_layout(
-            self._encode_width, self._encode_height, subsampling, self._downsample_to)
+            self._encode_width, self._encode_height, subsampling, self._downsample_to
+        )
         if self._downsample_to:
             self._scratch = _build_scratch_layout(
-                width, height, self._layout.y.pitch, self._downsample_to)
+                width, height, self._layout.y.pitch, self._downsample_to
+            )
 
     def _alloc_buffers(self) -> None:
         """Allocate the YUV input ring plus downsample scratch space.
@@ -643,6 +657,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 raise NvencError(f'Failed to allocate UV scratch buffer: {err}')
             self._uv_scratch = int(devptr)
             from .npp_bindings import make_npp_stream_context
+
             self._npp_ctx = make_npp_stream_context(self._gpu)
 
     @staticmethod
@@ -655,7 +670,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         for plane, value in ((layout.y, 0), (layout.u, 128), (layout.v, 128)):
             if plane is None:
                 continue
-            err, = driver.cuMemsetD8(base + plane.offset, value, plane.nbytes)
+            (err,) = driver.cuMemsetD8(base + plane.offset, value, plane.nbytes)
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise NvencError(f'Failed to initialize YUV buffer: {err}')
 
@@ -728,7 +743,8 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 parts.append(f'height={self._height} (must be even)')
             raise ValueError(
                 f'H.264 {fmt} requires even {" and ".join(parts)} — '
-                f'cannot represent exact dimensions {self._width}x{self._height}')
+                f'cannot represent exact dimensions {self._width}x{self._height}'
+            )
         self._sps_crop_right = dw // cu_x
         self._sps_crop_bottom = dh // cu_y
 
@@ -821,11 +837,13 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         if (width, height) != (self._width, self._height):
             raise ValueError(
                 f'JPEG dimensions {width}x{height} do not match initial frame '
-                f'dimensions {self._width}x{self._height}')
+                f'dimensions {self._width}x{self._height}'
+            )
         if subsampling != self._subsampling:
             raise ValueError(
                 f'JPEG chroma subsampling {_css_name(subsampling)} does not match '
-                f'initial frame subsampling {_css_name(self._subsampling)}')
+                f'initial frame subsampling {_css_name(self._subsampling)}'
+            )
 
     def _decode_gpu_into_buffer(self, buf_idx: int) -> None:
         """Transfer + device decode into specified buffer (async on decode stream)."""
@@ -844,18 +862,26 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 base + layout.y.offset,
                 self._uv_scratch + scratch.full_u.offset,
                 self._uv_scratch + scratch.full_v.offset,
-                layout.y.pitch, scratch.full_u.pitch, scratch.full_v.pitch,
+                layout.y.pitch,
+                scratch.full_u.pitch,
+                scratch.full_v.pitch,
                 stream,
             )
             self._npp_ctx.hStream = stream
             from .npp_bindings import resize_plane_8u
+
             if self._downsample_to == '420':
                 # Half width, half height, straight into the IYUV chroma planes
                 for src, dst in ((scratch.full_u, layout.u), (scratch.full_v, layout.v)):
                     resize_plane_8u(
-                        self._uv_scratch + src.offset, src.pitch, self._width, self._height,
-                        base + dst.offset, dst.pitch,
-                        scratch.chroma_width, scratch.chroma_height,
+                        self._uv_scratch + src.offset,
+                        src.pitch,
+                        self._width,
+                        self._height,
+                        base + dst.offset,
+                        dst.pitch,
+                        scratch.chroma_width,
+                        scratch.chroma_height,
                         ctx=self._npp_ctx,
                     )
             else:  # '422': half width, full height, staged then interleaved into NV16
@@ -864,17 +890,27 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                     (scratch.full_v, scratch.resized_v),
                 ):
                     resize_plane_8u(
-                        self._uv_scratch + src.offset, src.pitch, self._width, self._height,
-                        self._uv_scratch + dst.offset, dst.pitch,
-                        scratch.chroma_width, scratch.chroma_height,
+                        self._uv_scratch + src.offset,
+                        src.pitch,
+                        self._width,
+                        self._height,
+                        self._uv_scratch + dst.offset,
+                        dst.pitch,
+                        scratch.chroma_width,
+                        scratch.chroma_height,
                         ctx=self._npp_ctx,
                     )
                 from .npp_bindings import interleave_uv
+
                 interleave_uv(
-                    self._uv_scratch + scratch.resized_u.offset, scratch.resized_u.pitch,
-                    self._uv_scratch + scratch.resized_v.offset, scratch.resized_v.pitch,
-                    base + layout.u.offset, layout.u.pitch,
-                    scratch.chroma_width, scratch.chroma_height,
+                    self._uv_scratch + scratch.resized_u.offset,
+                    scratch.resized_u.pitch,
+                    self._uv_scratch + scratch.resized_v.offset,
+                    scratch.resized_v.pitch,
+                    base + layout.u.offset,
+                    layout.u.pitch,
+                    scratch.chroma_width,
+                    scratch.chroma_height,
                     stream=stream,
                 )
         else:
@@ -883,7 +919,9 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 base + layout.y.offset,
                 base + layout.u.offset,
                 base + layout.v.offset,
-                layout.y.pitch, layout.u.pitch, layout.v.pitch,
+                layout.y.pitch,
+                layout.u.pitch,
+                layout.v.pitch,
                 stream,
             )
 
@@ -903,7 +941,8 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             # padded to macroblock alignment (only IDR packets carry SPS)
             if packet.is_keyframe and (self._sps_crop_right or self._sps_crop_bottom):
                 packet.data = _patch_sps_crop(
-                    packet.data, self._sps_crop_right, self._sps_crop_bottom)
+                    packet.data, self._sps_crop_right, self._sps_crop_bottom
+                )
             self._muxer.mux(packet)
 
     def close(self) -> None:

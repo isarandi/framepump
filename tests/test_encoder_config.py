@@ -29,12 +29,28 @@ class TestValidConfigs:
     def test_codecs(self, codec):
         assert EncoderConfig(codec=codec).codec == codec
 
-    @pytest.mark.parametrize('preset', [
-        None,
-        'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7',
-        'ultrafast', 'superfast', 'veryfast', 'faster', 'fast',
-        'medium', 'slow', 'slower', 'veryslow',
-    ])
+    @pytest.mark.parametrize(
+        'preset',
+        [
+            None,
+            'p1',
+            'p2',
+            'p3',
+            'p4',
+            'p5',
+            'p6',
+            'p7',
+            'ultrafast',
+            'superfast',
+            'veryfast',
+            'faster',
+            'fast',
+            'medium',
+            'slow',
+            'slower',
+            'veryslow',
+        ],
+    )
     def test_presets(self, preset):
         assert EncoderConfig(preset=preset).preset == preset
 

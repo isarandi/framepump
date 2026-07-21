@@ -202,7 +202,7 @@ class TestVideoWriterFractionalFps:
         expected_duration = n_frames / fps
         actual_duration = get_duration(str(video_path))
         # Duration should be accurate within 1 frame
-        assert actual_duration == pytest.approx(expected_duration, abs=1/fps)
+        assert actual_duration == pytest.approx(expected_duration, abs=1 / fps)
 
     def test_high_precision_fps(self, tmp_path):
         """Test that high precision fps values are handled."""
@@ -255,7 +255,7 @@ class TestVideoWriterFractionalFps:
                     writer.append_data(np.zeros((64, 64, 3), dtype=np.uint8))
 
             frames = VideoFrames(str(video_path))
-            assert frames.fps == pytest.approx(fps, rel=1e-6), f"Failed for {fps} fps"
+            assert frames.fps == pytest.approx(fps, rel=1e-6), f'Failed for {fps} fps'
 
 
 class TestVideoWriterIntegration:
@@ -294,9 +294,9 @@ def make_quadrant_frame_uint8(size=128):
     """Create a quadrant test pattern: red, green, blue, white."""
     half = size // 2
     frame = np.zeros((size, size, 3), dtype=np.uint8)
-    frame[:half, :half] = [255, 0, 0]      # top-left: red
-    frame[:half, half:] = [0, 255, 0]      # top-right: green
-    frame[half:, :half] = [0, 0, 255]      # bottom-left: blue
+    frame[:half, :half] = [255, 0, 0]  # top-left: red
+    frame[:half, half:] = [0, 255, 0]  # top-right: green
+    frame[half:, :half] = [0, 0, 255]  # bottom-left: blue
     frame[half:, half:] = [255, 255, 255]  # bottom-right: white
     return frame
 
@@ -306,14 +306,26 @@ def assert_quadrants_match(original, decoded, atol=5):
     size = original.shape[0]
     half = size // 2
     margin = size // 16  # Stay away from edges
-    assert np.allclose(original[margin:half-margin, margin:half-margin],
-                       decoded[margin:half-margin, margin:half-margin], atol=atol)
-    assert np.allclose(original[margin:half-margin, half+margin:size-margin],
-                       decoded[margin:half-margin, half+margin:size-margin], atol=atol)
-    assert np.allclose(original[half+margin:size-margin, margin:half-margin],
-                       decoded[half+margin:size-margin, margin:half-margin], atol=atol)
-    assert np.allclose(original[half+margin:size-margin, half+margin:size-margin],
-                       decoded[half+margin:size-margin, half+margin:size-margin], atol=atol)
+    assert np.allclose(
+        original[margin : half - margin, margin : half - margin],
+        decoded[margin : half - margin, margin : half - margin],
+        atol=atol,
+    )
+    assert np.allclose(
+        original[margin : half - margin, half + margin : size - margin],
+        decoded[margin : half - margin, half + margin : size - margin],
+        atol=atol,
+    )
+    assert np.allclose(
+        original[half + margin : size - margin, margin : half - margin],
+        decoded[half + margin : size - margin, margin : half - margin],
+        atol=atol,
+    )
+    assert np.allclose(
+        original[half + margin : size - margin, half + margin : size - margin],
+        decoded[half + margin : size - margin, half + margin : size - margin],
+        atol=atol,
+    )
 
 
 class TestPixelRoundtrip:
@@ -366,9 +378,9 @@ class TestPixelRoundtrip:
         half = size // 2
 
         frame = np.zeros((size, size, 3), dtype=np.uint16)
-        frame[:half, :half] = [65535, 0, 0]          # top-left: red
-        frame[:half, half:] = [0, 65535, 0]          # top-right: green
-        frame[half:, :half] = [0, 0, 65535]          # bottom-left: blue
+        frame[:half, :half] = [65535, 0, 0]  # top-left: red
+        frame[:half, half:] = [0, 65535, 0]  # top-right: green
+        frame[half:, :half] = [0, 0, 65535]  # bottom-left: blue
         frame[half:, half:] = [65535, 65535, 65535]  # bottom-right: white
 
         with VideoWriter(str(video_path), fps=30) as writer:
@@ -385,6 +397,7 @@ class TestPixelRoundtrip:
 
         from framepump import GLVideoWriter
         from framepump.nvenc.exceptions import NvencError
+
         if GLVideoWriter is None:
             pytest.skip('GLVideoWriter not available (NVENC required)')
 
@@ -469,6 +482,7 @@ class TestPixelRoundtrip:
 
         from framepump import GLVideoWriter
         from framepump.nvenc.exceptions import NvencError
+
         if GLVideoWriter is None:
             pytest.skip('GLVideoWriter not available (NVENC required)')
 
@@ -505,6 +519,7 @@ class TestPixelRoundtrip:
 
         from framepump import GLVideoWriter
         from framepump.nvenc.exceptions import NvencError
+
         if GLVideoWriter is None:
             pytest.skip('GLVideoWriter not available (NVENC required)')
 

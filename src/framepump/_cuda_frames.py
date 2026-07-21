@@ -53,13 +53,16 @@ from ._cuda_compat import cuda_ctx_pushed
 PathLike = Union[str, Path]
 
 # Source pixel formats that carry >8 bits of precision.
-_HBD_FORMATS = frozenset({
-    nvc.Pixel_Format.P016,
-    nvc.Pixel_Format.YUV444_16Bit,
-})
+_HBD_FORMATS = frozenset(
+    {
+        nvc.Pixel_Format.P016,
+        nvc.Pixel_Format.YUV444_16Bit,
+    }
+)
 
 
 # ── Frame index ──────────────────────────────────────────────────────
+
 
 class _FrameIndexNvDec:
     """Packet-based frame index built from PyNvDemuxer.
@@ -126,6 +129,7 @@ class _FrameIndexNvDec:
         self.seekable: bool = True
         try:
             import av
+
             with av.open(video_path) as container:
                 stream = container.streams.video[0]
                 container_nframes = stream.frames
@@ -138,6 +142,7 @@ class _FrameIndexNvDec:
 
 
 # ── Decode session ───────────────────────────────────────────────────
+
 
 class _NvDecSession:
     """Wraps PyNvDemuxer + PyNvDecoder for a single decode session.
@@ -223,6 +228,7 @@ class _NvDecSession:
 
 
 # ── Public class ─────────────────────────────────────────────────────
+
 
 class VideoFramesCuda:
     """Lazy, sliceable GPU video frame iterator using NVDEC (low-level API).
@@ -312,8 +318,7 @@ class VideoFramesCuda:
             self._color_space = color_space
         else:
             raise ValueError(
-                f"color_space must be 'auto', 'bt601', or 'bt709', "
-                f"got {color_space!r}"
+                f"color_space must be 'auto', 'bt601', or 'bt709', " f'got {color_space!r}'
             )
 
     # ── Public interface ──────────────────────────────────────────────
@@ -343,8 +348,7 @@ class VideoFramesCuda:
                 item = length + item
             if item < 0 or item >= length:
                 raise IndexError(
-                    f'Frame index {item} out of range for video with '
-                    f'{length} frames'
+                    f'Frame index {item} out of range for video with ' f'{length} frames'
                 )
             abs_idx = self._frame_range[item]
             return self._get_frame_by_abs_idx(abs_idx, owns_memory=True)
@@ -367,7 +371,7 @@ class VideoFramesCuda:
         h, w = self.imshape
         return (
             f"VideoFramesCuda('{self.path}', {w}x{h}, "
-            f"{self.fps:.4g} fps, {len(self)} frames, {self.dtype})"
+            f'{self.fps:.4g} fps, {len(self)} frames, {self.dtype})'
         )
 
     @property
@@ -434,7 +438,10 @@ class VideoFramesCuda:
     def _make_session(self) -> _NvDecSession:
         """Create a new decode session with the configured color type."""
         return _NvDecSession(
-            self.path, self._gpu, self._index.codec, self._color_type,
+            self.path,
+            self._gpu,
+            self._index.codec,
+            self._color_type,
         )
 
     # ── Internal: random access ──────────────────────────────────────
@@ -481,8 +488,7 @@ class VideoFramesCuda:
                         if f.getPTS() >= target_pts:
                             return f, dec
                 raise RuntimeError(
-                    f'Failed to decode frame at PTS {target_pts} '
-                    f'(seeked to {safe_pts})'
+                    f'Failed to decode frame at PTS {target_pts} ' f'(seeked to {safe_pts})'
                 )
 
             frames = dec.Decode(pkt)
@@ -537,7 +543,10 @@ class VideoFramesCuda:
         safe_pts = self._index.safe_seek_pts[start]
 
         session = _NvDecSession(
-            self.path, self._gpu, self._index.codec, self._color_type,
+            self.path,
+            self._gpu,
+            self._index.codec,
+            self._color_type,
         )
         convert = self._npp_mode is not None
 
@@ -637,6 +646,7 @@ class VideoFramesCuda:
         buf = getattr(self, '_iter_buf_ptr', None)
         if buf is not None and ctx is not None:
             from cuda.bindings import driver
+
             with cuda_ctx_pushed(ctx):
                 # NPP work on the default stream may still be in flight.
                 driver.cuCtxSynchronize()
@@ -645,6 +655,7 @@ class VideoFramesCuda:
         device = getattr(self, '_cuda_device', None)
         if device is not None:
             from cuda.bindings import driver
+
             driver.cuDevicePrimaryCtxRelease(device)
             del self._cuda_device
         if ctx is not None:
@@ -655,7 +666,11 @@ class VideoFramesCuda:
         self._do_convert(frame, self._iter_buf_ptr)
         h, w = self.original_imshape
         return _GpuRgbBuffer(
-            self._iter_buf_ptr, h, w, self._out_pitch, self._gpu,
+            self._iter_buf_ptr,
+            h,
+            w,
+            self._out_pitch,
+            self._gpu,
             owns_memory=False,
         )
 
@@ -673,7 +688,12 @@ class VideoFramesCuda:
 
         self._do_convert(frame, devptr)
         return _GpuRgbBuffer(
-            devptr, h, w, pitch, self._gpu, owns_memory=True,
+            devptr,
+            h,
+            w,
+            pitch,
+            self._gpu,
+            owns_memory=True,
         )
 
     def _do_convert(self, frame, dst_ptr: int) -> None:
@@ -689,8 +709,16 @@ class VideoFramesCuda:
                 if pf == nvc.Pixel_Format.P016:
                     (y_ptr, y_pitch), (uv_ptr, uv_pitch) = _plane_layouts(frame, 2, w * 2, h)
                     npp.p016_to_rgb16(
-                        y_ptr, y_pitch, uv_ptr, uv_pitch,
-                        dst_ptr, dst_pitch, w, h, self._twist, ctx,
+                        y_ptr,
+                        y_pitch,
+                        uv_ptr,
+                        uv_pitch,
+                        dst_ptr,
+                        dst_pitch,
+                        w,
+                        h,
+                        self._twist,
+                        ctx,
                     )
                 elif pf == nvc.Pixel_Format.YUV444_16Bit:
                     planes = _plane_layouts(frame, 3, w * 2, h)
@@ -701,18 +729,30 @@ class VideoFramesCuda:
                             f'{y_pitch}/{u_pitch}/{v_pitch}'
                         )
                     npp.yuv444_16bit_to_rgb16(
-                        y_ptr, u_ptr, v_ptr, y_pitch,
-                        dst_ptr, dst_pitch, w, h, self._twist, ctx,
+                        y_ptr,
+                        u_ptr,
+                        v_ptr,
+                        y_pitch,
+                        dst_ptr,
+                        dst_pitch,
+                        w,
+                        h,
+                        self._twist,
+                        ctx,
                     )
                 else:
-                    raise RuntimeError(
-                        f'Unsupported source format for yuv_to_rgb16: {pf}'
-                    )
+                    raise RuntimeError(f'Unsupported source format for yuv_to_rgb16: {pf}')
 
             elif self._npp_mode == 'scale_8u_16u':
                 ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
                 npp.rgb8_to_rgb16(
-                    src_ptr, src_pitch, dst_ptr, dst_pitch, w, h, ctx,
+                    src_ptr,
+                    src_pitch,
+                    dst_ptr,
+                    dst_pitch,
+                    w,
+                    h,
+                    ctx,
                 )
 
             else:
@@ -781,6 +821,7 @@ def _plane_layouts_from_deltas(frame, num_planes: int, min_row_bytes: int, heigh
 
 # ── GPU RGB buffer with DLPack export ────────────────────────────────
 
+
 class _GpuRgbBuffer:
     """DLPack-compatible wrapper around a GPU-resident packed uint16 RGB buffer.
 
@@ -794,14 +835,27 @@ class _GpuRgbBuffer:
     """
 
     __slots__ = (
-        '_devptr', '_height', '_width', '_pitch',
-        '_gpu_id', '_owns_memory', '_own_device', '_own_ctx',
-        '_shape_arr', '_strides_arr',
+        '_devptr',
+        '_height',
+        '_width',
+        '_pitch',
+        '_gpu_id',
+        '_owns_memory',
+        '_own_device',
+        '_own_ctx',
+        '_shape_arr',
+        '_strides_arr',
     )
 
     def __init__(
-        self, devptr: int, height: int, width: int, pitch: int,
-        gpu_id: int, *, owns_memory: bool,
+        self,
+        devptr: int,
+        height: int,
+        width: int,
+        pitch: int,
+        gpu_id: int,
+        *,
+        owns_memory: bool,
     ) -> None:
         self._devptr = devptr
         self._height = height
@@ -832,12 +886,8 @@ class _GpuRgbBuffer:
         mt.dl_tensor.device = _DLDevice(2, self._gpu_id)  # kDLCUDA
         mt.dl_tensor.ndim = 3
         mt.dl_tensor.dtype = _DLDataType(1, 16, 1)  # kDLUInt 16-bit
-        mt.dl_tensor.shape = ctypes.cast(
-            self._shape_arr, ctypes.POINTER(ctypes.c_int64)
-        )
-        mt.dl_tensor.strides = ctypes.cast(
-            self._strides_arr, ctypes.POINTER(ctypes.c_int64)
-        )
+        mt.dl_tensor.shape = ctypes.cast(self._shape_arr, ctypes.POINTER(ctypes.c_int64))
+        mt.dl_tensor.strides = ctypes.cast(self._strides_arr, ctypes.POINTER(ctypes.c_int64))
         mt.dl_tensor.byte_offset = 0
 
         key = next(_prevent_gc_counter)
@@ -859,7 +909,12 @@ class _GpuRgbBuffer:
 
         mt.manager_ctx = key
         _prevent_gc_store[key] = (
-            devptr, mt, self._shape_arr, self._strides_arr, device, ctx,
+            devptr,
+            mt,
+            self._shape_arr,
+            self._strides_arr,
+            device,
+            ctx,
         )
 
         return _PyCapsule_New(ctypes.addressof(mt), b'dltensor', None)
@@ -903,6 +958,7 @@ class _FrameWithDecoder:
 # (e.g., torch) is done with the data.
 
 # DLPack ABI structs (stable since DLPack 0.2, 2017)
+
 
 class _DLDevice(ctypes.Structure):
     _fields_ = [('device_type', ctypes.c_int32), ('device_id', ctypes.c_int32)]
@@ -963,6 +1019,7 @@ _prevent_gc_counter = itertools.count()
 
 # ── _GpuRgbBuffer deleters (module-level to survive GC) ──────────────
 
+
 def _free_owned_buffer(devptr, device, ctx) -> None:
     """Free an owned allocation under its owning primary context.
 
@@ -1006,6 +1063,7 @@ _GPU_BUFFER_NOFREE_DELETER = _DeleterFunc(_gpu_buffer_nofree_deleter_impl)
 
 
 # ── _FrameWithDecoder deleter ────────────────────────────────────────
+
 
 def _prevent_gc_deleter_impl(managed_ptr):
     """Called by the DLPack consumer when the tensor is freed."""
@@ -1063,8 +1121,7 @@ def _dlpack_prevent_gc(capsule, *prevent_gc_refs):
     #   _PREVENT_GC_DELETER — prevents callback from being collected
     #   prevent_gc_refs — decoder, frame, etc.
     key = next(_prevent_gc_counter)
-    _prevent_gc_store[key] = (orig_ptr, capsule, wrapper, _PREVENT_GC_DELETER,
-                              *prevent_gc_refs)
+    _prevent_gc_store[key] = (orig_ptr, capsule, wrapper, _PREVENT_GC_DELETER, *prevent_gc_refs)
     wrapper.manager_ctx = key
 
     return _PyCapsule_New(ctypes.addressof(wrapper), b'dltensor', None)

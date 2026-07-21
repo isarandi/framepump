@@ -151,8 +151,19 @@ class TestLeadingGap:
             pytest.skip('ffmpeg CLI not available')
         out = tmp_path_factory.mktemp('shifted') / 'shifted.mp4'
         subprocess.run(
-            ['ffmpeg', '-y', '-v', 'error', '-i', str(DATA_DIR / 'short.mp4'),
-             '-output_ts_offset', '0.2', '-c', 'copy', str(out)],
+            [
+                'ffmpeg',
+                '-y',
+                '-v',
+                'error',
+                '-i',
+                str(DATA_DIR / 'short.mp4'),
+                '-output_ts_offset',
+                '0.2',
+                '-c',
+                'copy',
+                str(out),
+            ],
             check=True,
         )
         return str(out)

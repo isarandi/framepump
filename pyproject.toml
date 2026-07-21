@@ -51,7 +51,7 @@ test = [
     "pytest-forked",
 ]
 lint = [
-    "ruff",
+    "ruff==0.8.0",  # Keep in sync with .pre-commit-config.yaml
     "pyright",
     "pre-commit",
 ]

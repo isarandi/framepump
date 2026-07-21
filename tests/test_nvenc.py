@@ -6,6 +6,7 @@ Tests that don't require GPU are marked accordingly.
 
 import pytest
 
+
 # Check if NVENC GPU tests can run (requires GLX context, not EGL)
 def _nvenc_available():
     """Check if NVENC is available (library + GLFW + moderngl importable).
@@ -19,13 +20,16 @@ def _nvenc_available():
     """
     try:
         import ctypes
+
         ctypes.CDLL('libnvidia-encode.so.1')
         import glfw  # noqa: F401
         import moderngl  # noqa: F401
         from framepump.nvenc import NvencEncoder  # noqa: F401
+
         return True
     except Exception:
         return False
+
 
 NVENC_AVAILABLE = _nvenc_available()
 _glfw_initialized = False
@@ -42,6 +46,7 @@ class TestNvencImports:
             TextureFormatError,
             EncoderNotInitialized,
         )
+
         assert issubclass(NvencNotAvailable, NvencError)
         assert issubclass(TextureFormatError, NvencError)
         assert issubclass(EncoderNotInitialized, NvencError)
@@ -49,15 +54,16 @@ class TestNvencImports:
     def test_import_encoder_class(self):
         """Test that NvencEncoder class can be imported."""
         from framepump.nvenc import NvencEncoder
+
         assert NvencEncoder is not None
 
     def test_import_bindings(self):
         """Test that bindings module can be imported."""
         from framepump.nvenc import bindings
+
         assert hasattr(bindings, 'NvencAPI')
         assert hasattr(bindings, 'GUID')
         assert hasattr(bindings, 'NV_ENC_SUCCESS')
-
 
 
 class TestGLVideoWriterImport:
@@ -66,11 +72,13 @@ class TestGLVideoWriterImport:
     def test_import_glvideowriter(self):
         """Test that GLVideoWriter can be imported from main package."""
         from framepump import GLVideoWriter
+
         assert GLVideoWriter is not None
 
     def test_glvideowriter_has_expected_methods(self):
         """Test that GLVideoWriter has expected API."""
         from framepump import GLVideoWriter
+
         assert hasattr(GLVideoWriter, 'start_sequence')
         assert hasattr(GLVideoWriter, 'end_sequence')
         assert hasattr(GLVideoWriter, 'append_data')
@@ -100,6 +108,7 @@ def gl_context():
 
     # Check if GL context is on an NVIDIA GPU (required for NVENC OpenGL path)
     import ctypes
+
     gl = ctypes.cdll.LoadLibrary('libGL.so.1')
     gl.glGetString.restype = ctypes.c_char_p
     renderer = (gl.glGetString(0x1F01) or b'').decode(errors='replace')
@@ -114,16 +123,14 @@ def gl_context():
     glfw.destroy_window(window)
 
 
-@pytest.mark.skipif(
-    not NVENC_AVAILABLE,
-    reason='Requires NVIDIA GPU with NVENC support'
-)
+@pytest.mark.skipif(not NVENC_AVAILABLE, reason='Requires NVIDIA GPU with NVENC support')
 class TestNvencEncoder:
     """Tests that require actual NVENC hardware."""
 
     def test_encoder_init(self, gl_context):
         """Test that encoder initializes correctly."""
         from framepump.nvenc import NvencEncoder
+
         encoder = NvencEncoder(640, 480, fps=30)
         assert encoder is not None
         encoder.close()
@@ -131,12 +138,14 @@ class TestNvencEncoder:
     def test_encoder_context_manager(self, gl_context):
         """Test encoder as context manager."""
         from framepump.nvenc import NvencEncoder
+
         with NvencEncoder(640, 480, fps=30) as encoder:
             assert encoder is not None
 
     def test_encode_single_frame(self, gl_context):
         """Test encode + flush produces valid H.264 with correct structure."""
         from framepump.nvenc import NvencEncoder, EncodedPacket
+
         texture = gl_context.texture((640, 480), 4)  # RGBA
 
         with NvencEncoder(640, 480, fps=30) as encoder:
@@ -157,6 +166,7 @@ class TestNvencEncoder:
     def test_encode_multiple_frames(self, gl_context):
         """Test that N input frames produce exactly N output packets with valid timing."""
         from framepump.nvenc import NvencEncoder
+
         texture = gl_context.texture((640, 480), 4)
         n_frames = 30
 
@@ -223,10 +233,7 @@ class TestNvencEncoder:
             assert packets[0].is_keyframe, f'Single frame not keyframe at {fps} fps'
 
 
-@pytest.mark.skipif(
-    not NVENC_AVAILABLE,
-    reason='Requires NVIDIA GPU with NVENC support'
-)
+@pytest.mark.skipif(not NVENC_AVAILABLE, reason='Requires NVIDIA GPU with NVENC support')
 class TestGLVideoWriter:
     """Integration tests for GLVideoWriter."""
 

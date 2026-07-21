@@ -38,7 +38,9 @@ except ImportError:
 PathLike = Union[str, Path]
 
 
-class GLVideoWriter(AbstractVideoWriter['moderngl.Texture'], AbstractContextManager['GLVideoWriter']):
+class GLVideoWriter(
+    AbstractVideoWriter['moderngl.Texture'], AbstractContextManager['GLVideoWriter']
+):
     """Zero-copy GL texture to video writer using NVENC with PyAV muxing.
 
     Similar API to VideoWriter but runs synchronously (no background thread)
@@ -74,8 +76,9 @@ class GLVideoWriter(AbstractVideoWriter['moderngl.Texture'], AbstractContextMana
         if video_path is not None:
             if fps is None:
                 raise ValueError('fps must be provided if video_path is provided')
-            self.start_sequence(video_path, fps, audio_source_path=audio_source_path,
-                                encoder_config=encoder_config)
+            self.start_sequence(
+                video_path, fps, audio_source_path=audio_source_path, encoder_config=encoder_config
+            )
 
     @property
     def accepts_new_frames(self) -> bool:
@@ -252,8 +255,7 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
                 )
             # type() rather than isinstance(): True must not count as ordinal 1
             gpu_device = self._gpu if type(self._gpu) is int else None  # noqa: E721
-            self._encoder = NvencCudaEncoder(
-                width, height, **encoder_kwargs, gpu=gpu_device)
+            self._encoder = NvencCudaEncoder(width, height, **encoder_kwargs, gpu=gpu_device)
         else:
             if NvencEncoder is None:
                 raise ImportError(

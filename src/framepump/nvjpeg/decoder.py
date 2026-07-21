@@ -423,9 +423,7 @@ class NvjpegPhasedDecoder:
                 self._state, self._pinned_buffers[self._slot]
             )
             if status != NVJPEG_STATUS_SUCCESS:
-                raise RuntimeError(
-                    nvjpeg_status_message(status, 'Failed to attach pinned buffer')
-                )
+                raise RuntimeError(nvjpeg_status_message(status, 'Failed to attach pinned buffer'))
 
             status = _lib.nvjpegJpegStreamParse(
                 self._handle,
@@ -445,9 +443,7 @@ class NvjpegPhasedDecoder:
                 jpeg_stream, byref(width), byref(height)
             )
             if status != NVJPEG_STATUS_SUCCESS:
-                raise RuntimeError(
-                    nvjpeg_status_message(status, 'Failed to get frame dimensions')
-                )
+                raise RuntimeError(nvjpeg_status_message(status, 'Failed to get frame dimensions'))
 
             subsampling = c_int()
             status = _lib.nvjpegJpegStreamGetChromaSubsampling(jpeg_stream, byref(subsampling))

@@ -16,6 +16,7 @@ def test_imports():
 def test_videoframes_class_exists():
     """Test VideoFrames class has expected attributes."""
     from framepump import VideoFrames
+
     assert hasattr(VideoFrames, 'resized')
     assert hasattr(VideoFrames, 'repeat_each_frame')
     assert hasattr(VideoFrames, '__iter__')
@@ -26,6 +27,7 @@ def test_videoframes_class_exists():
 def test_videowriter_class_exists():
     """Test VideoWriter class has expected attributes."""
     from framepump import VideoWriter
+
     assert hasattr(VideoWriter, 'start_sequence')
     assert hasattr(VideoWriter, 'end_sequence')
     assert hasattr(VideoWriter, 'append_data')

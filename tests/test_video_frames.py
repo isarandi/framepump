@@ -20,8 +20,8 @@ def sample_video(tmp_path):
             frame = np.zeros((height, width, 3), dtype=np.uint8)
             # Add frame number as intensity
             frame[:, :, 0] = i * 8  # Red channel varies with frame
-            frame[:, :, 1] = 128    # Green constant
-            frame[:, :, 2] = 64     # Blue constant
+            frame[:, :, 1] = 128  # Green constant
+            frame[:, :, 2] = 64  # Blue constant
             writer.append_data(frame)
 
     return str(video_path), fps, n_frames, (height, width)

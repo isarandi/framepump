@@ -9,6 +9,7 @@ from .exceptions import (
 # CUDA-path encoder (optional, requires additional dependencies)
 try:
     from .cuda_encoder import NvencCudaEncoder
+
     HAS_CUDA_PATH = True
 except ImportError:
     NvencCudaEncoder = None

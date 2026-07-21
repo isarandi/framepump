@@ -67,7 +67,12 @@ class VideoEncodeError(FramePumpError):
         # Build informative message
         parts = []
         # Detect NVENC small frame error
-        if codec and 'nvenc' in codec and resolution and (resolution[0] < 150 or resolution[1] < 50):
+        if (
+            codec
+            and 'nvenc' in codec
+            and resolution
+            and (resolution[0] < 150 or resolution[1] < 50)
+        ):
             parts.append(
                 f'NVENC frame size too small: {resolution[0]}x{resolution[1]} '
                 f'(minimum ~145x49 for h264_nvenc)'
@@ -129,8 +134,7 @@ class PyAVReader:
 
         if self._is_fileobj:
             if gpu:
-                raise ValueError(
-                    'GPU decoding requires a filesystem path, not a file-like object')
+                raise ValueError('GPU decoding requires a filesystem path, not a file-like object')
             self.path = None
             self._source = source
             try:
@@ -151,7 +155,8 @@ class PyAVReader:
                     options['hwaccel_device'] = str(gpu)
             try:
                 self._container = av.open(
-                    str(source), options=options, metadata_errors='surrogateescape')
+                    str(source), options=options, metadata_errors='surrogateescape'
+                )
             except av.error.FFmpegError as e:
                 raise VideoDecodeError(source, 0, e) from e
 
@@ -159,7 +164,8 @@ class PyAVReader:
 
         if not self._container.streams.video:
             raise ValueError(
-                f'No video stream found in {source if not self._is_fileobj else "<file-like>"}')
+                f'No video stream found in {source if not self._is_fileobj else "<file-like>"}'
+            )
         self._stream = self._container.streams.video[0]
 
         # Enable multi-threaded decoding (~5x speedup).
@@ -186,8 +192,16 @@ class PyAVReader:
 
     # Codecs with NVIDIA CUVID hardware decoder support.
     _CUVID_CODECS = {
-        'h264', 'hevc', 'mpeg1video', 'mpeg2video', 'mpeg4',
-        'av1', 'vp8', 'vp9', 'vc1', 'mjpeg',
+        'h264',
+        'hevc',
+        'mpeg1video',
+        'mpeg2video',
+        'mpeg4',
+        'av1',
+        'vp8',
+        'vp9',
+        'vc1',
+        'mjpeg',
     }
 
     # Container formats where hwaccel=cuda causes segfaults in av.open().
@@ -240,7 +254,11 @@ class PyAVReader:
             # - dirac: raw dirac bitstream
             # - *_pipe: image pipes (bmp_pipe, png_pipe, etc.) - seek(0) works but seek(N) fails
             # - cavsvideo: CAVS codec fails to decode after seeking
-            elif 'image' in format_name or format_name in ('dirac', 'cavsvideo', 'rm') or '_pipe' in format_name:
+            elif (
+                'image' in format_name
+                or format_name in ('dirac', 'cavsvideo', 'rm')
+                or '_pipe' in format_name
+            ):
                 self._seekable = False
             else:
                 try:
@@ -290,8 +308,7 @@ class PyAVReader:
         if self._is_fileobj:
             self._source.seek(0)
             try:
-                self._container = av.open(
-                    self._source, metadata_errors='surrogateescape')
+                self._container = av.open(self._source, metadata_errors='surrogateescape')
             except av.error.FFmpegError as e:
                 raise VideoDecodeError('<file-like>', 0, e) from e
         else:
@@ -302,7 +319,8 @@ class PyAVReader:
                     options['hwaccel_device'] = str(self._gpu)
             try:
                 self._container = av.open(
-                    str(self.path), options=options, metadata_errors='surrogateescape')
+                    str(self.path), options=options, metadata_errors='surrogateescape'
+                )
             except av.error.FFmpegError as e:
                 raise VideoDecodeError(self.path, 0, e) from e
         self._stream = self._container.streams.video[0]
@@ -516,8 +534,7 @@ class PyAVReader:
             last_filter.link_to(scale_filter)
             last_filter = scale_filter
         elif needs_sws_fix:
-            scale_filter = graph.add(
-                'scale', 'w=iw:h=ih:flags=accurate_rnd+full_chroma_int')
+            scale_filter = graph.add('scale', 'w=iw:h=ih:flags=accurate_rnd+full_chroma_int')
             last_filter.link_to(scale_filter)
             last_filter = scale_filter
 
@@ -703,8 +720,7 @@ class FrameIndexPyAV:
             video_path: Path to the video file, or a file-like object.
             reader: Optional existing PyAVReader to use (avoids reopening).
         """
-        self.video_path = (
-            Path(video_path) if isinstance(video_path, (str, Path)) else video_path)
+        self.video_path = Path(video_path) if isinstance(video_path, (str, Path)) else video_path
 
         # Use provided reader or create temporary one
         own_reader = reader is None

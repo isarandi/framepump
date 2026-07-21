@@ -36,8 +36,7 @@ def _torch_cuda_or_skip():
 class _FakeTensor:
     """Minimal stand-in exposing the tensor introspection surface."""
 
-    def __init__(self, dtype='torch.uint8', shape=(4, 8, 3), device_type='cuda',
-                 contiguous=True):
+    def __init__(self, dtype='torch.uint8', shape=(4, 8, 3), device_type='cuda', contiguous=True):
         self.dtype = dtype
         self.shape = shape
         self._contiguous = contiguous
@@ -160,18 +159,27 @@ class TestNppBindings:
         from framepump import npp_bindings
 
         with pytest.raises(ValueError, match='even'):
-            npp_bindings.rgb_to_nv12(0, width * 3, 0, width, 0, width,
-                                     width, height, 0, 0, 0)
+            npp_bindings.rgb_to_nv12(0, width * 3, 0, width, 0, width, width, height, 0, 0, 0)
         with pytest.raises(ValueError, match='even'):
-            npp_bindings.yuv420_to_nv12(0, width, 0, width // 2, 0, width // 2,
-                                        0, width, 0, width, width, height)
+            npp_bindings.yuv420_to_nv12(
+                0, width, 0, width // 2, 0, width // 2, 0, width, 0, width, width, height
+            )
         with pytest.raises(ValueError, match='even'):
-            npp_bindings.nv12_to_rgb8(0, width, 0, width, 0, width * 3,
-                                      width, height,
-                                      npp_bindings.BT601_YUV_TO_RGB_8_FULL)
+            npp_bindings.nv12_to_rgb8(
+                0,
+                width,
+                0,
+                width,
+                0,
+                width * 3,
+                width,
+                height,
+                npp_bindings.BT601_YUV_TO_RGB_8_FULL,
+            )
         with pytest.raises(ValueError, match='even'):
-            npp_bindings.nv12_to_p016(0, width, 0, width, 0, width * 2,
-                                      0, width * 2, width, height)
+            npp_bindings.nv12_to_p016(
+                0, width, 0, width, 0, width * 2, 0, width * 2, width, height
+            )
 
     def test_default_ctx_uses_current_device_and_caches(self):
         driver = _init_gpu_or_skip()

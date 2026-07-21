@@ -92,6 +92,7 @@ class AbstractVideoWriter(ABC, Generic[T]):
 
 class Message:
     """Base class for queue messages."""
+
     pass
 
 
@@ -161,8 +162,12 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
             if fps is None:
                 raise ValueError('fps must be provided if video_path is provided')
             self.start_sequence(
-                video_path, fps, audio_source_path=audio_source_path, gpu=gpu,
-                encoder_config=encoder_config)
+                video_path,
+                fps,
+                audio_source_path=audio_source_path,
+                gpu=gpu,
+                encoder_config=encoder_config,
+            )
 
     @property
     def accepts_new_frames(self) -> bool:
@@ -328,9 +333,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         if self._state is not _WriterState.FAILED:
             self._state = _WriterState.IDLE
 
-    def __exit__(
-        self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any
-    ) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any) -> None:
         if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
             # On Ctrl+C, don't wait for pending work
             self.shutdown()
@@ -546,7 +549,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             self._temp_file = None
             self._file_output = video_output
             if format is None:
-                raise ValueError("format is required when writing to a file-like object")
+                raise ValueError('format is required when writing to a file-like object')
             self._format = format
 
         # State will be initialized on first frame
@@ -648,7 +651,8 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
 
         if self._temp_file is not None:
             self._output_container = av.open(
-                os.fspath(self._temp_file.temp_path), 'w', format=self._format)
+                os.fspath(self._temp_file.temp_path), 'w', format=self._format
+            )
         else:
             self._output_container = av.open(self._file_output, 'w', format=self._format)
 
@@ -681,8 +685,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             self._audio_stream = self._output_container.add_stream(template=src_audio)
             self._audio_time_base = src_audio.time_base
             self._audio_pkts = (
-                pkt for pkt in self._audio_input_container.demux(src_audio)
-                if pkt.dts is not None
+                pkt for pkt in self._audio_input_container.demux(src_audio) if pkt.dts is not None
             )
 
     def close(self) -> None:
@@ -756,9 +759,11 @@ def video_audio_mux(
     """
     spu.ensure_parent_dir_exists(out_video_path)
 
-    with (av.open(str(vidpath_imagesource)) as video_src,
-          av.open(str(vidpath_audiosource)) as audio_src,
-          av.open(str(out_video_path), 'w') as output):
+    with (
+        av.open(str(vidpath_imagesource)) as video_src,
+        av.open(str(vidpath_audiosource)) as audio_src,
+        av.open(str(out_video_path), 'w') as output,
+    ):
         src_video = video_src.streams.video[0]
         if not audio_src.streams.audio:
             raise NoAudioStreamError(vidpath_audiosource)
@@ -826,12 +831,12 @@ def trim_video(
     end_pts = index.frame_pts[end_frame_idx]
     safe_seek_pts = index.safe_seek_pts[start_frame_idx]
 
-    with (av.open(str(input_path)) as input_container,
-          av.open(str(output_path), 'w') as output_container):
+    with (
+        av.open(str(input_path)) as input_container,
+        av.open(str(output_path), 'w') as output_container,
+    ):
         input_video = input_container.streams.video[0]
-        input_audio = (
-            input_container.streams.audio[0] if input_container.streams.audio else None
-        )
+        input_audio = input_container.streams.audio[0] if input_container.streams.audio else None
 
         # Set up output video stream
         codec_name = 'h264_nvenc' if gpu else 'libx264'

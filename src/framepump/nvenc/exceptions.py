@@ -63,19 +63,23 @@ def nvenc_status_message(status: int, context: str = '', detail: str | None = No
 
 class NvencError(Exception):
     """Base exception for NVENC errors."""
+
     pass
 
 
 class NvencNotAvailable(NvencError):
     """NVENC library could not be loaded."""
+
     pass
 
 
 class TextureFormatError(NvencError):
     """Texture format is not compatible with NVENC."""
+
     pass
 
 
 class EncoderNotInitialized(NvencError):
     """Encoder was not properly initialized."""
+
     pass

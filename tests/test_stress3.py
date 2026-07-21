@@ -237,6 +237,7 @@ class TestConstantFramerateValues:
 def _load_fate_categories():
     """Load fate file categories (verified with ffmpeg)."""
     import json
+
     categories_path = Path(__file__).parent / 'fate_categories.json'
     if not categories_path.exists():
         return None
@@ -255,7 +256,9 @@ def _collect_fate_files_by_category():
 
     has_video = [(FATE_DIR / p, 'has_video') for p in categories['has_video']]
     no_video = [(FATE_DIR / p, 'no_video') for p in categories['no_video']]
-    errors = [(FATE_DIR / p, 'error') for p in categories['decode_error'] + categories['not_recognized']]
+    errors = [
+        (FATE_DIR / p, 'error') for p in categories['decode_error'] + categories['not_recognized']
+    ]
 
     return has_video, no_video, errors
 
@@ -265,8 +268,9 @@ class TestFateHasVideo:
 
     _has_video, _, _ = _collect_fate_files_by_category()
 
-    @pytest.mark.parametrize('video_path', [p for p, _ in _has_video],
-                             ids=lambda p: str(p.relative_to(FATE_DIR)))
+    @pytest.mark.parametrize(
+        'video_path', [p for p, _ in _has_video], ids=lambda p: str(p.relative_to(FATE_DIR))
+    )
     def test_must_decode(self, video_path):
         """File must decode - ffmpeg verified it has video."""
         frames = VideoFrames(str(video_path))
@@ -282,8 +286,9 @@ class TestFateNoVideo:
 
     _, _no_video, _ = _collect_fate_files_by_category()
 
-    @pytest.mark.parametrize('video_path', [p for p, _ in _no_video],
-                             ids=lambda p: str(p.relative_to(FATE_DIR)))
+    @pytest.mark.parametrize(
+        'video_path', [p for p, _ in _no_video], ids=lambda p: str(p.relative_to(FATE_DIR))
+    )
     def test_must_raise_no_video(self, video_path):
         """File must raise 'No video stream' error."""
         with pytest.raises(ValueError, match='No video stream'):
@@ -295,8 +300,9 @@ class TestFateDecodeError:
 
     _, _, _errors = _collect_fate_files_by_category()
 
-    @pytest.mark.parametrize('video_path', [p for p, _ in _errors],
-                             ids=lambda p: str(p.relative_to(FATE_DIR)))
+    @pytest.mark.parametrize(
+        'video_path', [p for p, _ in _errors], ids=lambda p: str(p.relative_to(FATE_DIR))
+    )
     def test_must_error(self, video_path):
         """File must raise some error (ffmpeg also fails on these)."""
         with pytest.raises(Exception):
@@ -382,8 +388,6 @@ class TestNegativeIndexSlicing:
         frames = VideoFrames(sample_video)
         without_last_five = frames[:-5]
         assert len(without_last_five) == 15
-
-
 
 
 if __name__ == '__main__':

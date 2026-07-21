@@ -402,12 +402,12 @@ class TestSeekingEdgeCases:
         n = min(len(frames), 20)
 
         # Get frame 10 first
-        frame10_first = frames[min(10, n-1)].copy()
+        frame10_first = frames[min(10, n - 1)].copy()
 
         # Get other frames, then frame 10 again
-        _ = frames[min(5, n-1)]
-        _ = frames[min(15, n-1)]
-        frame10_second = frames[min(10, n-1)]
+        _ = frames[min(5, n - 1)]
+        _ = frames[min(15, n - 1)]
+        frame10_second = frames[min(10, n - 1)]
 
         np.testing.assert_array_equal(frame10_first, frame10_second)
 
@@ -586,16 +586,14 @@ class TestCorruptedInputs:
         with open(video_path, 'rb') as f:
             data = f.read()
         with open(truncated_path, 'wb') as f:
-            f.write(data[:len(data)//2])  # Write only half
+            f.write(data[: len(data) // 2])  # Write only half
 
         # Should either decode some frames or raise VideoDecodeError
         try:
             frames = VideoFrames(str(truncated_path))
             count = sum(1 for _ in frames)
             # Truncated at half → should get fewer frames than original
-            assert 0 < count < 30, (
-                f'Expected partial decode (1-29 frames), got {count}'
-            )
+            assert 0 < count < 30, f'Expected partial decode (1-29 frames), got {count}'
         except (VideoDecodeError, RuntimeError):
             pass  # Clean error on corrupt data is acceptable
 

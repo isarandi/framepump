@@ -556,3 +556,36 @@ class TestPixelRoundtrip:
         finally:
             if old_display is not None:
                 os.environ['DISPLAY'] = old_display
+
+
+class TestFloatInputFrames:
+    def test_float16_frames_produce_nonzero_video(self, tmp_path):
+        from framepump import VideoFrames
+
+        path = tmp_path / 'f16.mp4'
+        with VideoWriter(str(path), fps=10) as writer:
+            for _ in range(5):
+                writer.append_data(np.full((64, 64, 3), 0.5, np.float16))
+        frame = next(iter(VideoFrames(str(path))))
+        assert frame.mean() > 64  # 0.5 must land near mid-gray, not black
+
+    def test_float_to_uint16_dtype_equivalence(self):
+        from framepump.video_writing import _float_to_uint16
+
+        values = np.linspace(0.0, 1.0, 32, dtype=np.float64)
+        ref = _float_to_uint16(values.astype(np.float32))
+        for dtype in (np.float16, np.float64):
+            got = _float_to_uint16(values.astype(dtype))
+            assert np.all(np.isfinite(got.astype(np.float64)))
+            tol = 40 if dtype == np.float16 else 1  # float16 quantization of the input
+            assert np.abs(got.astype(np.int64) - ref.astype(np.int64)).max() <= tol
+
+
+class TestQueueSizeValidation:
+    def test_zero_queue_size_rejected(self):
+        with pytest.raises(ValueError, match='queue_size'):
+            VideoWriter(queue_size=0)
+
+    def test_negative_queue_size_rejected(self):
+        with pytest.raises(ValueError, match='queue_size'):
+            VideoWriter(queue_size=-1)

@@ -273,3 +273,62 @@ class TestExports:
 
         assert issubclass(IndexBuildError, FramePumpError)
         assert issubclass(FilterConfigError, FramePumpError)
+
+
+class TestFfmpegVsyncParity:
+    """Numeric CFR must place duplicated/dropped frames exactly like ffmpeg's
+    vsync (fps_mode cfr), not just produce the same frame count."""
+
+    @staticmethod
+    def _ffmpeg_cfr(src, rate, out):
+        if shutil.which('ffmpeg') is None:
+            pytest.skip('ffmpeg CLI not available')
+        subprocess.run(
+            [
+                'ffmpeg',
+                '-y',
+                '-v',
+                'error',
+                '-i',
+                str(src),
+                '-fps_mode',
+                'cfr',
+                '-r',
+                str(rate),
+                '-c:v',
+                'libx264',
+                '-crf',
+                '0',
+                '-pix_fmt',
+                'yuv420p',
+                str(out),
+            ],
+            check=True,
+        )
+
+    @staticmethod
+    def _source_map(frames, sources):
+        stacked = np.stack(sources).astype(np.int16)
+        return [
+            int(np.abs(stacked - frame.astype(np.int16)).mean(axis=(1, 2, 3)).argmin())
+            for frame in frames
+        ]
+
+    @pytest.mark.parametrize(
+        'name, rate',
+        [
+            ('exact_30fps.mp4', 45.0),
+            ('exact_30fps.mp4', 60.0),
+            ('exact_30fps.mp4', 20.0),
+            ('ntsc_film.mp4', 30.0),
+        ],
+    )
+    def test_duplicate_placement_matches_ffmpeg(self, name, rate, tmp_path):
+        src = DATA_DIR / name
+        golden = tmp_path / 'golden.mp4'
+        self._ffmpeg_cfr(src, rate, golden)
+
+        sources = [f.copy() for f in VideoFrames(str(src))]
+        ours = self._source_map(VideoFrames(str(src), constant_framerate=rate), sources)
+        ffmpegs = self._source_map(VideoFrames(str(golden)), sources)
+        assert ours == ffmpegs

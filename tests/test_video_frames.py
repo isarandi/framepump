@@ -223,3 +223,69 @@ class TestVideoFramesDtype:
 
         with pytest.raises(ValueError):
             VideoFrames(video_path, dtype=np.int32)
+
+
+class TestSeekableParameter:
+    def test_seekable_false_indexing_matches_default(self, sample_video):
+        video_path, _, n_frames, _ = sample_video
+        ref = VideoFrames(video_path)
+        vf = VideoFrames(video_path, seekable=False)
+        assert len(vf) == n_frames
+        assert np.array_equal(vf[10], ref[10])
+        assert np.array_equal(vf[-1], ref[-1])
+
+    def test_seekable_false_positive_start_slice(self, sample_video):
+        video_path, _, _, _ = sample_video
+        ref = list(VideoFrames(video_path))
+        sliced = list(VideoFrames(video_path, seekable=False)[5:8])
+        assert len(sliced) == 3
+        for a, b in zip(sliced, ref[5:8]):
+            assert np.array_equal(a, b)
+
+
+class TestTimestamplessStreams:
+    """Raw H.264 elementary streams have no timestamps; indexed and windowed
+    access must fall back to frame counting instead of yielding nothing."""
+
+    @pytest.fixture
+    def raw_h264(self):
+        import pathlib
+
+        return str(pathlib.Path(__file__).parent / 'data' / 'raw25.h264')
+
+    def test_positive_start_slice_yields_frames(self, raw_h264):
+        vf = VideoFrames(raw_h264)
+        full = list(vf)
+        assert len(full) == len(vf)
+        sliced = list(vf[5:10])
+        assert len(sliced) == 5
+        for a, b in zip(sliced, full[5:10]):
+            assert np.array_equal(a, b)
+
+    def test_positive_start_slice_cfr(self, raw_h264):
+        vf = VideoFrames(raw_h264, constant_framerate=True)
+        full = list(vf)
+        sliced = list(vf[5:10])
+        assert len(sliced) == 5
+        for a, b in zip(sliced, full[5:10]):
+            assert np.array_equal(a, b)
+
+    def test_integer_indexing(self, raw_h264):
+        vf = VideoFrames(raw_h264)
+        full = list(vf)
+        assert np.array_equal(vf[7], full[7])
+
+
+class TestDtypeSpellings:
+    """Any DTypeLike spelling of a supported dtype must be accepted."""
+
+    @pytest.mark.parametrize('spelling', ['float32', float, np.dtype(np.float32)])
+    def test_dtype_like_spellings(self, sample_video, spelling):
+        video_path, _, _, _ = sample_video
+        frames = VideoFrames(video_path, dtype=spelling)
+        assert frames[0].dtype in (np.float32, np.float64)
+
+    def test_unsupported_dtype_message_is_clean(self, sample_video):
+        video_path, _, _, _ = sample_video
+        with pytest.raises(ValueError, match='Unsupported dtype'):
+            VideoFrames(video_path, dtype='int32')

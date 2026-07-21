@@ -389,3 +389,115 @@ class TestZeroFrames:
             writer.start_sequence(str(out), fps=30)
             writer.end_sequence()
         assert list(tmp_path.iterdir()) == []
+
+
+class TestMuxerAudioValidation:
+    def test_audio_source_without_audio_stream_raises(self, tmp_path):
+        from framepump import NoAudioStreamError, VideoWriter
+        from framepump._h264_mux import H264PassthroughMuxer
+
+        silent = tmp_path / 'silent.mp4'
+        with VideoWriter(str(silent), fps=30) as writer:
+            for _ in range(3):
+                writer.append_data(np.zeros((64, 64, 3), np.uint8))
+
+        out = tmp_path / 'out.mp4'
+        with pytest.raises(NoAudioStreamError):
+            H264PassthroughMuxer(
+                str(out),
+                fps=Fraction(30),
+                width=64,
+                height=64,
+                bframes=0,
+                audio_source_path=str(silent),
+            )
+        assert not out.exists()
+        assert not list(tmp_path.glob('*.tmp_*'))
+
+
+class TestTrimVideo:
+    @staticmethod
+    def _make_video(tmp_path, n_frames=24, fps=12):
+        from framepump import VideoWriter
+
+        path = tmp_path / 'src.mp4'
+        with VideoWriter(str(path), fps=fps) as writer:
+            for i in range(n_frames):
+                writer.append_data(np.full((64, 64, 3), (i * 9) % 255, np.uint8))
+        return str(path), n_frames, fps
+
+    def test_trim_to_full_duration_keeps_last_frame(self, tmp_path):
+        from framepump import get_duration, num_frames, trim_video
+
+        src, n_frames, _ = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+        trim_video(src, str(out), 0.0, get_duration(src), gpu=False)
+        assert num_frames(str(out), exact=True) == n_frames
+
+    def test_trim_past_duration_keeps_last_frame(self, tmp_path):
+        from framepump import num_frames, trim_video
+
+        src, n_frames, _ = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+        trim_video(src, str(out), 0.0, 1e9, gpu=False)
+        assert num_frames(str(out), exact=True) == n_frames
+
+    def test_trim_mid_range_frame_count(self, tmp_path):
+        from framepump import num_frames, trim_video
+
+        src, _, fps = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+        trim_video(src, str(out), 0.5, 1.5, gpu=False)  # 1 second at 12 fps
+        assert num_frames(str(out), exact=True) == fps
+
+    def test_trim_error_leaves_no_output_file(self, tmp_path, monkeypatch):
+        from framepump import trim_video
+        from framepump import video_writing as vw
+
+        src, _, _ = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('simulated failure')
+
+        monkeypatch.setattr(vw, '_trim_video_to_path', boom)
+        with pytest.raises(RuntimeError, match='simulated failure'):
+            trim_video(src, str(out), 0.0, 1.0)
+        assert not out.exists()
+        assert not list(tmp_path.glob('*.tmp_*'))
+
+
+class TestVideoAudioMuxErrors:
+    def test_mux_error_leaves_no_output_file(self, tmp_path):
+        from framepump import NoAudioStreamError, VideoWriter, video_audio_mux
+
+        silent = tmp_path / 'silent.mp4'
+        with VideoWriter(str(silent), fps=30) as writer:
+            for _ in range(3):
+                writer.append_data(np.zeros((64, 64, 3), np.uint8))
+
+        out = tmp_path / 'muxed.mp4'
+        with pytest.raises(NoAudioStreamError):
+            video_audio_mux(str(silent), str(silent), str(out))
+        assert not out.exists()
+        assert not list(tmp_path.glob('*.tmp_*'))
+
+
+class TestTrimVideoNvencMinimum:
+    """NVENC rejects frames below ~145x49; auto-detection must not pick it
+    for small videos, and an explicit gpu=True must fail with a clear error."""
+
+    def test_small_video_auto_gpu_falls_back_to_cpu(self, tmp_path):
+        from framepump import num_frames, trim_video
+
+        src, n_frames, _ = TestTrimVideo._make_video(tmp_path)  # 64x64
+        out = tmp_path / 'trimmed.mp4'
+        trim_video(src, str(out), 0.0, 1.0)  # gpu=None auto-detect
+        assert num_frames(str(out), exact=True) > 0
+
+    def test_small_video_explicit_gpu_raises_clear_error(self, tmp_path):
+        from framepump import trim_video
+
+        src, _, _ = TestTrimVideo._make_video(tmp_path)
+        with pytest.raises(ValueError, match='NVENC.*minimum'):
+            trim_video(src, str(tmp_path / 'x.mp4'), 0.0, 1.0, gpu=True)

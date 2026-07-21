@@ -66,7 +66,12 @@ You can index into the video like a list:
     middle = frames[len(frames) // 2]
 
 Random access works correctly even for videos with B-frames. FramePump seeks
-to the nearest safe point and decodes forward to the target frame.
+to the nearest safe point and decodes forward to the target frame. For codecs
+whose containers are known to misreport keyframes (screen codecs, open-GOP
+MPEG-1/2, packed-B MPEG-4), FramePump verifies at open time that seeking
+reproduces sequential decoding, and transparently falls back to slower
+decode-from-start access when it does not — indexing always returns the same
+pixels that iteration would.
 
 
 Slicing

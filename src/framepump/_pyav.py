@@ -97,6 +97,27 @@ class NoAudioStreamError(FramePumpError):
         super().__init__(f'No audio stream found in {name}')
 
 
+class NoVideoStreamError(FramePumpError):
+    """Raised when a file contains no video stream (e.g. audio-only files)."""
+
+    def __init__(self, path):
+        self.path = Path(path) if isinstance(path, (str, Path)) else path
+        name = self.path.name if isinstance(self.path, Path) else '<file-like>'
+        super().__init__(f'No video stream found in {name}')
+
+
+class UnsupportedCodecError(FramePumpError):
+    """Raised when this FFmpeg build has no decoder for the video stream."""
+
+    def __init__(self, path):
+        self.path = Path(path) if isinstance(path, (str, Path)) else path
+        name = self.path.name if isinstance(self.path, Path) else '<file-like>'
+        super().__init__(
+            f'No decoder available for the video stream in {name} '
+            f'(codec not supported by this FFmpeg build)'
+        )
+
+
 class FilterConfigError(FramePumpError):
     """Raised when filter graph configuration fails."""
 
@@ -163,15 +184,28 @@ class PyAVReader:
         self._gpu = gpu
 
         if not self._container.streams.video:
-            raise ValueError(
-                f'No video stream found in {source if not self._is_fileobj else "<file-like>"}'
-            )
+            raise NoVideoStreamError(source)
         self._stream = self._container.streams.video[0]
+
+        # codec_context is None when this FFmpeg build has no decoder for the
+        # stream's codec (e.g. JPEG-XL, VVC on older builds)
+        if self._stream.codec_context is None:
+            raise UnsupportedCodecError(source)
+
+        if not self._stream.width or not self._stream.height:
+            # e.g. animated WebP on FFmpeg builds without an anim decoder:
+            # the stream probes as 0x0 and decoding fails with cryptic errors
+            raise VideoDecodeError(
+                source,
+                0,
+                RuntimeError('Video stream has no valid dimensions (unsupported format?)'),
+            )
 
         # Enable multi-threaded decoding (~5x speedup).
         # Some formats/codecs don't support threading safely.
         _THREADING_UNSAFE_CODECS = {'vp4'}
         codec_name = self._stream.codec_context.codec.name
+        self.codec_name = codec_name
         self._use_threading = (
             self._container.format.name not in ('pmp',)
             and codec_name not in _THREADING_UNSAFE_CODECS
@@ -220,7 +254,9 @@ class PyAVReader:
             raise VideoDecodeError(path, 0, e) from e
         try:
             if not probe.streams.video:
-                raise ValueError(f'No video stream found in {path}')
+                raise NoVideoStreamError(path)
+            if probe.streams.video[0].codec_context is None:
+                raise UnsupportedCodecError(path)
             fmt = probe.format.name
             codec = probe.streams.video[0].codec_context.codec.name
 
@@ -455,6 +491,33 @@ class PyAVReader:
                 )
         self.seek(time_seconds)
 
+    def decode_raw(self) -> Generator[av.VideoFrame, None, None]:
+        """Decode raw frames from current position, mapping decoder errors.
+
+        ``InvalidDataError`` becomes ``VideoDecodeError``; I/O errors at end of
+        stream (errno 5) are treated as EOF (malformed EOF markers in some
+        containers).
+        """
+        count = 0
+        try:
+            for frame in self._container.decode(self._stream):
+                yield frame
+                count += 1
+        except av.error.EOFError:
+            # AVERROR_EOF surfacing as an exception: treat as end of stream
+            return
+        except av.FFmpegError as e:
+            # Treat I/O errors as end of stream (malformed EOF in some containers)
+            if getattr(e, 'errno', None) == 5:
+                return
+            # Wrap every FFmpeg-level failure (invalid data, unknown decoder
+            # errors, unimplemented features, DRM permission errors, ...) so
+            # callers see a FramePumpError instead of raw av internals
+            raise VideoDecodeError(self.path, count, e) from e
+        except OSError as e:
+            if e.errno != 5:
+                raise
+
     def decode_frames(
         self,
         max_frames: int | None = None,
@@ -484,26 +547,19 @@ class PyAVReader:
         graph = self._build_filter_graph(output_shape, target_format)
 
         count = 0
-        try:
-            for frame in self._container.decode(self._stream):
-                # Push frame through filter graph
-                graph.push(frame)
-                filtered_frame = graph.pull()
+        for frame in self.decode_raw():
+            # Push frame through filter graph
+            graph.push(frame)
+            filtered_frame = graph.pull()
 
-                # Convert to numpy
-                arr = filtered_frame.to_ndarray()
+            # Convert to numpy
+            arr = filtered_frame.to_ndarray()
 
-                yield arr
+            yield arr
 
-                count += 1
-                if max_frames is not None and count >= max_frames:
-                    break
-        except av.error.InvalidDataError as e:
-            raise VideoDecodeError(self.path, count, e) from e
-        except OSError as e:
-            # Treat I/O errors as end of stream (malformed EOF in some containers)
-            if e.errno != 5:
-                raise
+            count += 1
+            if max_frames is not None and count >= max_frames:
+                break
 
     def _build_filter_graph(
         self, output_shape: tuple[int, int] | None, target_format: str
@@ -849,7 +905,8 @@ class FrameIndexPyAV:
         return self.frame_pts[frame_idx]
 
     def __repr__(self) -> str:
-        return f'FrameIndexPyAV({self.video_path.name!r}, frames={self.frame_count})'
+        name = self.video_path.name if isinstance(self.video_path, Path) else '<file-like>'
+        return f'FrameIndexPyAV({name!r}, frames={self.frame_count})'
 
 
 class IndexBuildError(FramePumpError):

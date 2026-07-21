@@ -1,0 +1,106 @@
+"""Behavior on damaged, exotic and misindexed real-world streams.
+
+Fixtures:
+- ``unreliable_seek.ts``: MPEG-2 in MPEG-TS where the packet index counts
+  frames the decoder never produces and keyframe-based access returns wrong
+  pixels; FramePump must detect this at open time and fall back to
+  sequential-only access with a decoder-accurate index.
+- ``no_decodable_frames.mov``: SVQ3 file whose single indexed frame cannot be
+  decoded; iteration must raise instead of silently yielding nothing.
+"""
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from framepump import (
+    FramePumpError,
+    NoVideoStreamError,
+    UnsupportedCodecError,
+    VideoDecodeError,
+    VideoFrames,
+)
+
+DATA_DIR = Path(__file__).parent / 'data'
+
+
+def _ffmpeg_or_skip():
+    if shutil.which('ffmpeg') is None:
+        pytest.skip('ffmpeg CLI not available')
+
+
+def _make(tmp_path, name, *args):
+    _ffmpeg_or_skip()
+    out = tmp_path / name
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', *args, str(out)], check=True)
+    return str(out)
+
+
+class TestUnreliableSeekFallback:
+    def test_len_matches_iteration(self):
+        vf = VideoFrames(str(DATA_DIR / 'unreliable_seek.ts'))
+        assert len(vf) == sum(1 for _ in vf)
+
+    def test_indexing_matches_iteration(self):
+        vf = VideoFrames(str(DATA_DIR / 'unreliable_seek.ts'))
+        seq = list(vf)
+        for i in (0, 1, 2, len(seq) // 2, len(seq) - 1):
+            assert np.array_equal(vf[i], seq[i]), f'frame {i}'
+        assert np.array_equal(vf[-1], seq[-1])
+
+    def test_slicing_matches_iteration(self):
+        vf = VideoFrames(str(DATA_DIR / 'unreliable_seek.ts'))
+        seq = list(vf)
+        for a, b in zip(vf[1:4], seq[1:4]):
+            assert np.array_equal(a, b)
+        for a, b in zip(vf[::2], seq[::2]):
+            assert np.array_equal(a, b)
+
+
+class TestSeekVerificationKeepsGoodFiles:
+    """Suspect codecs that pass the open-time probe must keep fast seeking."""
+
+    @pytest.mark.parametrize(
+        'name, codec_args',
+        [
+            ('good_mpeg2.mp4', ['-c:v', 'mpeg2video', '-g', '12']),
+            ('good_mpeg4.mp4', ['-c:v', 'mpeg4', '-g', '12']),
+        ],
+    )
+    def test_seek_kept_and_correct(self, tmp_path, name, codec_args):
+        path = _make(
+            tmp_path,
+            name,
+            '-f',
+            'lavfi',
+            '-i',
+            'testsrc=duration=2:size=128x96:rate=25',
+            *codec_args,
+        )
+        vf = VideoFrames(path)
+        assert vf._seekable, 'probe must not disable seeking for a consistent file'
+        seq = list(vf)
+        for i in (1, 10, len(seq) - 1):
+            assert np.array_equal(vf[i], seq[i]), f'frame {i}'
+
+
+class TestNoDecodableFrames:
+    def test_iteration_raises_instead_of_silent_empty(self):
+        vf = VideoFrames(str(DATA_DIR / 'no_decodable_frames.mov'))
+        assert len(vf) > 0
+        with pytest.raises(VideoDecodeError, match='no frames'):
+            list(vf)
+
+
+class TestStreamErrors:
+    def test_audio_only_raises_catchable_error(self, tmp_path):
+        path = _make(
+            tmp_path, 'audio_only.mp4', '-f', 'lavfi', '-i', 'sine=duration=1', '-c:a', 'aac'
+        )
+        with pytest.raises(NoVideoStreamError):
+            VideoFrames(path)
+        assert issubclass(NoVideoStreamError, FramePumpError)
+        assert issubclass(UnsupportedCodecError, FramePumpError)

@@ -49,10 +49,11 @@ class AbstractVideoWriter(ABC, Generic[T]):
     @abstractmethod
     def start_sequence(
         self,
-        video_path: VideoOutput,
-        fps: float,
+        video_output: VideoOutput,
+        fps: float | Fraction | None = None,
         audio_source_path: PathLike | None = None,
         gpu: bool | int = False,
+        encoder_config: EncoderConfig | None = None,
         format: str | None = None,
     ) -> None:
         """Start a new video sequence.
@@ -144,9 +145,14 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
 
         See class docstring for full parameter descriptions.
         """
+        if queue_size < 1:
+            raise ValueError(f'queue_size must be >= 1, got {queue_size}')
         self._queue: queue.Queue[Message] = queue.Queue(queue_size)
         self._feedback_queue: queue.Queue[FeedbackMessage] = queue.Queue()
         self._thread: threading.Thread | None = None
+        # Kept even after close() nulls _thread, so a restart can never race
+        # a previous worker that is still consuming the queue.
+        self._last_thread: threading.Thread | None = None
         self._accepts_new_frames: bool = False
         self._state: _WriterState = _WriterState.IDLE
         self._state_lock = threading.Lock()
@@ -279,10 +285,17 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         try:
             thread = self._thread
             if thread is not None and thread.is_alive() and self._state is _WriterState.RUNNING:
-                self._put_checked(Quit())
-                # Timeout proportional to queue size (assume ~0.5s per frame for encoding)
-                timeout = max(10.0, self._queue.maxsize * 2.0)
-                thread.join(timeout=timeout)
+                try:
+                    self._put_checked(Quit())
+                    # Timeout proportional to queue size (assume ~0.5s per frame for encoding)
+                    timeout = max(10.0, self._queue.maxsize * 2.0)
+                    thread.join(timeout=timeout)
+                except BaseException:
+                    # KeyboardInterrupt during the drain: make the worker stop
+                    # so it cannot keep consuming the queue after _thread is
+                    # nulled (and race a restarted worker).
+                    self._shutdown_event.set()
+                    raise
                 if thread.is_alive():
                     warnings.warn(
                         f'VideoWriter did not finish within {timeout:.0f}s timeout, '
@@ -297,6 +310,10 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                         raise RuntimeError('VideoWriter thread did not exit in time')
             elif thread is not None:
                 thread.join(timeout=3.0)
+                if self._state is _WriterState.RUNNING:
+                    # Worker died without going through its error handler
+                    # (e.g. killed by a non-Exception BaseException)
+                    self._note_worker_failure(None, None)
         finally:
             self._thread = None
             self._accepts_new_frames = False
@@ -428,9 +445,9 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
             and self._thread.is_alive()
         ):
             return
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
+        if self._last_thread is not None:
+            self._last_thread.join(timeout=5.0)
+            if self._last_thread.is_alive():
                 raise RuntimeError('VideoWriter worker thread is stuck; cannot restart')
         self._shutdown_event.clear()
         self._drain_queue(self._queue)
@@ -441,6 +458,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
             self._error_reported = False
             self._state = _WriterState.RUNNING
         self._thread = threading.Thread(target=self._main_video_writer, daemon=True)
+        self._last_thread = self._thread
         self._thread.start()
 
     def _main_video_writer(self) -> None:
@@ -713,9 +731,11 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
                     audio_pkt.stream = self._audio_stream
                     self._output_container.mux(audio_pkt)
             finally:
-                self._output_container.close()
-                if self._audio_input_container is not None:
-                    self._audio_input_container.close()
+                try:
+                    self._output_container.close()
+                finally:
+                    if self._audio_input_container is not None:
+                        self._audio_input_container.close()
         except BaseException:
             if self._temp_file is not None:
                 self._temp_file.cleanup()
@@ -725,18 +745,26 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             self._temp_file.finalize()
 
     def _abort(self) -> None:
-        """Abort write - close resources without flushing, delete temp file."""
+        """Abort write - close resources without flushing, delete temp file.
+
+        Closing the output container writes a trailer and can itself raise
+        (e.g. the very disk-full error that triggered the abort); the temp
+        file must be deleted regardless.
+        """
         if self._closed:
             return
         self._closed = True
 
-        if self._output_container is not None:
-            self._output_container.close()
-        if self._audio_input_container is not None:
-            self._audio_input_container.close()
-
-        if self._temp_file is not None:
-            self._temp_file.cleanup()
+        try:
+            try:
+                if self._output_container is not None:
+                    self._output_container.close()
+            finally:
+                if self._audio_input_container is not None:
+                    self._audio_input_container.close()
+        finally:
+            if self._temp_file is not None:
+                self._temp_file.cleanup()
 
     def __exit__(self, exc_type: type[BaseException] | None, *args: Any) -> None:
         if exc_type is None:
@@ -759,10 +787,29 @@ def video_audio_mux(
     """
     spu.ensure_parent_dir_exists(out_video_path)
 
+    # Write through a temp file so an error leaves nothing at the final path
+    temp_file = TempFile(out_video_path)
+    out_format = Path(out_video_path).suffix.lstrip('.')
+    try:
+        _video_audio_mux_to_path(
+            vidpath_audiosource, vidpath_imagesource, temp_file.temp_path, out_format
+        )
+    except BaseException:
+        temp_file.cleanup()
+        raise
+    temp_file.finalize()
+
+
+def _video_audio_mux_to_path(
+    vidpath_audiosource: PathLike,
+    vidpath_imagesource: PathLike,
+    out_video_path: PathLike,
+    out_format: str,
+) -> None:
     with (
         av.open(str(vidpath_imagesource)) as video_src,
         av.open(str(vidpath_audiosource)) as audio_src,
-        av.open(str(out_video_path), 'w') as output,
+        av.open(str(out_video_path), 'w', format=out_format) as output,
     ):
         src_video = video_src.streams.video[0]
         if not audio_src.streams.audio:
@@ -816,24 +863,59 @@ def trim_video(
     """
     start_time = _parse_time(start_time)
     end_time = _parse_time(end_time)
-    if gpu is None:
-        gpu = _nvenc_available()
 
     spu.ensure_parent_dir_exists(output_path)
 
     # Build frame index for accurate seeking
     with PyAVReader(input_path) as reader:
         index = FrameIndexPyAV(input_path, reader)
+        width, height = reader.resolution
 
-    start_frame_idx = _find_frame_at_time(index, start_time)
+    # Output dimensions after the even-dimension rounding applied below
+    out_w = width + (width % 2)
+    out_h = height + (height % 2)
+    if gpu is None:
+        # NVENC cannot encode below its hardware minimum; auto-detect must not
+        # pick an encoder that will reject the video at the first frame.
+        gpu = _nvenc_available() and out_w >= _NVENC_MIN_W and out_h >= _NVENC_MIN_H
+    elif gpu and (out_w < _NVENC_MIN_W or out_h < _NVENC_MIN_H):
+        raise ValueError(
+            f'NVENC cannot encode {width}x{height} video: the hardware minimum '
+            f'is {_NVENC_MIN_W}x{_NVENC_MIN_H}. Use gpu=False.'
+        )
+
+    start_frame_idx = min(_find_frame_at_time(index, start_time), index.frame_count - 1)
     end_frame_idx = _find_frame_at_time(index, end_time)
     target_pts = index.frame_pts[start_frame_idx]
-    end_pts = index.frame_pts[end_frame_idx]
+    # None means "no end bound": the requested end is at/past the last frame
+    end_pts = index.frame_pts[end_frame_idx] if end_frame_idx < index.frame_count else None
     safe_seek_pts = index.safe_seek_pts[start_frame_idx]
 
+    # Write through a temp file so an error leaves nothing at the final path
+    temp_file = TempFile(output_path)
+    out_format = Path(output_path).suffix.lstrip('.')
+    try:
+        _trim_video_to_path(
+            input_path, temp_file.temp_path, out_format, gpu, target_pts, end_pts, safe_seek_pts
+        )
+    except BaseException:
+        temp_file.cleanup()
+        raise
+    temp_file.finalize()
+
+
+def _trim_video_to_path(
+    input_path: PathLike,
+    output_path: PathLike,
+    out_format: str,
+    gpu: bool | int,
+    target_pts: Fraction,
+    end_pts: Fraction | None,
+    safe_seek_pts: Fraction,
+) -> None:
     with (
         av.open(str(input_path)) as input_container,
-        av.open(str(output_path), 'w') as output_container,
+        av.open(str(output_path), 'w', format=out_format) as output_container,
     ):
         input_video = input_container.streams.video[0]
         input_audio = input_container.streams.audio[0] if input_container.streams.audio else None
@@ -888,7 +970,7 @@ def trim_video(
             frame_pts = frame.pts * input_video.time_base
             if frame_pts < target_pts:
                 continue
-            if frame_pts >= end_pts:
+            if end_pts is not None and frame_pts >= end_pts:
                 break
 
             graph.push(frame)
@@ -906,12 +988,15 @@ def trim_video(
 
             input_container.seek(audio_offset, stream=input_audio)
             for packet in input_container.demux(input_audio):
-                if packet.dts is None:
+                # The seek lands at/before the offset: skip packets from before
+                # the start point (and packets without timestamps)
+                if packet.pts is None or packet.pts < audio_offset:
                     continue
-                if float(packet.pts * audio_time_base) >= float(end_pts):
+                if end_pts is not None and float(packet.pts * audio_time_base) >= float(end_pts):
                     break
                 packet.pts -= audio_offset
-                packet.dts -= audio_offset
+                if packet.dts is not None:
+                    packet.dts -= audio_offset
                 packet.stream = audio_stream
                 output_container.mux(packet)
 
@@ -932,15 +1017,22 @@ def _parse_time(value: float | str) -> float:
 
 
 def _find_frame_at_time(index: FrameIndexPyAV, time_seconds: float) -> int:
-    """Find frame index closest to given time."""
-    from fractions import Fraction
+    """Find the index of the first frame at or after the given time.
 
+    Returns ``index.frame_count`` when the time is past the last frame, so a
+    trim end at or beyond the video duration includes the final frame instead
+    of clamping to (and then excluding) it.
+    """
     target = Fraction(time_seconds).limit_denominator(1000000)
-    # Binary search for the frame
     for i, pts in enumerate(index.frame_pts):
         if pts >= target:
             return i
-    return index.frame_count - 1
+    return index.frame_count
+
+
+# NVENC hardware minimum encode dimensions (H.264), verified empirically
+_NVENC_MIN_W = 145
+_NVENC_MIN_H = 49
 
 
 def _nvenc_available() -> bool:
@@ -956,7 +1048,10 @@ def _nvenc_available() -> bool:
 
 def _float_to_uint16(frame: NDArray) -> NDArray:
     """Convert float frame [0,1] to uint16 [0,65535] for high precision encoding."""
-    return np.clip(frame * 65535, 0, 65535).astype(np.uint16)
+    # Scale in float32: under NEP 50 promotion (numpy >= 2), float16 * 65535
+    # stays float16 and overflows to inf, which the uint16 cast maps to 0.
+    scaled = frame.astype(np.float32, copy=False) * np.float32(65535)
+    return np.clip(scaled, 0, 65535).astype(np.uint16)
 
 
 @dataclass

@@ -18,6 +18,8 @@ from ._pyav import (
     FramePumpError,
     IndexBuildError,
     NoAudioStreamError,
+    NoVideoStreamError,
+    UnsupportedCodecError,
     VideoDecodeError,
     VideoEncodeError,
 )
@@ -26,20 +28,38 @@ from .encoder_config import EncoderConfig
 from .video_writing import AbstractVideoWriter, VideoWriter, trim_video, video_audio_mux
 from .video_writing_gl import GLVideoWriter
 
+
+def _make_cuda_stub(class_name: str, requirements: str) -> type:
+    """Placeholder for a CUDA-only class on machines without the CUDA stack.
+
+    Instantiating it raises a helpful ImportError instead of the bare
+    "'NoneType' object is not callable" a None placeholder would give.
+    """
+
+    def __init__(self, *args, **kwargs):
+        raise ImportError(
+            f'{class_name} requires {requirements}. ' f'Install the CUDA dependencies to use it.'
+        )
+
+    return type(class_name, (), {'__init__': __init__, '__doc__': f'{class_name} (unavailable)'})
+
+
 try:
     from .cuda_video_writer import JpegVideoWriterCUDA
 except ImportError:
-    JpegVideoWriterCUDA = None
+    JpegVideoWriterCUDA = _make_cuda_stub(
+        'JpegVideoWriterCUDA', 'cuda-python and the nvJPEG/NVENC libraries (CUDA toolkit)'
+    )
 
 try:
     from ._cuda_frames import VideoFramesCuda
 except ImportError:
-    VideoFramesCuda = None
+    VideoFramesCuda = _make_cuda_stub('VideoFramesCuda', 'cuda-python and PyNvVideoCodec')
 
 try:
     from ._cuda_gl import CudaToGLUploader
 except ImportError:
-    CudaToGLUploader = None
+    CudaToGLUploader = _make_cuda_stub('CudaToGLUploader', 'cuda-python')
 
 try:
     from ._version import __version__
@@ -52,6 +72,8 @@ __all__ = [
     'VideoDecodeError',
     'VideoEncodeError',
     'NoAudioStreamError',
+    'NoVideoStreamError',
+    'UnsupportedCodecError',
     'IndexBuildError',
     'FilterConfigError',
     'AbstractVideoWriter',

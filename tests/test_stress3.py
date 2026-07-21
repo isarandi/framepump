@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from framepump import VideoFrames, VideoWriter, num_frames, get_fps
+from framepump import (
+    NoVideoStreamError,
+    VideoDecodeError,
+    VideoFrames,
+    VideoWriter,
+    get_fps,
+    num_frames,
+)
 
 DATA_DIR = Path(__file__).parent.parent / 'data'
 FATE_DIR = Path(__file__).parent.parent / 'fate'
@@ -268,17 +275,33 @@ class TestFateHasVideo:
 
     _has_video, _, _ = _collect_fate_files_by_category()
 
+    # ffmpeg CLI decodes these, but the system libavcodec via PyAV produces
+    # zero frames; framepump must raise rather than silently yield nothing.
+    _PYAV_UNDECODABLE = {
+        'h264/H264_might_overflow.mkv',
+        'svq3/svq3_decoding_regression.mov',
+    }
+
     @pytest.mark.parametrize(
         'video_path', [p for p, _ in _has_video], ids=lambda p: str(p.relative_to(FATE_DIR))
     )
     def test_must_decode(self, video_path):
         """File must decode - ffmpeg verified it has video."""
+        if str(video_path.relative_to(FATE_DIR)) in self._PYAV_UNDECODABLE:
+            frames = VideoFrames(str(video_path))
+            with pytest.raises(VideoDecodeError, match='no frames'):
+                list(frames)
+            return
+
         frames = VideoFrames(str(video_path))
         _ = len(frames)
         _ = frames.fps
+        decoded_any = False
         for f in frames:
             assert f.ndim == 3
+            decoded_any = True
             break
+        assert decoded_any, 'decoder produced no frames'
 
 
 class TestFateNoVideo:
@@ -290,8 +313,8 @@ class TestFateNoVideo:
         'video_path', [p for p, _ in _no_video], ids=lambda p: str(p.relative_to(FATE_DIR))
     )
     def test_must_raise_no_video(self, video_path):
-        """File must raise 'No video stream' error."""
-        with pytest.raises(ValueError, match='No video stream'):
+        """File must raise NoVideoStreamError."""
+        with pytest.raises(NoVideoStreamError):
             VideoFrames(str(video_path))
 
 

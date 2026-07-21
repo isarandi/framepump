@@ -14,7 +14,7 @@ import numpy as np
 import simplepyutils as spu
 from numpy.typing import DTypeLike, NDArray
 
-from ._pyav import FrameIndexPyAV, PyAVReader, VideoDecodeError
+from ._pyav import FrameIndexPyAV, FramePumpError, PyAVReader, VideoDecodeError
 
 PathLike = Union[str, Path]
 
@@ -26,6 +26,13 @@ __all__ = [
     'video_extents',
     'has_audio',
 ]
+
+
+# Codecs whose containers are known to mark non-decodable packets as keyframes
+# (screen codecs) or whose GOP structure defeats keyframe seeking (open-GOP
+# MPEG-1/2, packed-B MPEG-4). Seeking is content-verified for these at
+# construction and disabled when it does not reproduce sequential decode.
+_SEEK_UNRELIABLE_CODECS = frozenset({'mpeg1video', 'mpeg2video', 'mpeg4', 'fic', 'vmnc'})
 
 
 class VideoFrames:
@@ -51,6 +58,7 @@ class VideoFrames:
     def __init__(
         self,
         video_path,
+        *,
         dtype: DTypeLike = np.uint8,
         gpu: bool | int = False,
         constant_framerate: Union[bool, float] = False,
@@ -71,43 +79,73 @@ class VideoFrames:
 
         See class docstring for full parameter descriptions.
         """
+        try:
+            dtype = np.dtype(dtype).type
+        except TypeError as e:
+            raise ValueError(f'Unsupported dtype: {dtype!r}') from e
+        if dtype not in (np.uint8, np.uint16, np.float16, np.float32, np.float64):
+            raise ValueError(f'Unsupported dtype: {np.dtype(dtype).name}')
+
         self._is_fileobj = hasattr(video_path, 'read')
         self.path = video_path
 
         # Create persistent PyAV reader for metadata and decoding
         self._reader = PyAVReader(video_path, gpu=gpu)
+        try:
+            # Get metadata from reader (no subprocess calls)
+            width, height = self._reader.resolution
+            self.original_imshape: tuple[int, int] = (height, width)
+            self.original_fps = self._reader.fps
+            self.resized_imshape: tuple[int, int] | None = None
+            self.repeat_count = 1
 
-        # Get metadata from reader (no subprocess calls)
-        width, height = self._reader.resolution
-        self.original_imshape: tuple[int, int] = (height, width)
-        self.original_fps = self._reader.fps
-        self.resized_imshape: tuple[int, int] | None = None
-        self.repeat_count = 1
+            self.dtype = dtype
+            self.gpu = gpu
 
-        if dtype not in (np.uint8, np.uint16, np.float16, np.float32, np.float64):
-            raise ValueError(f'Unsupported dtype: {dtype}')
+            # Parse constant_framerate: False, True, or a number (target fps)
+            if isinstance(constant_framerate, bool):
+                self.constant_framerate = constant_framerate
+                self.target_fps = self.original_fps
+            else:
+                self.constant_framerate = True
+                self.target_fps = float(constant_framerate)
 
-        self.dtype = dtype
-        self.gpu = gpu
+            # Apply the caller's seekability before building the index, so the
+            # index style (seek-based vs sequential) always agrees with what
+            # iteration readers are allowed to do, and an explicit value
+            # actually skips the probe.
+            if seekable is not None:
+                self._reader._seekable = seekable
+            self._seekable = self._reader.seekable
+            self._codec_name: str = self._reader.codec_name
 
-        # Parse constant_framerate: False, True, or a number (target fps)
-        if isinstance(constant_framerate, bool):
-            self.constant_framerate = constant_framerate
-            self.target_fps = self.original_fps
-        else:
-            self.constant_framerate = True
-            self.target_fps = float(constant_framerate)
+            # Build frame index upfront
+            self._index = FrameIndexPyAV(self.path, reader=self._reader)
+        finally:
+            # The reader gets reopened lazily in __iter__
+            self._reader.close()
+            self._reader = None
 
-        # Build frame index upfront
-        self._index = FrameIndexPyAV(self.path, reader=self._reader)
+        # When True, decoded frame PTS cannot be trusted for locating frames
+        # (set when the index had to synthesize timestamps); frame-count
+        # matching is used instead.
+        self._pts_unreliable = False
 
-        # Cache seekable result so new readers don't need to re-probe.
-        # If caller provided an explicit value, use it (skips the probe).
-        self._seekable = seekable if seekable is not None else self._reader.seekable
-
-        # Close the reader — it gets reopened lazily in __iter__
-        self._reader.close()
-        self._reader = None
+        # Some codecs/containers mark packets as keyframes that are not truly
+        # independently decodable (screen codecs, open-GOP MPEG, packed-B
+        # MPEG-4), so seeking would silently return wrong pixels. For those,
+        # verify that seeking reproduces sequential decode and fall back to
+        # sequential-only access (correct, slower) when it does not.
+        if (
+            self._index.frame_count > 1
+            and self._codec_name in _SEEK_UNRELIABLE_CODECS
+            and not self._seek_reproduces_sequential()
+        ):
+            self._seekable = False
+            # The packet-based index may also count packets the decoder never
+            # turns into frames (the same brokenness that defeats seeking), so
+            # rebuild it from what the decoder actually produces.
+            self._rebuild_index_from_decode()
 
         # In CFR mode, all behavior (count, indexing, iteration, seeking) derives
         # from this single output-index -> source-index map.
@@ -133,10 +171,24 @@ class VideoFrames:
         try:
             raw_frames = self._iter_decoded(reader, frame_range, internal_dtype)
             frames = map(self._maybe_to_float, raw_frames)
-            if self.repeat_count == 1:
-                yield from frames
-            else:
-                yield from spu.repeat_n(frames, self.repeat_count)
+            if self.repeat_count != 1:
+                frames = spu.repeat_n(frames, self.repeat_count)
+            count = 0
+            for frame in frames:
+                yield frame
+                count += 1
+            if count == 0:
+                # The index recorded frames but the decoder produced none
+                # (e.g. an unsupported bitstream feature the decoder skips
+                # silently) — silence here would look like a valid empty view.
+                raise VideoDecodeError(
+                    self.path,
+                    0,
+                    RuntimeError(
+                        f'Decoder produced no frames, but the video index '
+                        f'recorded {len(frame_range)} for this range'
+                    ),
+                )
         finally:
             reader.close()
 
@@ -259,6 +311,7 @@ class VideoFrames:
         result._cfr_source_map = self._cfr_source_map
         result._is_fileobj = self._is_fileobj
         result._seekable = self._seekable
+        result._pts_unreliable = self._pts_unreliable
         result._reader = None  # Each clone gets its own reader on iteration
         return result
 
@@ -368,12 +421,21 @@ class VideoFrames:
         reached_target = False
 
         frame_count = 0
-        for frame in reader._container.decode(reader._stream):
-            # Check if we've reached the target frame
+        skip_count = 0
+        for frame in reader.decode_raw():
+            # Check if we've reached the target frame. Match by PTS if available,
+            # otherwise by decoded-frame count (timestampless streams, e.g. raw
+            # H.264 elementary streams, where the index has synthetic PTS and
+            # decoding starts from frame 0).
             if not reached_target:
-                frame_pts = Fraction(frame.pts) * time_base if frame.pts is not None else None
-                if frame_pts is None or float(frame_pts) < target_pts_float - 1e-6:
-                    continue  # Skip this frame
+                usable_pts = frame.pts is not None and not self._pts_unreliable
+                frame_pts = Fraction(frame.pts) * time_base if usable_pts else None
+                if not (
+                    (frame_pts is not None and float(frame_pts) >= target_pts_float - 1e-6)
+                    or skip_count == slice_start
+                ):
+                    skip_count += 1
+                    continue
                 reached_target = True
 
             # Process frame through filter graph
@@ -417,10 +479,18 @@ class VideoFrames:
         reached_target = False
         prev_frame_arr = None
 
-        for frame in reader._container.decode(reader._stream):
+        skip_count = 0
+        for frame in reader.decode_raw():
             if not reached_target:
-                frame_pts = Fraction(frame.pts) * time_base if frame.pts is not None else None
-                if frame_pts is None or float(frame_pts) < target_pts_float - 1e-6:
+                # Match by PTS if available, otherwise by decoded-frame count
+                # (timestampless streams, e.g. raw H.264 elementary streams).
+                usable_pts = frame.pts is not None and not self._pts_unreliable
+                frame_pts = Fraction(frame.pts) * time_base if usable_pts else None
+                if not (
+                    (frame_pts is not None and float(frame_pts) >= target_pts_float - 1e-6)
+                    or skip_count == first_source
+                ):
+                    skip_count += 1
                     continue
                 reached_target = True
                 source_idx = first_source
@@ -475,7 +545,7 @@ class VideoFrames:
         output_idx = 0
         prev_frame_arr = None
 
-        for frame in reader._container.decode(reader._stream):
+        for frame in reader.decode_raw():
             # Process through filter graph for exact color conversion
             graph.push(frame)
             filtered_frame = graph.pull()
@@ -539,8 +609,9 @@ class VideoFrames:
             time_base = reader.time_base
 
             frame_count = 0
-            for frame in reader._container.decode(reader._stream):
-                frame_pts = Fraction(frame.pts) * time_base if frame.pts is not None else None
+            for frame in reader.decode_raw():
+                usable_pts = frame.pts is not None and not self._pts_unreliable
+                frame_pts = Fraction(frame.pts) * time_base if usable_pts else None
                 # Match by PTS if available, otherwise by frame count (for attached pictures etc.)
                 if (
                     frame_pts is not None and float(frame_pts) >= target_pts_float - 1e-6
@@ -557,6 +628,89 @@ class VideoFrames:
             if own_reader:
                 reader.close()
 
+    def _seek_reproduces_sequential(self) -> bool:
+        """Check whether seek-based access decodes the same pixels as iteration.
+
+        Compares a few early frames plus the frames around the first real seek
+        point (the first index whose safe seek target differs from the start),
+        decoded via the seek path, against sequential decode from the start.
+        Bounded by roughly one GOP of sequential decoding.
+        """
+        n = self._index.frame_count
+        first_safe = self._index.safe_seek_pts[0]
+        j0 = next((i for i in range(1, n) if self._index.safe_seek_pts[i] != first_safe), 1)
+        probe = sorted({i for i in (1, 2, j0, j0 + 1, j0 + 2) if 0 < i < n})
+        if not probe:
+            return True
+
+        try:
+            reader = self._create_reader()
+            try:
+                # Same starting procedure as sequential iteration
+                reader.seek_to_time(Fraction(0))
+                sequential = {}
+                for i, arr in enumerate(reader.decode_frames(max_frames=probe[-1] + 1)):
+                    if i in probe:
+                        sequential[i] = arr
+            finally:
+                reader.close()
+
+            for i in probe:
+                if i not in sequential:
+                    # The decoder yielded fewer frames than the index recorded
+                    return False
+                if not np.array_equal(sequential[i], self._decode_frame_at_source(i, np.uint8)):
+                    return False
+        except FramePumpError:
+            return False
+        return True
+
+    def _rebuild_index_from_decode(self) -> None:
+        """Rebuild the frame index from actual decoder output (one full decode).
+
+        Used when packet-based indexing is untrustworthy: the count and PTS
+        list then reflect the frames the decoder really produces, so ``len()``,
+        indexing and iteration agree even when some packets are undecodable.
+        """
+        pts_list: list[Fraction | None] = []
+        reader = self._create_reader()
+        try:
+            # Start decoding exactly like sequential iteration does (reopens
+            # non-seekable containers), so the rebuilt index reflects it
+            reader.seek_to_time(Fraction(0))
+            time_base = reader.time_base
+            try:
+                for frame in reader.decode_raw():
+                    pts_list.append(
+                        Fraction(frame.pts) * time_base if frame.pts is not None else None
+                    )
+            except VideoDecodeError:
+                # Keep the frames decoded before the error (truncated-file
+                # semantics, same as sequential iteration would surface them)
+                pass
+        finally:
+            reader.close()
+
+        n = len(pts_list)
+        monotonic = n > 0 and all(p is not None for p in pts_list)
+        if monotonic:
+            monotonic = all(b >= a for a, b in zip(pts_list, pts_list[1:]))
+        if not monotonic:
+            # Unusable timestamps: synthesize evenly spaced PTS and switch
+            # frame matching to counting, since decoded PTS can't locate frames
+            fps = (
+                Fraction(self.original_fps).limit_denominator(1000000)
+                if self.original_fps
+                else Fraction(25)
+            )
+            start = pts_list[0] if n and pts_list[0] is not None else Fraction(0)
+            pts_list = [start + Fraction(i) / fps for i in range(n)]
+            self._pts_unreliable = True
+
+        self._index.frame_pts = pts_list
+        self._index.safe_seek_pts = [Fraction(0)] * n
+        self._index.frame_count = n
+
     def _build_cfr_source_map(self) -> list[int]:
         """Build the mapping from CFR output frame index to source frame index.
 
@@ -566,18 +720,38 @@ class VideoFrames:
         seeking all read from it, so they cannot disagree with each other.
 
         The arithmetic deliberately uses floats: FFmpeg computes vsync in doubles,
-        so float — not exact rational — arithmetic reproduces its output. PTS are
-        taken relative to the first frame (as ffmpeg does via the stream start
-        time), so streams that start late (e.g. MPEG-TS) produce no phantom
-        leading frames.
+        so float — not exact rational — arithmetic reproduces its output. Like
+        ffmpeg, sync values stay unrounded (only the frame counts are rounded)
+        and each source frame carries its real duration rescaled to the output
+        timebase — both matter when the target fps differs from the source fps.
+        PTS are taken relative to the first frame (as ffmpeg does via the stream
+        start time), so streams that start late (e.g. MPEG-TS) produce no
+        phantom leading frames.
         """
         fps = self.target_fps
         frame_pts = self._index.frame_pts
         start_pts = frame_pts[0] if frame_pts else Fraction(0)
 
-        # Convert PTS to output timebase (integer frame units)
-        sync_ipts_list = [round(float(pts - start_pts) * fps) for pts in frame_pts]
-        duration = 1  # Each source frame has duration=1 in output timebase
+        # Convert PTS to output timebase (frame units), mirroring ffmpeg's
+        # adjust_frame_pts_to_encoder_tb: rescale the exact rational PTS into
+        # the output timebase with 16 extra precision bits (round half away
+        # from zero, like av_rescale_q's AV_ROUND_NEAR_INF for non-negative
+        # values); non-integer results are then biased by 2^-17 away from zero
+        # to avoid exact midpoints in the frame-count rounding below (integers
+        # are left exact so on-boundary frames round half-to-even like ffmpeg).
+        fps_frac = Fraction(fps)
+        raw_ipts = [(pts - start_pts) * fps_frac for pts in frame_pts]
+        scale = 1 << 16
+        eps = 1.0 / (1 << 17)
+        sync_ipts_list = []
+        for v in raw_ipts:
+            q = int(v * scale + Fraction(1, 2)) / scale
+            sync_ipts_list.append(q if q == int(q) else q + eps)
+
+        # Per-frame duration in output timebase: delta to the next PTS; the last
+        # frame reuses the previous delta (single frame: one output slot).
+        durations = [float(b - a) for a, b in zip(raw_ipts, raw_ipts[1:])]
+        durations.append(durations[-1] if durations else 1.0)
 
         next_pts = 0
         source_map = []  # source_map[output_idx] = source_idx
@@ -585,7 +759,13 @@ class VideoFrames:
 
         for source_idx, sync_ipts in enumerate(sync_ipts_list):
             delta0 = sync_ipts - next_pts
-            delta = delta0 + duration
+            delta = delta0 + durations[source_idx]
+
+            # ffmpeg clips frames that arrive slightly early but still within
+            # their duration ("Clipping frame in rate conversion"): the drift
+            # is zeroed while delta keeps its value.
+            if delta0 < 0 < delta:
+                delta0 = 0
 
             nb_frames = 1
             nb_frames_prev = 0

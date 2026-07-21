@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from framepump import VideoFrames, VideoWriter, VideoDecodeError
+from framepump import (
+    NoVideoStreamError,
+    UnsupportedCodecError,
+    VideoDecodeError,
+    VideoFrames,
+    VideoWriter,
+)
 
 # Path to various test video directories
 FATE_DIR = Path(__file__).parent.parent / 'fate'
@@ -180,13 +186,13 @@ class TestExoticFormats:
             _ = frames.fps
             _ = frames.imshape
             if is_audio_only:
-                pytest.fail(f'{video_path.name} should have raised "No video stream" error')
-        except ValueError as e:
-            if 'No video stream' in str(e):
-                if is_audio_only:
-                    return  # Expected error for audio-only file
-                pytest.fail(f'{video_path.name} has video but got "No video stream" error')
-            pytest.fail(f'Failed to open {video_path.name}: {e}')
+                pytest.fail(f'{video_path.name} should have raised NoVideoStreamError')
+        except NoVideoStreamError:
+            if is_audio_only:
+                return  # Expected error for audio-only file
+            pytest.fail(f'{video_path.name} has video but got NoVideoStreamError')
+        except UnsupportedCodecError:
+            return  # Clean error: this FFmpeg build lacks the codec's decoder
         except VideoDecodeError as e:
             if is_partial:
                 return  # Expected error for partial/corrupt file
@@ -217,16 +223,18 @@ class TestExoticFormats:
                     break
             assert count > 0 or may_be_empty, f'No frames yielded from {video_path.name}'
             if is_audio_only:
-                pytest.fail(f'{video_path.name} should have raised "No video stream" error')
-        except ValueError as e:
-            if 'No video stream' in str(e):
-                if is_audio_only:
-                    return  # Expected error for audio-only file
-                pytest.fail(f'{video_path.name} has video but got "No video stream" error')
-            pytest.fail(f'Failed to iterate {video_path.name}: {e}')
+                pytest.fail(f'{video_path.name} should have raised NoVideoStreamError')
+        except NoVideoStreamError:
+            if is_audio_only:
+                return  # Expected error for audio-only file
+            pytest.fail(f'{video_path.name} has video but got NoVideoStreamError')
+        except UnsupportedCodecError:
+            return  # Clean error: this FFmpeg build lacks the codec's decoder
         except VideoDecodeError as e:
-            if is_partial:
-                return  # Expected error for partial/corrupt file
+            if is_partial or may_be_empty:
+                # Files whose frames cannot be decoded now raise instead of
+                # silently yielding an empty iteration
+                return
             pytest.fail(f'Unexpected decode error for {video_path.name}: {e}')
         except Exception as e:
             pytest.fail(f'Failed to iterate {video_path.name}: {e}')

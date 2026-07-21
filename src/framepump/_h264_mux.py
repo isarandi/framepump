@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, BinaryIO, Union
 
 import av
 
+from ._pyav import NoAudioStreamError
 from ._temp_file import TempFile
 
 if TYPE_CHECKING:
@@ -172,7 +173,7 @@ class H264PassthroughMuxer:
         if not self._audio_input_container.streams.audio:
             self._audio_input_container.close()
             self._audio_input_container = None
-            return
+            raise NoAudioStreamError(audio_source_path)
         src_audio = self._audio_input_container.streams.audio[0]
         self._audio_stream = self._output_container.add_stream(template=src_audio)
         self._audio_time_base = src_audio.time_base

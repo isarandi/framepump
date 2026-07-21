@@ -1,8 +1,9 @@
 """GPU-resident video frame reader using NVDEC via PyNvVideoCodec low-level API.
 
-Uses PyNvDemuxer + PyNvDecoder (low-level) instead of SimpleDecoder (high-level)
-for precise PTS-based seeking and accurate frame counts — even for videos with
-edit lists, B-frame reordering, or unreliable container metadata.
+Demuxes with PyAV (reliable seeking, Annex-B conversion via bitstream
+filters) and decodes with PyNvDecoder, for precise PTS-based seeking and
+accurate frame counts — even for videos with edit lists, B-frame reordering,
+or unreliable container metadata.
 
 Provides the same lazy, sliceable interface as VideoFrames but decodes on GPU
 and yields DLPack-compatible frames. Use ``torch.from_dlpack(frame)`` to get
@@ -47,18 +48,19 @@ from __future__ import annotations
 import bisect
 import ctypes
 import itertools
-import subprocess
-import sys
 import threading
 import warnings
 from pathlib import Path
 from typing import Union
 
+import av
 import numpy as np
+from av.bitstream import BitStreamFilterContext
 from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
 from ._cuda_compat import cuda_ctx_pushed
+from ._pyav import PyAVReader, UnsupportedCodecError
 from ._selection import FrameSelection
 
 PathLike = Union[str, Path]
@@ -91,90 +93,107 @@ class _CudaLazyIndexState:
         self.index: _FrameIndexNvDec | None = None
 
 
-# Whether PyNvDemuxer.Seek() works in this process's environment (None =
-# not yet probed). Some driver/library combinations segfault on any nonzero
-# seek, so the probe runs in a subprocess.
-_demuxer_seek_safe: bool | None = None
+# PyAV codec names -> NVDEC codec ids. Only these have NVDEC hardware
+# decoder support.
+_NVDEC_CODECS = {
+    'h264': nvc.cudaVideoCodec.H264,
+    'hevc': nvc.cudaVideoCodec.HEVC,
+    'av1': nvc.cudaVideoCodec.AV1,
+    'vp9': nvc.cudaVideoCodec.VP9,
+    'vp8': nvc.cudaVideoCodec.VP8,
+    'mpeg1video': nvc.cudaVideoCodec.MPEG1,
+    'mpeg2video': nvc.cudaVideoCodec.MPEG2,
+    'mpeg4': nvc.cudaVideoCodec.MPEG4,
+    'mjpeg': nvc.cudaVideoCodec.JPEG,
+    'vc1': nvc.cudaVideoCodec.VC1,
+}
+
+# Codecs whose MP4/MKV packets need conversion to Annex-B start codes for
+# the NVDEC parser
+_ANNEXB_FILTERS = {'h264': 'h264_mp4toannexb', 'hevc': 'hevc_mp4toannexb'}
 
 
-def _demuxer_seek_is_safe(probe_path: str) -> bool:
-    global _demuxer_seek_safe
-    if _demuxer_seek_safe is None:
-        code = (
-            'import sys\n'
-            'import PyNvVideoCodec as nvc\n'
-            'dmx = nvc.CreateDemuxer(sys.argv[1])\n'
-            'target = 0\n'
-            'while target <= 0:\n'
-            '    pkt = dmx.Demux()\n'
-            '    if pkt.bsl == 0:\n'
-            '        break\n'
-            '    target = max(pkt.pts, pkt.dts)\n'
-            'dmx.Seek(target if target > 0 else 1)\n'
-            'print("OK")\n'
-        )
-        try:
-            result = subprocess.run(
-                [sys.executable, '-c', code, str(probe_path)],
-                capture_output=True,
-                timeout=120,
-            )
-            _demuxer_seek_safe = result.returncode == 0
-        except Exception:
-            _demuxer_seek_safe = False
-        if not _demuxer_seek_safe:
-            warnings.warn(
-                'PyNvVideoCodec demuxer seeking crashes in this environment; '
-                'VideoFramesCuda falls back to decode-from-start for indexed '
-                'and offset access (correct but slower).',
-                RuntimeWarning,
-                stacklevel=3,
-            )
-    return _demuxer_seek_safe
+class _PyAVPacketSource:
+    """Demux packets with PyAV and present them as NVDEC PacketData.
+
+    PyAV replaces PyNvDemuxer here: its seeking is reliable (PyNvDemuxer's
+    Seek() segfaults outright on some driver/library combinations and
+    mishandles edit-list files), and its bitstream filters convert AVCC
+    packets to the Annex-B form the NVDEC parser expects.
+    """
+
+    def __init__(self, video_path: str, codec_name: str) -> None:
+        self._container = av.open(video_path)
+        self._stream = self._container.streams.video[0]
+        self._codec_name = codec_name
+        self._bsf = self._make_bsf()
+        # The NVDEC parser copies the bitstream during Decode(), but hold the
+        # most recent buffer anyway so its memory can never be reused early
+        self._last_buf = None
+
+    def _make_bsf(self):
+        filter_name = _ANNEXB_FILTERS.get(self._codec_name)
+        if filter_name is None:
+            return None
+        return BitStreamFilterContext(filter_name, self._stream)
+
+    def seek(self, pts: int) -> None:
+        """Seek to the keyframe at or before ``pts`` (stream time_base units)."""
+        self._container.seek(pts, stream=self._stream, backward=True)
+        # The filter buffers parameter sets; start it fresh after a jump
+        self._bsf = self._make_bsf()
+
+    def packets(self):
+        """Yield NVDEC PacketData for the remaining packets."""
+        for packet in self._container.demux(self._stream):
+            if packet.pts is None and packet.dts is None:
+                continue
+            filtered = self._bsf.filter(packet) if self._bsf is not None else (packet,)
+            for fp in filtered:
+                data = bytes(fp)
+                if not data:
+                    continue
+                buf = ctypes.create_string_buffer(data, len(data))
+                self._last_buf = buf
+                pd = nvc.PacketData()
+                pd.bsl_data = ctypes.addressof(buf)
+                pd.bsl = len(data)
+                pts = fp.pts if fp.pts is not None else fp.dts
+                pd.pts = pts if pts is not None else 0
+                yield pd
+
+    def close(self) -> None:
+        self._container.close()
 
 
 # ── Frame index ──────────────────────────────────────────────────────
 
 
 class _FrameIndexNvDec:
-    """Packet-based frame index built from PyNvDemuxer.
+    """Packet-based frame index built from PyAV demuxing.
 
     Same algorithm as FrameIndexPyAV._build_from_packets() — collects
     file-order PTS, builds running_max_at array, computes safe seek points
-    via bisect.  PTS values are raw integers in the stream's time_base.
+    via bisect.  PTS values are raw integers in the stream's time_base,
+    matching the values fed to the NVDEC decoder through PacketData.
     """
 
     def __init__(self, video_path: str) -> None:
-        dmx = nvc.CreateDemuxer(video_path)
-
-        # Store metadata from demuxer.
-        self.width: int = dmx.Width()
-        self.height: int = dmx.Height()
-        self.fps: float = dmx.FrameRate()
-        self.codec = dmx.GetNvCodecId()
-        self.bit_depth: int = dmx.BitDepth()
-        self.color_space = dmx.ColorSpace()
-        self.chroma_format = dmx.ChromaFormat()
-
-        # Collect PTS in file (packet) order.
+        # Collect PTS in file (packet) order via PyAV.
         file_order_pts: list[int] = []
         running_max_at: list[int] = []
         running_max = -1
 
-        while True:
-            pkt = dmx.Demux()
-            if pkt.bsl == 0:
-                break
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            for pkt in container.demux(stream):
+                pts = pkt.pts if pkt.pts is not None else pkt.dts
+                if pts is None or pts < 0:
+                    continue
 
-            pts = pkt.pts
-            if pts < 0:
-                pts = pkt.dts
-            if pts < 0:
-                continue
-
-            file_order_pts.append(pts)
-            running_max = max(running_max, pts)
-            running_max_at.append(running_max)
+                file_order_pts.append(pts)
+                running_max = max(running_max, pts)
+                running_max_at.append(running_max)
 
         if not file_order_pts:
             raise RuntimeError(f'No valid packets found in {video_path}')
@@ -194,37 +213,21 @@ class _FrameIndexNvDec:
             else:
                 self.safe_seek_pts.append(min(file_order_pts[0], 0))
 
-        # Detect edit-list files where PyNvDemuxer.Seek() crashes (SIGSEGV).
-        # Compare our packet count with the container header's nb_frames.
-        # A large discrepancy (e.g., 437 vs 30) indicates edit-list trimming
-        # by the demuxer, which breaks its Seek() function.
-        self.seekable: bool = True
+        # Whether the container supports reliable seeking (raw bitstreams and
+        # image-pipe formats do not); reuses the CPU reader's detection and
+        # probe. Non-seekable sources decode from the start instead.
+        reader = PyAVReader(video_path)
         try:
-            import av
-
-            with av.open(video_path) as container:
-                stream = container.streams.video[0]
-                container_nframes = stream.frames
-            if container_nframes > 0 and self.frame_count > 0:
-                ratio = container_nframes / self.frame_count
-                if ratio > 1.5 or ratio < 0.67:
-                    self.seekable = False
-        except Exception:
-            pass  # If av.open fails, assume seekable
-
-        # Some driver/PyNvVideoCodec combinations segfault on ANY nonzero
-        # Seek(); verify once per process in a throwaway subprocess (a crash
-        # there cannot take this process down) and fall back to
-        # decode-from-start access when seeking is unusable.
-        if self.seekable and not _demuxer_seek_is_safe(video_path):
-            self.seekable = False
+            self.seekable: bool = reader.seekable
+        finally:
+            reader.close()
 
 
 # ── Decode session ───────────────────────────────────────────────────
 
 
 class _NvDecSession:
-    """Wraps PyNvDemuxer + PyNvDecoder for a single decode session.
+    """PyAV packet source + PyNvDecoder for a single decode session.
 
     Created per iteration/access — not shared across clones or concurrent
     iterations.
@@ -235,9 +238,10 @@ class _NvDecSession:
         video_path: str,
         gpu: int,
         codec,
+        codec_name: str,
         output_color_type,
     ) -> None:
-        self._dmx = nvc.CreateDemuxer(video_path)
+        self._src = _PyAVPacketSource(video_path, codec_name)
         self._dec = nvc.CreateDecoder(
             gpuid=gpu,
             codec=codec,
@@ -246,27 +250,25 @@ class _NvDecSession:
             latency=nvc.DisplayDecodeLatencyType.LOW,
         )
 
+    def _decode_all(self):
+        """Feed every remaining packet and flush; yield (pts, frame)."""
+        for pd in self._src.packets():
+            for f in self._dec.Decode(pd):
+                yield f.getPTS(), f
+        empty = nvc.PacketData()
+        while True:
+            frames = self._dec.Decode(empty)
+            if not frames:
+                break
+            for f in frames:
+                yield f.getPTS(), f
+
     def iter_from_start(self):
         """Decode all frames sequentially from the beginning.
 
         Yields (pts, frame) tuples in display order.
         """
-        while True:
-            pkt = self._dmx.Demux()
-            if pkt.bsl == 0:
-                # Flush buffered frames.
-                empty = nvc.PacketData()
-                while True:
-                    frames = self._dec.Decode(empty)
-                    if not frames:
-                        break
-                    for f in frames:
-                        yield f.getPTS(), f
-                return
-
-            frames = self._dec.Decode(pkt)
-            for f in frames:
-                yield f.getPTS(), f
+        yield from self._decode_all()
 
     def iter_from_pts(self, start_pts: int):
         """Seek to start_pts and decode forward.
@@ -274,36 +276,15 @@ class _NvDecSession:
         Yields (pts, frame) tuples in display order, starting from the first
         frame with PTS >= start_pts.
         """
-        self._dmx.Seek(start_pts)
+        self._src.seek(start_pts)
         reached = False
-
-        while True:
-            pkt = self._dmx.Demux()
-            if pkt.bsl == 0:
-                empty = nvc.PacketData()
-                while True:
-                    frames = self._dec.Decode(empty)
-                    if not frames:
-                        break
-                    for f in frames:
-                        pts = f.getPTS()
-                        if not reached:
-                            if pts >= start_pts:
-                                reached = True
-                            else:
-                                continue
-                        yield pts, f
-                return
-
-            frames = self._dec.Decode(pkt)
-            for f in frames:
-                pts = f.getPTS()
-                if not reached:
-                    if pts >= start_pts:
-                        reached = True
-                    else:
-                        continue
-                yield pts, f
+        for pts, f in self._decode_all():
+            if not reached:
+                if pts >= start_pts:
+                    reached = True
+                else:
+                    continue
+            yield pts, f
 
 
 # ── Public class ─────────────────────────────────────────────────────
@@ -357,15 +338,28 @@ class VideoFramesCuda:
             raise ValueError(f'Unsupported dtype: {dtype}')
         self.dtype: np.dtype = dtype
 
-        # Read container metadata from a short-lived demuxer (no packet scan)
-        dmx = nvc.CreateDemuxer(self.path)
-        self.original_imshape: tuple[int, int] = (dmx.Height(), dmx.Width())
-        self.original_fps: float = dmx.FrameRate()
-        self._codec = dmx.GetNvCodecId()
-        self._bit_depth: int = dmx.BitDepth()
-        self._meta_color_space = dmx.ColorSpace()
-        self._chroma_format = dmx.ChromaFormat()
-        del dmx
+        # Read container metadata via PyAV (no packet scan); this also gives
+        # the same clean errors as the CPU class for audio-only files and
+        # codecs without a decoder
+        reader = PyAVReader(self.path)
+        try:
+            width, height = reader.resolution
+            self.original_imshape: tuple[int, int] = (height, width)
+            self.original_fps: float = float(reader.fps)
+            self._codec_name: str = reader.codec_name
+            pix_fmt = reader._stream.codec_context.format
+            fmt_name = pix_fmt.name if pix_fmt is not None else 'yuv420p'
+            self._colorspace_id = int(getattr(reader._stream.codec_context, 'colorspace', 0) or 0)
+        finally:
+            reader.close()
+
+        if self._codec_name not in _NVDEC_CODECS:
+            raise UnsupportedCodecError(self.path)
+        self._codec = _NVDEC_CODECS[self._codec_name]
+        # Bit depth and chroma subsampling from the pixel format name
+        # (e.g. 'yuv420p10le', 'yuv444p')
+        self._bit_depth: int = 10 if '10' in fmt_name else 12 if '12' in fmt_name else 8
+        self._chroma_is_444: bool = '444' in fmt_name
 
         # The frame index (full packet scan) is built lazily on first
         # length-dependent or seek-based access; forward streaming access
@@ -396,13 +390,12 @@ class VideoFramesCuda:
 
         # Color space (only matters for yuv_to_rgb16 path).
         if color_space == 'auto':
-            cs = self._meta_color_space
-            if cs == nvc.ColorSpace.BT_709:
+            if self._colorspace_id == 1:  # AVCOL_SPC_BT709
                 self._color_space = 'bt709'
-            elif cs == nvc.ColorSpace.BT_601:
+            elif self._colorspace_id in (5, 6):  # BT470BG / SMPTE170M (BT.601)
                 self._color_space = 'bt601'
             else:
-                # UNSPEC — fall back to height heuristic.
+                # Unspecified — fall back to height heuristic.
                 self._color_space = 'bt709' if self.original_imshape[0] >= 720 else 'bt601'
         elif color_space in ('bt601', 'bt709'):
             self._color_space = color_space
@@ -559,9 +552,10 @@ class VideoFramesCuda:
         result.original_imshape = self.original_imshape
         result.original_fps = self.original_fps
         result._codec = self._codec
+        result._codec_name = self._codec_name
         result._bit_depth = self._bit_depth
-        result._meta_color_space = self._meta_color_space
-        result._chroma_format = self._chroma_format
+        result._chroma_is_444 = self._chroma_is_444
+        result._colorspace_id = self._colorspace_id
         result._selection = self._selection
         # Index state is shared: whichever view builds it, all views see it
         result._lazy = self._lazy
@@ -575,11 +569,8 @@ class VideoFramesCuda:
 
         Avoids creating a decoder session just for format probing.
         """
-        chroma = self._chroma_format
         hbd = self._bit_depth > 8
-
-        chroma_444 = getattr(nvc.cudaVideoChromaFormat, '444')
-        if chroma == chroma_444:
+        if self._chroma_is_444:
             return nvc.Pixel_Format.YUV444_16Bit if hbd else nvc.Pixel_Format.YUV444
         # 420 (and 422, which NVDEC outputs as 420)
         return nvc.Pixel_Format.P016 if hbd else nvc.Pixel_Format.NV12
@@ -592,6 +583,7 @@ class VideoFramesCuda:
             self.path,
             self._gpu,
             self._codec,
+            self._codec_name,
             self._color_type,
         )
 
@@ -613,8 +605,8 @@ class VideoFramesCuda:
         If the file is non-seekable (edit-list files), decodes from the
         beginning and skips to the target PTS.
         """
-        # Create fresh demuxer + decoder per seek for clean state.
-        dmx = nvc.CreateDemuxer(self.path)
+        # Create a fresh packet source + decoder per seek for clean state.
+        src = _PyAVPacketSource(self.path, self._codec_name)
         dec = nvc.CreateDecoder(
             gpuid=self._gpu,
             codec=self._codec,
@@ -624,28 +616,21 @@ class VideoFramesCuda:
         )
 
         if self._index.seekable and safe_pts > 0:
-            dmx.Seek(safe_pts)
+            src.seek(safe_pts)
 
+        for pd in src.packets():
+            for f in dec.Decode(pd):
+                if f.getPTS() >= target_pts:
+                    return f, dec
+        empty = nvc.PacketData()
         while True:
-            pkt = dmx.Demux()
-            if pkt.bsl == 0:
-                # Flush.
-                empty = nvc.PacketData()
-                while True:
-                    frames = dec.Decode(empty)
-                    if not frames:
-                        break
-                    for f in frames:
-                        if f.getPTS() >= target_pts:
-                            return f, dec
-                raise RuntimeError(
-                    f'Failed to decode frame at PTS {target_pts} ' f'(seeked to {safe_pts})'
-                )
-
-            frames = dec.Decode(pkt)
+            frames = dec.Decode(empty)
+            if not frames:
+                break
             for f in frames:
                 if f.getPTS() >= target_pts:
                     return f, dec
+        raise RuntimeError(f'Failed to decode frame at PTS {target_pts} (seeked to {safe_pts})')
 
     def _wrap_frame(self, frame, dec, *, owns_memory: bool):
         """Wrap a decoded frame for output (NPP conversion or DLPack)."""
@@ -706,6 +691,7 @@ class VideoFramesCuda:
             self.path,
             self._gpu,
             self._codec,
+            self._codec_name,
             self._color_type,
         )
 

@@ -523,6 +523,7 @@ class PyAVReader:
         max_frames: int | None = None,
         output_shape: tuple[int, int] | None = None,
         dtype: DTypeLike = np.uint8,
+        target_format: str | None = None,
     ) -> Generator[NDArray, None, None]:
         """Decode frames from current position.
 
@@ -540,8 +541,9 @@ class PyAVReader:
         if dtype not in (np.uint8, np.uint16):
             raise ValueError(f'Unsupported dtype: {dtype}')
 
-        # Choose pixel format based on dtype
-        target_format = 'rgb48' if dtype == np.uint16 else 'rgb24'
+        if target_format is None:
+            # Choose pixel format based on dtype
+            target_format = 'rgb48' if dtype == np.uint16 else 'rgb24'
 
         # Build filter graph for exact FFmpeg compatibility
         graph = self._build_filter_graph(output_shape, target_format)

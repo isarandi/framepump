@@ -26,6 +26,7 @@ import numpy as np
 import simplepyutils as spu
 from numpy.typing import NDArray
 
+from ._h264_mux import _FORMAT_ALIASES
 from ._pyav import FrameIndexPyAV, NoAudioStreamError, PyAVReader, VideoEncodeError
 from ._temp_file import TempFile
 from .encoder_config import EncoderConfig
@@ -76,7 +77,12 @@ class AbstractVideoWriter(ABC, Generic[T]):
 
     @abstractmethod
     def end_sequence(self) -> None:
-        """End the current video sequence."""
+        """End the current video sequence.
+
+        Implementations may accept additional keyword-only options (e.g.
+        ``VideoWriter``'s ``block=``); the abstract interface stays minimal
+        because such options are meaningless for synchronous writers.
+        """
         ...
 
     @abstractmethod
@@ -486,7 +492,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                         writer = None
                     if isinstance(msg.video_output, (str, Path)):
                         spu.ensure_parent_dir_exists(msg.video_output)
-                    writer = SequenceWriter(
+                    writer = self._sequence_writer_cls(
                         msg.video_output,
                         fps=msg.fps,
                         audio_source_path=msg.audio_source_path,
@@ -561,7 +567,8 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
         if isinstance(video_output, (str, Path)):
             self._temp_file = TempFile(video_output)
             self._file_output = None
-            self._format = format or Path(video_output).suffix.lstrip('.')
+            fmt = format or Path(video_output).suffix.lstrip('.')
+            self._format = _FORMAT_ALIASES.get(fmt, fmt)
         else:
             # File-like object
             self._temp_file = None
@@ -593,9 +600,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
         if self._closed:
             raise RuntimeError('Writer is closed, cannot write more frames.')
 
-        # Convert float to uint16 for high precision encoding
-        if np.issubdtype(frame.dtype, np.floating):
-            frame = _float_to_uint16(frame)
+        frame = self._prepare_frame(frame)
 
         if self._output_container is None:
             self._open(frame)
@@ -643,13 +648,18 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
 
         self._pts += 1
 
-    def _open(self, first_frame: NDArray) -> None:
-        """Open containers and set up streams based on first frame."""
+    def _prepare_frame(self, frame: NDArray) -> NDArray:
+        """Normalize an incoming frame before validation and encoding."""
+        # Convert float to uint16 for high precision encoding
+        if np.issubdtype(frame.dtype, np.floating):
+            return _float_to_uint16(frame)
+        return frame
+
+    def _validate_first_frame(self, first_frame: NDArray) -> None:
         if first_frame.dtype not in (np.uint8, np.uint16):
             raise ValueError(f'Unsupported frame dtype: {first_frame.dtype}')
 
         height, width = first_frame.shape[:2]
-
         if height % 2 != 0 or width % 2 != 0:
             raise ValueError(
                 f'Frame dimensions must be even for H.264 encoding (yuv420p), '
@@ -664,17 +674,8 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             )
             self._gpu = False
 
-        self._frame_dtype = first_frame.dtype
-        self._frame_shape = first_frame.shape
-
-        if self._temp_file is not None:
-            self._output_container = av.open(
-                os.fspath(self._temp_file.temp_path), 'w', format=self._format
-            )
-        else:
-            self._output_container = av.open(self._file_output, 'w', format=self._format)
-
-        # Set up video stream
+    def _setup_video_stream(self, first_frame: NDArray) -> None:
+        height, width = first_frame.shape[:2]
         codec_name = self._encoder_config.get_codec_name(self._gpu)
         self._video_stream = self._output_container.add_stream(codec_name, rate=self._fps_frac)
         self._video_stream.width = width
@@ -688,6 +689,22 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             self._input_format = 'rgb48le'
 
         self._video_stream.options = self._encoder_config.build_options(self._gpu)
+
+    def _open(self, first_frame: NDArray) -> None:
+        """Open containers and set up streams based on first frame."""
+        self._validate_first_frame(first_frame)
+
+        self._frame_dtype = first_frame.dtype
+        self._frame_shape = first_frame.shape
+
+        if self._temp_file is not None:
+            self._output_container = av.open(
+                os.fspath(self._temp_file.temp_path), 'w', format=self._format
+            )
+        else:
+            self._output_container = av.open(self._file_output, 'w', format=self._format)
+
+        self._setup_video_stream(first_frame)
 
         # Set up audio if provided
         if self._audio_source_path is not None:
@@ -773,6 +790,71 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
             self._abort()
 
 
+# SequenceWriter is defined after VideoWriter, so the binding lives here
+VideoWriter._sequence_writer_cls = SequenceWriter
+
+
+class DepthVideoWriter(VideoWriter):
+    """Threaded writer for 16-bit grayscale depth videos (lossless FFV1).
+
+    Stores depth maps as FFV1-encoded ``gray16le`` in an MKV container:
+    truly lossless for 16-bit data, roughly half the size of a PNG sequence
+    thanks to temporal compression. Frames are ``(height, width)`` uint16
+    arrays (e.g. depth in millimeters).
+
+    Read the result back losslessly with
+    ``VideoFrames(path, dtype=np.uint16, gray=True)``.
+
+    Example:
+        >>> with DepthVideoWriter('depth.mkv', fps=5) as writer:
+        ...     for depth in depth_frames:  # (H, W) uint16
+        ...         writer.append_data(depth)
+    """
+
+    _sequence_writer_cls = None  # bound below
+
+
+class _DepthSequenceWriter(SequenceWriter):
+    """SequenceWriter variant encoding (H, W) uint16 frames as FFV1 gray16le."""
+
+    _SUPPORTED_FORMATS = ('matroska', 'avi', 'nut')
+
+    def _prepare_frame(self, frame: NDArray) -> NDArray:
+        # Float depth is ambiguous (meters? normalized?); require explicit
+        # integer values instead of guessing a scale
+        if np.issubdtype(frame.dtype, np.floating):
+            raise ValueError(
+                'DepthVideoWriter requires uint16 frames; convert float depth '
+                'to integer units (e.g. millimeters) explicitly'
+            )
+        return frame
+
+    def _validate_first_frame(self, first_frame: NDArray) -> None:
+        if first_frame.dtype != np.uint16:
+            raise ValueError(f'DepthVideoWriter requires uint16 frames, got {first_frame.dtype}')
+        if first_frame.ndim != 2:
+            raise ValueError(
+                f'DepthVideoWriter requires (height, width) frames, '
+                f'got shape {first_frame.shape}'
+            )
+        if self._format not in self._SUPPORTED_FORMATS:
+            raise ValueError(
+                f'FFV1 depth video needs an MKV (or AVI/NUT) container, '
+                f"got format {self._format!r} — use a '.mkv' output path"
+            )
+
+    def _setup_video_stream(self, first_frame: NDArray) -> None:
+        height, width = first_frame.shape
+        self._video_stream = self._output_container.add_stream('ffv1', rate=self._fps_frac)
+        self._video_stream.width = width
+        self._video_stream.height = height
+        self._video_stream.pix_fmt = 'gray16le'
+        self._input_format = 'gray16le'
+
+
+DepthVideoWriter._sequence_writer_cls = _DepthSequenceWriter
+
+
 def video_audio_mux(
     vidpath_audiosource: PathLike,
     vidpath_imagesource: PathLike,
@@ -790,6 +872,7 @@ def video_audio_mux(
     # Write through a temp file so an error leaves nothing at the final path
     temp_file = TempFile(out_video_path)
     out_format = Path(out_video_path).suffix.lstrip('.')
+    out_format = _FORMAT_ALIASES.get(out_format, out_format)
     try:
         _video_audio_mux_to_path(
             vidpath_audiosource, vidpath_imagesource, temp_file.temp_path, out_format
@@ -894,6 +977,7 @@ def trim_video(
     # Write through a temp file so an error leaves nothing at the final path
     temp_file = TempFile(output_path)
     out_format = Path(output_path).suffix.lstrip('.')
+    out_format = _FORMAT_ALIASES.get(out_format, out_format)
     try:
         _trim_video_to_path(
             input_path, temp_file.temp_path, out_format, gpu, target_pts, end_pts, safe_seek_pts

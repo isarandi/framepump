@@ -94,6 +94,10 @@ class VideoFrames:
             or an int to select a specific GPU device ordinal.
         constant_framerate: False for VFR (native timestamps), True for CFR at
             original fps, or a number for CFR at that specific fps.
+        gray: Decode to single-channel grayscale: frames are (height, width)
+            instead of (height, width, 3). With dtype=np.uint16 the decode is
+            bit-exact for gray16le sources (e.g. FFV1 depth videos written by
+            DepthVideoWriter). Not supported together with gpu decoding.
     """
 
     def __init__(
@@ -104,6 +108,7 @@ class VideoFrames:
         gpu: bool | int = False,
         constant_framerate: Union[bool, float] = False,
         seekable: bool | None = None,
+        gray: bool = False,
     ) -> None:
         """Open a video file for lazy frame access.
 
@@ -126,6 +131,10 @@ class VideoFrames:
             raise ValueError(f'Unsupported dtype: {dtype!r}') from e
         if dtype not in (np.uint8, np.uint16, np.float16, np.float32, np.float64):
             raise ValueError(f'Unsupported dtype: {np.dtype(dtype).name}')
+
+        if gray and gpu:
+            raise ValueError('gray=True is not supported together with gpu decoding')
+        self.gray = gray
 
         self._is_fileobj = hasattr(video_path, 'read')
         self.path = video_path
@@ -226,7 +235,11 @@ class VideoFrames:
         reader = self._create_reader()
         try:
             reader.seek_to_time(Fraction(0))
-            raw = reader.decode_frames(output_shape=self.resized_imshape, dtype=internal_dtype)
+            raw = reader.decode_frames(
+                output_shape=self.resized_imshape,
+                dtype=internal_dtype,
+                target_format=self._pix_target(internal_dtype),
+            )
             raw = itertools.islice(raw, start, streamable.stop, step)
             for frame in self._convert_and_repeat(raw):
                 yield frame
@@ -252,6 +265,12 @@ class VideoFrames:
         if self.repeat_count == 1:
             return frames
         return spu.repeat_n(frames, self.repeat_count)
+
+    def _pix_target(self, internal_dtype: DTypeLike) -> str:
+        """Decode target pixel format: RGB by default, grayscale for gray=True."""
+        if self.gray:
+            return 'gray16le' if internal_dtype == np.uint16 else 'gray'
+        return 'rgb48' if internal_dtype == np.uint16 else 'rgb24'
 
     def _resolved_range(self) -> range:
         """The concrete source-index range, resolving the selection if needed."""
@@ -432,6 +451,7 @@ class VideoFrames:
         result.repeat_count = self.repeat_count
         result.dtype = self.dtype
         result.gpu = self.gpu
+        result.gray = self.gray
         result.constant_framerate = self.constant_framerate
         result.target_fps = self.target_fps
         # Index state (index, CFR map, seek verdicts) is shared: whichever
@@ -611,7 +631,7 @@ class VideoFrames:
         reader.seek_to_time(safe_pts_frac)
 
         # Build filter graph
-        target_format = 'rgb48' if internal_dtype == np.uint16 else 'rgb24'
+        target_format = self._pix_target(internal_dtype)
         graph = reader._build_filter_graph(self.resized_imshape, target_format)
 
         # Skip frames until we reach the target PTS (mimics FFmpeg's -ss behavior)
@@ -663,7 +683,7 @@ class VideoFrames:
         target_pts_frac = self._index.frame_pts[first_source]
         reader.seek_to_time(safe_pts_frac)
 
-        target_format = 'rgb48' if internal_dtype == np.uint16 else 'rgb24'
+        target_format = self._pix_target(internal_dtype)
         graph = reader._build_filter_graph(self.resized_imshape, target_format)
 
         target_pts_float = float(target_pts_frac)
@@ -730,12 +750,13 @@ class VideoFrames:
             yield from reader.decode_frames(
                 output_shape=self.resized_imshape,
                 dtype=dtype,
+                target_format=self._pix_target(dtype),
             )
             return
 
         # CFR mode: walk the source map from the beginning
         source_map = self._cfr_source_map
-        target_format = 'rgb48' if dtype == np.uint16 else 'rgb24'
+        target_format = self._pix_target(dtype)
 
         # Build filter graph for exact FFmpeg compatibility
         graph = reader._build_filter_graph(self.resized_imshape, target_format)
@@ -800,7 +821,7 @@ class VideoFrames:
             reader.seek_to_time(safe_pts_frac)
 
             # Build filter graph for exact FFmpeg compatibility
-            target_format = 'rgb48' if internal_dtype == np.uint16 else 'rgb24'
+            target_format = self._pix_target(internal_dtype)
             graph = reader._build_filter_graph(self.resized_imshape, target_format)
 
             # Decode frames until we reach the target PTS
@@ -848,7 +869,11 @@ class VideoFrames:
                 # Same starting procedure as sequential iteration
                 reader.seek_to_time(Fraction(0))
                 sequential = {}
-                for i, arr in enumerate(reader.decode_frames(max_frames=probe[-1] + 1)):
+                for i, arr in enumerate(
+                    reader.decode_frames(
+                        max_frames=probe[-1] + 1, target_format=self._pix_target(np.uint8)
+                    )
+                ):
                     if i in probe:
                         sequential[i] = arr
             finally:

@@ -33,9 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid-data errors were, and the rest leaked as raw `av.error.*` internals.
 - `VideoFramesCuda` indexed access and offset slices segfaulted outright on
   driver/PyNvVideoCodec combinations where `PyNvDemuxer.Seek()` crashes (observed with
-  PyNvVideoCodec 2.0.3 on driver 590.48, for every nonzero seek target). Seek support
-  is now probed once per process in a throwaway subprocess; when broken, access falls
-  back to decode-from-start with a warning (correct but slower).
+  PyNvVideoCodec 2.0.3 on driver 590.48, for every nonzero seek target). Demuxing now
+  goes through PyAV — reliable seeking, Annex-B conversion via bitstream filters, and
+  the same clean `NoVideoStreamError`/`UnsupportedCodecError` behavior as the CPU
+  reader — with packets fed directly to the NVDEC decoder; PyNvDemuxer is no longer
+  used at all.
+- Writing to `.mkv` paths failed with `no container format 'mkv'` in `VideoWriter`,
+  `trim_video` and `video_audio_mux` (the path suffix is not a valid libav muxer
+  name); the suffix is now mapped to the proper container name, as the GL/CUDA
+  writers' muxer already did.
 
 - Writing float16 frames produced an all-black video on numpy >= 2 (NEP 50 promotion
   overflowed the scaling to inf inside float16); scaling now happens in float32.
@@ -182,6 +188,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streaming access never scans packets, and reverse iteration buffers chunk frames in
   owned GPU copies (safe to keep without `.clone()`, unlike forward iteration's shared
   buffers).
+- `DepthVideoWriter`: lossless 16-bit depth video via FFV1-encoded `gray16le` in MKV —
+  bit-exact for `(height, width)` uint16 frames at roughly half the size of a PNG
+  sequence. Read back with the new `VideoFrames(..., gray=True)`, which decodes any
+  video to single-channel `(height, width)` frames (bit-exact for gray16le sources
+  with `dtype=np.uint16`, luma conversion for color sources).
 - File-like objects (anything with `read`/`seek`/`tell`, e.g. `BytesIO`) are accepted as
   video sources by `VideoFrames`. `BytesIO` sources support multiple concurrently active
   iterators; other file-like objects support one.

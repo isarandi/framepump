@@ -193,3 +193,27 @@ Next Steps
 - :doc:`/howto/frame-accurate-processing` — slicing, frame counting, VFR handling
 - :doc:`/howto/batch-video-writing` — writing multiple videos efficiently
 - :doc:`/howto/gpu-acceleration` — hardware-accelerated decode and encode
+
+Depth Videos (16-bit Grayscale)
+-------------------------------
+
+Depth maps compress well as lossless video.
+:class:`~framepump.DepthVideoWriter` stores ``(height, width)`` uint16 frames
+as FFV1-encoded 16-bit grayscale in an MKV container — bit-exact, and roughly
+half the size of the equivalent PNG sequence thanks to temporal compression:
+
+.. code-block:: python
+
+    import numpy as np
+    from framepump import DepthVideoWriter, VideoFrames
+
+    with DepthVideoWriter('depth.mkv', fps=5) as writer:
+        for depth in depth_frames:  # (H, W) uint16, e.g. millimeters
+            writer.append_data(depth)
+
+    # Read back losslessly: frames are (H, W) uint16
+    for depth in VideoFrames('depth.mkv', dtype=np.uint16, gray=True):
+        process(depth)
+
+``gray=True`` also works on regular color videos, yielding single-channel
+luma frames.

@@ -25,7 +25,13 @@ from ._pyav import (
 )
 from .encoder_config import EncoderConfig
 
-from .video_writing import AbstractVideoWriter, VideoWriter, trim_video, video_audio_mux
+from .video_writing import (
+    AbstractVideoWriter,
+    DepthVideoWriter,
+    VideoWriter,
+    trim_video,
+    video_audio_mux,
+)
 from .video_writing_gl import GLVideoWriter
 
 
@@ -78,6 +84,7 @@ __all__ = [
     'FilterConfigError',
     'AbstractVideoWriter',
     'VideoWriter',
+    'DepthVideoWriter',
     'GLVideoWriter',
     'JpegVideoWriterCUDA',
     'VideoFramesCuda',

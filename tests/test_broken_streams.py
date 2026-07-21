@@ -81,7 +81,8 @@ class TestSeekVerificationKeepsGoodFiles:
             *codec_args,
         )
         vf = VideoFrames(path)
-        assert vf._seekable, 'probe must not disable seeking for a consistent file'
+        len(vf)  # build the index, which runs the seek-reliability probe
+        assert not vf._lazy.seek_disabled, 'probe must not disable seeking for a consistent file'
         seq = list(vf)
         for i in (1, 10, len(seq) - 1):
             assert np.array_equal(vf[i], seq[i]), f'frame {i}'

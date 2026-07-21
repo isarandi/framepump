@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Lazy frame indexing: opening a video no longer scans the whole file. Forward
+  iteration, prefix-style slicing (`frames[:100]`, `frames[::2]`) and slice chains that
+  reduce to a plain forward slice (via the new `slicecompose` dependency) stream in a
+  single pass without ever building the index; `len()`, integer indexing, negative
+  bounds, CFR mode and reverse iteration build it on first use, once, shared across all
+  views. Note that `list(frames)` calls `len()` as a preallocation hint and therefore
+  builds the index; a `for` loop or comprehension streams without it.
 - File-like objects (anything with `read`/`seek`/`tell`, e.g. `BytesIO`) are accepted as
   video sources by `VideoFrames`. `BytesIO` sources support multiple concurrently active
   iterators; other file-like objects support one.

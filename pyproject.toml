@@ -42,6 +42,7 @@ dependencies = [
     "av",  # PyAV for video I/O
     "simplepyutils",
     "more-itertools",
+    "slicecompose",  # lazy slice-chain composition for deferred frame indexing
 ]
 
 [project.optional-dependencies]

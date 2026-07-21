@@ -134,3 +134,31 @@ For non-seekable streams:
   beginning).
 - Random access works but requires decoding from the start each time, which
   is slow. Sequential iteration is unaffected.
+
+Lazy Index Construction
+-----------------------
+
+The packet index is only built when something actually needs it. Opening a
+video reads container metadata (dimensions, frame rate, codec) but does not
+scan the file. Forward iteration, prefix-style slicing (``frames[:100]``,
+``frames[::2]``) and any chain of slices that reduces to a plain forward
+slice are served by decoding from the start and skipping — a single pass
+over the file, with no index at all. The reduction is computed symbolically
+with `slicecompose <https://github.com/isarandi/slicecompose>`_, whose
+compositions are valid for every sequence length, so streamed access is
+exact without knowing the frame count.
+
+The index is built (once, shared by all views of the video) the first time
+an operation depends on the frame count or on seeking:
+
+- ``len(frames)`` and negative indices or slice bounds (``frames[-100:]``)
+- integer indexing (``frames[i]`` seeks, which needs safe seek points)
+- reverse iteration (chunk planning needs keyframe positions)
+- forward slices whose start is far from the beginning (seeking amortizes
+  better than decoding and discarding)
+- CFR mode (all CFR behavior derives from the single source map)
+
+One Python-protocol subtlety: ``list(frames)`` calls ``len()`` as a
+preallocation hint before iterating, which builds the index. A ``for`` loop
+or comprehension over the same view streams without it.
+

@@ -34,8 +34,10 @@ You can inspect the video's properties immediately:
     print(frames.imshape)   # (height, width) in pixels, e.g. (1080, 1920)
     print(len(frames))      # Exact frame count
 
-The frame count is exact, not an estimate. FramePump builds a packet index
-on construction by scanning the container without decoding any frames.
+The frame count is exact, not an estimate. FramePump scans the container's
+packets (without decoding frames) to build an index the first time something
+needs it — such as ``len()``, integer indexing or negative slice bounds.
+Opening a video and iterating it forward never triggers the scan.
 
 
 Iterating Over Frames
@@ -68,7 +70,7 @@ You can index into the video like a list:
 Random access works correctly even for videos with B-frames. FramePump seeks
 to the nearest safe point and decodes forward to the target frame. For codecs
 whose containers are known to misreport keyframes (screen codecs, open-GOP
-MPEG-1/2, packed-B MPEG-4), FramePump verifies at open time that seeking
+MPEG-1/2, packed-B MPEG-4), FramePump verifies before first seeking that seeking
 reproduces sequential decoding, and transparently falls back to slower
 decode-from-start access when it does not — indexing always returns the same
 pixels that iteration would.

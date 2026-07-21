@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import itertools
 import operator
+import threading
 from bisect import bisect_left
 from collections import deque
 from collections.abc import Generator
@@ -15,6 +17,7 @@ import simplepyutils as spu
 from numpy.typing import DTypeLike, NDArray
 
 from ._pyav import FrameIndexPyAV, FramePumpError, PyAVReader, VideoDecodeError
+from ._selection import FrameSelection
 
 PathLike = Union[str, Path]
 
@@ -30,9 +33,43 @@ __all__ = [
 
 # Codecs whose containers are known to mark non-decodable packets as keyframes
 # (screen codecs) or whose GOP structure defeats keyframe seeking (open-GOP
-# MPEG-1/2, packed-B MPEG-4). Seeking is content-verified for these at
-# construction and disabled when it does not reproduce sequential decode.
+# MPEG-1/2, packed-B MPEG-4). Seeking is content-verified for these when the
+# index is built and disabled when it does not reproduce sequential decode.
 _SEEK_UNRELIABLE_CODECS = frozenset({'mpeg1video', 'mpeg2video', 'mpeg4', 'fic', 'vmnc'})
+
+# Streaming (decode-from-start-and-skip, no index) is used for forward
+# selections whose start is at most this many frames; larger starts build the
+# index and seek, which amortizes better than decoding and discarding.
+_STREAM_MAX_SKIP = 256
+
+
+class _LazyIndexState:
+    """Frame-index state shared between a VideoFrames and all its views.
+
+    Views are created by slicing; they must observe the same index, CFR map
+    and seek-reliability verdicts no matter which view triggered the build.
+    """
+
+    __slots__ = (
+        'lock',
+        'index',
+        'cfr_source_map',
+        'seek_disabled',
+        'pts_unreliable',
+        'seekable_probed',
+    )
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.index: FrameIndexPyAV | None = None
+        self.cfr_source_map: list[int] | None = None
+        # True when the seek-reliability probe failed: access is sequential-only
+        self.seek_disabled = False
+        # True when decoded frame PTS cannot be trusted for locating frames
+        # (the index had to synthesize timestamps); frame counting is used
+        self.pts_unreliable = False
+        # Cached container-seekability auto-probe verdict (None = not probed)
+        self.seekable_probed: bool | None = None
 
 
 class VideoFrames:
@@ -110,59 +147,44 @@ class VideoFrames:
                 self.constant_framerate = True
                 self.target_fps = float(constant_framerate)
 
-            # Apply the caller's seekability before building the index, so the
-            # index style (seek-based vs sequential) always agrees with what
-            # iteration readers are allowed to do, and an explicit value
-            # actually skips the probe.
-            if seekable is not None:
-                self._reader._seekable = seekable
-            self._seekable = self._reader.seekable
+            # The caller's explicit seekability (None = auto-probe lazily on
+            # first reader use; probing seeks and decodes a test frame, too
+            # expensive for construction)
+            self._seekable: bool | None = seekable
             self._codec_name: str = self._reader.codec_name
-
-            # Build frame index upfront
-            self._index = FrameIndexPyAV(self.path, reader=self._reader)
         finally:
-            # The reader gets reopened lazily in __iter__
+            # Readers are created on demand for iteration and index building
             self._reader.close()
             self._reader = None
 
-        # When True, decoded frame PTS cannot be trusted for locating frames
-        # (set when the index had to synthesize timestamps); frame-count
-        # matching is used instead.
-        self._pts_unreliable = False
+        # The frame index (full packet scan of the file) is built lazily: it
+        # is only needed for length-dependent access (len(), integer indexing,
+        # negative slice components, reverse iteration) and for CFR mode.
+        # Plain forward iteration and prefix-style slicing stream without it.
+        # The state is shared with all views cloned from this instance.
+        self._lazy = _LazyIndexState()
 
-        # Some codecs/containers mark packets as keyframes that are not truly
-        # independently decodable (screen codecs, open-GOP MPEG, packed-B
-        # MPEG-4), so seeking would silently return wrong pixels. For those,
-        # verify that seeking reproduces sequential decode and fall back to
-        # sequential-only access (correct, slower) when it does not.
-        if (
-            self._index.frame_count > 1
-            and self._codec_name in _SEEK_UNRELIABLE_CODECS
-            and not self._seek_reproduces_sequential()
-        ):
-            self._seekable = False
-            # The packet-based index may also count packets the decoder never
-            # turns into frames (the same brokenness that defeats seeking), so
-            # rebuild it from what the decoder actually produces.
-            self._rebuild_index_from_decode()
-
-        # In CFR mode, all behavior (count, indexing, iteration, seeking) derives
-        # from this single output-index -> source-index map.
-        if self.constant_framerate:
-            self._cfr_source_map: list[int] | None = self._build_cfr_source_map()
-            n_frames = len(self._cfr_source_map)
-        else:
-            self._cfr_source_map = None
-            n_frames = self._index.frame_count
-
-        # Store frame range - slicing applies directly to this
-        self._frame_range: range = range(n_frames)
+        # Which frames this view selects; symbolic until the count is known
+        self._selection = FrameSelection.identity()
 
     def __iter__(self) -> Generator[NDArray, None, None]:
         internal_dtype = np.uint8 if self.dtype == np.uint8 else np.uint16
 
-        frame_range = self._frame_range
+        # Stream without the index when the selection is a plain forward
+        # slice with a small start (CFR always needs the index: all CFR
+        # behavior derives from the single source map). If the index already
+        # exists, the seek-based paths are at least as good — use them.
+        if not self._selection.is_resolved and not self.constant_framerate:
+            streamable = self._selection.streamable_slice
+            if (
+                streamable is not None
+                and (streamable.start or 0) <= _STREAM_MAX_SKIP
+                and self._lazy.index is None
+            ):
+                yield from self._iter_streamed(streamable, internal_dtype)
+                return
+
+        frame_range = self._resolved_range()
         if len(frame_range) == 0:
             return
 
@@ -170,11 +192,8 @@ class VideoFrames:
         reader = self._create_reader()
         try:
             raw_frames = self._iter_decoded(reader, frame_range, internal_dtype)
-            frames = map(self._maybe_to_float, raw_frames)
-            if self.repeat_count != 1:
-                frames = spu.repeat_n(frames, self.repeat_count)
             count = 0
-            for frame in frames:
+            for frame in self._convert_and_repeat(raw_frames):
                 yield frame
                 count += 1
             if count == 0:
@@ -191,6 +210,109 @@ class VideoFrames:
                 )
         finally:
             reader.close()
+
+    def _iter_streamed(
+        self, streamable: slice, internal_dtype: DTypeLike
+    ) -> Generator[NDArray, None, None]:
+        """Decode from the start and skip, without building the frame index."""
+        start = streamable.start or 0
+        step = streamable.step or 1
+
+        count = 0
+        reader = self._create_reader()
+        try:
+            reader.seek_to_time(Fraction(0))
+            raw = reader.decode_frames(output_shape=self.resized_imshape, dtype=internal_dtype)
+            raw = itertools.islice(raw, start, streamable.stop, step)
+            for frame in self._convert_and_repeat(raw):
+                yield frame
+                count += 1
+        finally:
+            reader.close()
+
+        if count == 0 and len(self) > 0:
+            # Same guarantee as the resolved path: an empty decode of a
+            # nonempty selection must not look like a valid empty view.
+            # Building the index here is cheap — the stream ended immediately.
+            raise VideoDecodeError(
+                self.path,
+                0,
+                RuntimeError(
+                    f'Decoder produced no frames, but the video index '
+                    f'recorded {len(self)} for this range'
+                ),
+            )
+
+    def _convert_and_repeat(self, raw_frames):
+        frames = map(self._maybe_to_float, raw_frames)
+        if self.repeat_count == 1:
+            return frames
+        return spu.repeat_n(frames, self.repeat_count)
+
+    def _resolved_range(self) -> range:
+        """The concrete source-index range, resolving the selection if needed."""
+        if not self._selection.is_resolved:
+            self._selection = self._selection.resolve(self._n_frames_total())
+        return self._selection.range
+
+    def _n_frames_total(self) -> int:
+        if self.constant_framerate:
+            return len(self._cfr_source_map)
+        return self._index.frame_count
+
+    @property
+    def _index(self) -> FrameIndexPyAV:
+        if self._lazy.index is None:
+            self._materialize_index()
+        return self._lazy.index
+
+    @property
+    def _cfr_source_map(self) -> list[int] | None:
+        if self.constant_framerate and self._lazy.index is None:
+            self._materialize_index()
+        return self._lazy.cfr_source_map
+
+    @property
+    def _pts_unreliable(self) -> bool:
+        return self._lazy.pts_unreliable
+
+    def _materialize_index(self) -> None:
+        """Build the frame index (full packet scan), shared with all views.
+
+        Also runs the seek-reliability verification for suspect codecs and
+        builds the CFR source map, so every consumer of the index sees the
+        same verdicts regardless of which view triggered the build.
+        """
+        with self._lazy.lock:
+            if self._lazy.index is not None:
+                return
+
+            reader = self._create_reader()
+            try:
+                self._lazy.index = FrameIndexPyAV(self.path, reader=reader)
+            finally:
+                reader.close()
+
+            # Some codecs/containers mark packets as keyframes that are not
+            # truly independently decodable (screen codecs, open-GOP MPEG,
+            # packed-B MPEG-4), so seeking would silently return wrong
+            # pixels. Verify that seeking reproduces sequential decode and
+            # fall back to sequential-only access when it does not.
+            if (
+                self._lazy.index.frame_count > 1
+                and self._codec_name in _SEEK_UNRELIABLE_CODECS
+                and not self._seek_reproduces_sequential()
+            ):
+                self._lazy.seek_disabled = True
+                # The packet-based index may also count packets the decoder
+                # never turns into frames (the same brokenness that defeats
+                # seeking), so rebuild it from what the decoder produces.
+                self._rebuild_index_from_decode()
+
+            # In CFR mode, all behavior (count, indexing, iteration, seeking)
+            # derives from this single output-index -> source-index map.
+            if self.constant_framerate:
+                self._lazy.cfr_source_map = self._build_cfr_source_map()
 
     @overload
     def __getitem__(self, item: int) -> NDArray: ...
@@ -209,7 +331,7 @@ class VideoFrames:
 
             # The bounds check above uses the repeat-inclusive length, so after
             # dividing out the repeat factor the index is always within range.
-            abs_idx = self._frame_range[item // self.repeat_count]
+            abs_idx = self._resolved_range()[item // self.repeat_count]
             source_idx = self._abs_to_source(abs_idx)
             return self._maybe_to_float(self._decode_frame_at_source(source_idx))
         elif isinstance(item, slice):
@@ -227,20 +349,21 @@ class VideoFrames:
             if item.step == 0:
                 raise ValueError('slice step cannot be zero')
 
-            # Apply slice to frame range
             result = self._clone()
-            result._frame_range = self._frame_range[item]
+            result._selection = self._selection.sliced(item)
             return result
         else:
             raise TypeError('VideoFrames indices must be integers or slices.')
 
     def __len__(self) -> int:
-        return len(self._frame_range) * self.repeat_count
+        return len(self._resolved_range()) * self.repeat_count
 
     def __repr__(self) -> str:
         h, w = self.imshape
         label = self.path if isinstance(self.path, (str, Path)) else '<file-like>'
-        return f"VideoFrames('{label}', {w}x{h}, {self.fps:.4g} fps, {len(self)} frames)"
+        # Never trigger the index scan just for a repr
+        length = f'{len(self)} frames' if self._selection.is_resolved else 'lazy'
+        return f"VideoFrames('{label}', {w}x{h}, {self.fps:.4g} fps, {length})"
 
     @property
     def imshape(self) -> tuple[int, int]:
@@ -249,8 +372,12 @@ class VideoFrames:
 
     @property
     def fps(self) -> float:
-        """Effective frame rate, accounting for slicing and frame repetition."""
-        return self.target_fps / self._frame_range.step * self.repeat_count
+        """Effective frame rate, accounting for slicing and frame repetition.
+
+        Uses the selection's effective stride, which is known even before the
+        frame count is — reading fps never triggers the index scan.
+        """
+        return self.target_fps / abs(self._selection.step_product) * self.repeat_count
 
     def resized(self, shape: tuple[int, int]) -> 'VideoFrames':
         """Return a new VideoFrames that decodes frames at the given resolution.
@@ -299,19 +426,19 @@ class VideoFrames:
         result.path = self.path
         result.original_imshape = self.original_imshape
         result.resized_imshape = self.resized_imshape
-        result._frame_range = self._frame_range
+        result._selection = self._selection
         result.original_fps = self.original_fps
         result.repeat_count = self.repeat_count
         result.dtype = self.dtype
         result.gpu = self.gpu
         result.constant_framerate = self.constant_framerate
         result.target_fps = self.target_fps
-        # Share index and CFR map with clones (read-only, thread-safe)
-        result._index = self._index
-        result._cfr_source_map = self._cfr_source_map
+        # Index state (index, CFR map, seek verdicts) is shared: whichever
+        # view builds it, all views observe the same result
+        result._lazy = self._lazy
         result._is_fileobj = self._is_fileobj
         result._seekable = self._seekable
-        result._pts_unreliable = self._pts_unreliable
+        result._codec_name = self._codec_name
         result._reader = None  # Each clone gets its own reader on iteration
         return result
 
@@ -331,7 +458,13 @@ class VideoFrames:
         else:
             source = self.path
         reader = PyAVReader(source, gpu=self.gpu)
-        reader._seekable = self._seekable
+        seekable = self._seekable if self._seekable is not None else self._lazy.seekable_probed
+        if seekable is None:
+            # First reader for this video: let it auto-probe (seek + decode
+            # one frame) and cache the verdict so later readers skip it
+            seekable = reader.seekable
+            self._lazy.seekable_probed = seekable
+        reader._seekable = seekable and not self._lazy.seek_disabled
         return reader
 
     def _iter_decoded(
@@ -705,7 +838,7 @@ class VideoFrames:
             )
             start = pts_list[0] if n and pts_list[0] is not None else Fraction(0)
             pts_list = [start + Fraction(i) / fps for i in range(n)]
-            self._pts_unreliable = True
+            self._lazy.pts_unreliable = True
 
         self._index.frame_pts = pts_list
         self._index.safe_seek_pts = [Fraction(0)] * n

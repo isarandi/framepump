@@ -21,6 +21,13 @@ batches. Clone if you need to keep frames beyond the current loop body::
     for frame in frames:
         t = torch.from_dlpack(frame).clone()  # safe to keep
 
+Reverse iteration (``frames[::-1]``) yields owned GPU buffers instead (they
+are buffered internally per chunk), so keeping those without cloning is safe.
+
+The frame index (a packet scan of the file) is built lazily: forward
+iteration and prefix-style slicing stream without it; ``len()``, integer
+indexing, negative bounds and reverse iteration build it on first use.
+
 Example:
     >>> import numpy as np
     >>> frames = VideoFramesCuda('video.mp4')
@@ -40,6 +47,8 @@ from __future__ import annotations
 import bisect
 import ctypes
 import itertools
+import subprocess
+import sys
 import threading
 import warnings
 from pathlib import Path
@@ -50,6 +59,7 @@ from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
 from ._cuda_compat import cuda_ctx_pushed
+from ._selection import FrameSelection
 
 PathLike = Union[str, Path]
 
@@ -60,6 +70,67 @@ _HBD_FORMATS = frozenset(
         nvc.Pixel_Format.YUV444_16Bit,
     }
 )
+
+
+# Streaming (decode-from-start-and-skip, no index) is used for forward
+# selections whose start is at most this many frames (mirrors VideoFrames)
+_STREAM_MAX_SKIP = 256
+
+# Reverse iteration buffers one chunk of copied/converted GPU frames at a
+# time; the chunk frame count is derived from this budget ([4, 64] frames)
+_REVERSE_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+class _CudaLazyIndexState:
+    """Frame-index state shared between a VideoFramesCuda and all its views."""
+
+    __slots__ = ('lock', 'index')
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.index: _FrameIndexNvDec | None = None
+
+
+# Whether PyNvDemuxer.Seek() works in this process's environment (None =
+# not yet probed). Some driver/library combinations segfault on any nonzero
+# seek, so the probe runs in a subprocess.
+_demuxer_seek_safe: bool | None = None
+
+
+def _demuxer_seek_is_safe(probe_path: str) -> bool:
+    global _demuxer_seek_safe
+    if _demuxer_seek_safe is None:
+        code = (
+            'import sys\n'
+            'import PyNvVideoCodec as nvc\n'
+            'dmx = nvc.CreateDemuxer(sys.argv[1])\n'
+            'target = 0\n'
+            'while target <= 0:\n'
+            '    pkt = dmx.Demux()\n'
+            '    if pkt.bsl == 0:\n'
+            '        break\n'
+            '    target = max(pkt.pts, pkt.dts)\n'
+            'dmx.Seek(target if target > 0 else 1)\n'
+            'print("OK")\n'
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, '-c', code, str(probe_path)],
+                capture_output=True,
+                timeout=120,
+            )
+            _demuxer_seek_safe = result.returncode == 0
+        except Exception:
+            _demuxer_seek_safe = False
+        if not _demuxer_seek_safe:
+            warnings.warn(
+                'PyNvVideoCodec demuxer seeking crashes in this environment; '
+                'VideoFramesCuda falls back to decode-from-start for indexed '
+                'and offset access (correct but slower).',
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    return _demuxer_seek_safe
 
 
 # ── Frame index ──────────────────────────────────────────────────────
@@ -140,6 +211,13 @@ class _FrameIndexNvDec:
                     self.seekable = False
         except Exception:
             pass  # If av.open fails, assume seekable
+
+        # Some driver/PyNvVideoCodec combinations segfault on ANY nonzero
+        # Seek(); verify once per process in a throwaway subprocess (a crash
+        # there cannot take this process down) and fall back to
+        # decode-from-start access when seeking is unusable.
+        if self.seekable and not _demuxer_seek_is_safe(video_path):
+            self.seekable = False
 
 
 # ── Decode session ───────────────────────────────────────────────────
@@ -279,12 +357,21 @@ class VideoFramesCuda:
             raise ValueError(f'Unsupported dtype: {dtype}')
         self.dtype: np.dtype = dtype
 
-        # Build precise frame index from packets (no decoding).
-        self._index = _FrameIndexNvDec(self.path)
+        # Read container metadata from a short-lived demuxer (no packet scan)
+        dmx = nvc.CreateDemuxer(self.path)
+        self.original_imshape: tuple[int, int] = (dmx.Height(), dmx.Width())
+        self.original_fps: float = dmx.FrameRate()
+        self._codec = dmx.GetNvCodecId()
+        self._bit_depth: int = dmx.BitDepth()
+        self._meta_color_space = dmx.ColorSpace()
+        self._chroma_format = dmx.ChromaFormat()
+        del dmx
 
-        self.original_imshape: tuple[int, int] = (self._index.height, self._index.width)
-        self.original_fps: float = self._index.fps
-        self._frame_range: range = range(self._index.frame_count)
+        # The frame index (full packet scan) is built lazily on first
+        # length-dependent or seek-based access; forward streaming access
+        # never needs it. Shared with all views cloned from this instance.
+        self._lazy = _CudaLazyIndexState()
+        self._selection = FrameSelection.identity()
 
         # Probe source pixel format (needs one decoded NATIVE frame).
         self._source_format = self._probe_source_format()
@@ -309,14 +396,14 @@ class VideoFramesCuda:
 
         # Color space (only matters for yuv_to_rgb16 path).
         if color_space == 'auto':
-            cs = self._index.color_space
+            cs = self._meta_color_space
             if cs == nvc.ColorSpace.BT_709:
                 self._color_space = 'bt709'
             elif cs == nvc.ColorSpace.BT_601:
                 self._color_space = 'bt601'
             else:
                 # UNSPEC — fall back to height heuristic.
-                self._color_space = 'bt709' if self._index.height >= 720 else 'bt601'
+                self._color_space = 'bt709' if self.original_imshape[0] >= 720 else 'bt601'
         elif color_space in ('bt601', 'bt709'):
             self._color_space = color_space
         else:
@@ -327,22 +414,58 @@ class VideoFramesCuda:
     # ── Public interface ──────────────────────────────────────────────
 
     def __iter__(self):
-        frame_range = self._frame_range
+        # Stream without the index when the selection is a plain forward
+        # slice with a small start. If the index already exists, the
+        # seek-based paths are at least as good — use them.
+        if not self._selection.is_resolved:
+            streamable = self._selection.streamable_slice
+            if (
+                streamable is not None
+                and (streamable.start or 0) <= _STREAM_MAX_SKIP
+                and self._lazy.index is None
+            ):
+                yield from self._iter_streamed(streamable)
+                return
+
+        frame_range = self._resolved_range()
         if len(frame_range) == 0:
             return
 
         if self._npp_mode is not None:
             self._init_npp_pipeline()
 
-        try:
-            if frame_range.step > 30:
-                yield from self._iter_by_index(frame_range)
-            elif frame_range.start > 0:
-                yield from self._iter_with_seek(frame_range)
-            else:
-                yield from self._iter_sequential(frame_range)
-        finally:
-            pass
+        # Large step (either direction): per-frame seeks; range() iterates
+        # backward natively for negative steps, and each frame gets its own
+        # decoder, so no chunk buffering is needed.
+        if abs(frame_range.step) > 30:
+            yield from self._iter_by_index(frame_range)
+        elif frame_range.step < 0:
+            yield from self._iter_reversed(frame_range)
+        elif frame_range.start > 0:
+            yield from self._iter_with_seek(frame_range)
+        else:
+            yield from self._iter_sequential(frame_range)
+
+    def _iter_streamed(self, streamable: slice):
+        """Decode from the start and skip, without building the frame index."""
+        if self._npp_mode is not None:
+            self._init_npp_pipeline()
+        session = self._make_session()
+        convert = self._npp_mode is not None
+        start = streamable.start or 0
+        stop = streamable.stop
+        step = streamable.step or 1
+
+        frame_count = 0
+        for _pts, frame in session.iter_from_start():
+            if stop is not None and frame_count >= stop:
+                break
+            if frame_count >= start and (frame_count - start) % step == 0:
+                if convert:
+                    yield self._convert_frame_shared(frame)
+                else:
+                    yield frame
+            frame_count += 1
 
     def __getitem__(self, item):
         if isinstance(item, int):
@@ -353,28 +476,27 @@ class VideoFramesCuda:
                 raise IndexError(
                     f'Frame index {item} out of range for video with ' f'{length} frames'
                 )
-            abs_idx = self._frame_range[item]
+            abs_idx = self._resolved_range()[item]
             return self._get_frame_by_abs_idx(abs_idx, owns_memory=True)
 
         if isinstance(item, slice):
-            if item.step is not None and item.step < 0:
-                raise ValueError('Negative step not supported.')
             if item.step == 0:
                 raise ValueError('Slice step cannot be zero.')
             result = self._clone()
-            result._frame_range = self._frame_range[item]
+            result._selection = self._selection.sliced(item)
             return result
 
         raise TypeError('Indices must be integers or slices.')
 
     def __len__(self) -> int:
-        return len(self._frame_range)
+        return len(self._resolved_range())
 
     def __repr__(self) -> str:
         h, w = self.imshape
+        # Never trigger the index scan just for a repr
+        length = f'{len(self)} frames' if self._selection.is_resolved else 'lazy'
         return (
-            f"VideoFramesCuda('{self.path}', {w}x{h}, "
-            f'{self.fps:.4g} fps, {len(self)} frames, {self.dtype})'
+            f"VideoFramesCuda('{self.path}', {w}x{h}, {self.fps:.4g} fps, {length}, {self.dtype})"
         )
 
     @property
@@ -384,8 +506,26 @@ class VideoFramesCuda:
 
     @property
     def fps(self) -> float:
-        """Effective frame rate, accounting for slicing."""
-        return self.original_fps / self._frame_range.step
+        """Effective frame rate, accounting for slicing.
+
+        Uses the selection's effective stride, which is known even before
+        the frame count is — reading fps never triggers the index scan.
+        """
+        return self.original_fps / abs(self._selection.step_product)
+
+    @property
+    def _index(self) -> _FrameIndexNvDec:
+        if self._lazy.index is None:
+            with self._lazy.lock:
+                if self._lazy.index is None:
+                    self._lazy.index = _FrameIndexNvDec(self.path)
+        return self._lazy.index
+
+    def _resolved_range(self) -> range:
+        """The concrete frame-index range, resolving the selection if needed."""
+        if not self._selection.is_resolved:
+            self._selection = self._selection.resolve(self._index.frame_count)
+        return self._selection.range
 
     def close(self) -> None:
         """Release GPU resources allocated for the NPP pipeline.
@@ -418,9 +558,13 @@ class VideoFramesCuda:
         result._color_space = self._color_space
         result.original_imshape = self.original_imshape
         result.original_fps = self.original_fps
-        result._frame_range = self._frame_range
-        # Share index (read-only, immutable).
-        result._index = self._index
+        result._codec = self._codec
+        result._bit_depth = self._bit_depth
+        result._meta_color_space = self._meta_color_space
+        result._chroma_format = self._chroma_format
+        result._selection = self._selection
+        # Index state is shared: whichever view builds it, all views see it
+        result._lazy = self._lazy
         # NPP pipeline state is NOT shared — each clone initializes lazily.
         return result
 
@@ -431,9 +575,8 @@ class VideoFramesCuda:
 
         Avoids creating a decoder session just for format probing.
         """
-        idx = self._index
-        chroma = idx.chroma_format
-        hbd = idx.bit_depth > 8
+        chroma = self._chroma_format
+        hbd = self._bit_depth > 8
 
         chroma_444 = getattr(nvc.cudaVideoChromaFormat, '444')
         if chroma == chroma_444:
@@ -448,7 +591,7 @@ class VideoFramesCuda:
         return _NvDecSession(
             self.path,
             self._gpu,
-            self._index.codec,
+            self._codec,
             self._color_type,
         )
 
@@ -474,7 +617,7 @@ class VideoFramesCuda:
         dmx = nvc.CreateDemuxer(self.path)
         dec = nvc.CreateDecoder(
             gpuid=self._gpu,
-            codec=self._index.codec,
+            codec=self._codec,
             usedevicememory=True,
             outputColorType=self._color_type,
             latency=nvc.DisplayDecodeLatencyType.LOW,
@@ -522,10 +665,22 @@ class VideoFramesCuda:
 
     # ── Iteration paths ──────────────────────────────────────────────
 
-    def _iter_sequential(self, frame_range: range):
+    def _emit(self, frame, owned: bool):
+        """Convert or wrap a decoded frame for yielding.
+
+        ``owned=False`` follows the iteration contract (shared conversion
+        buffer / raw decoder frame, valid until the next step). ``owned=True``
+        produces a buffer independent of the decode session — required when
+        frames are buffered past subsequent decodes (reverse chunks), since
+        decoder-owned surfaces are recycled from a bounded pool.
+        """
+        if self._npp_mode is not None:
+            return self._convert_frame_fresh(frame) if owned else self._convert_frame_shared(frame)
+        return self._copy_rgb_frame(frame) if owned else frame
+
+    def _iter_sequential(self, frame_range: range, *, owned: bool = False):
         """Path C: sequential decode from beginning with step."""
         session = self._make_session()
-        convert = self._npp_mode is not None
         start = frame_range.start
         stop = frame_range.stop
         step = frame_range.step
@@ -535,13 +690,10 @@ class VideoFramesCuda:
             if frame_count >= stop:
                 break
             if frame_count >= start and (frame_count - start) % step == 0:
-                if convert:
-                    yield self._convert_frame_shared(frame)
-                else:
-                    yield frame
+                yield self._emit(frame, owned)
             frame_count += 1
 
-    def _iter_with_seek(self, frame_range: range):
+    def _iter_with_seek(self, frame_range: range, *, owned: bool = False):
         """Path B: seek to start, then sequential with step."""
         start = frame_range.start
         stop = frame_range.stop
@@ -553,10 +705,9 @@ class VideoFramesCuda:
         session = _NvDecSession(
             self.path,
             self._gpu,
-            self._index.codec,
+            self._codec,
             self._color_type,
         )
-        convert = self._npp_mode is not None
 
         if self._index.seekable:
             frame_iter = session.iter_from_pts(safe_pts)
@@ -571,10 +722,7 @@ class VideoFramesCuda:
             if frame_count >= max_frames:
                 break
             if frame_count % step == 0:
-                if convert:
-                    yield self._convert_frame_shared(frame)
-                else:
-                    yield frame
+                yield self._emit(frame, owned)
             frame_count += 1
 
     def _iter_by_index(self, frame_range: range):
@@ -594,6 +742,105 @@ class VideoFramesCuda:
             # Assign after yield so previous decoder survives while caller uses the frame
             prev_dec = dec
         del prev_dec
+
+    # ── Reverse iteration ────────────────────────────────────────────
+
+    def _iter_reversed(self, frame_range: range):
+        """Iterate a negative-step range via backward chunks decoded forward.
+
+        Chunk frames must outlive the chunk's remaining decodes, so each
+        selected frame is copied (uint8) or freshly converted (uint16) into
+        an owned GPU buffer before the chunk is yielded in reverse —
+        decoder-owned surfaces cannot be buffered, since the decoder recycles
+        its bounded surface pool as decoding continues.
+        """
+        fwd = frame_range[::-1]
+        min_chunk, max_chunk, fallback_chunk = self._reverse_chunk_bounds()
+
+        pos = len(fwd)
+        while pos > 0:
+            lo = self._pick_reverse_chunk_start(fwd, pos, min_chunk, max_chunk, fallback_chunk)
+            chunk = fwd[lo:pos]
+            if chunk.start > 0:
+                buf = list(self._iter_with_seek(chunk, owned=True))
+            else:
+                buf = list(self._iter_sequential(chunk, owned=True))
+            yield from reversed(buf)
+            pos = lo
+
+    def _reverse_chunk_bounds(self) -> tuple[int, int, int]:
+        """(min, max, fallback) chunk lengths, bounded by the GPU byte budget."""
+        h, w = self.imshape
+        frame_bytes = max(h * w * 3 * self.dtype.itemsize, 1)
+        max_chunk = max(4, min(64, _REVERSE_CHUNK_BYTES // frame_bytes))
+        min_chunk = max(1, max_chunk // 2)
+        return min_chunk, max_chunk, (min_chunk + max_chunk) // 2
+
+    def _pick_reverse_chunk_start(
+        self, fwd: range, hi_pos: int, min_chunk: int, max_chunk: int, fallback_chunk: int
+    ) -> int:
+        """Position in ``fwd`` where the next (backward) chunk should start.
+
+        Prefers a selected frame that is its own safe seek point within
+        [hi_pos - max_chunk, hi_pos - min_chunk], so the chunk's seek lands
+        exactly where decoding must begin.
+        """
+        lo_limit = max(hi_pos - max_chunk, 0)
+        for p in range(max(hi_pos - min_chunk, 0), lo_limit - 1, -1):
+            if p == 0 or self._is_safe_seek_frame(fwd[p]):
+                return p
+        return max(hi_pos - fallback_chunk, 0)
+
+    def _is_safe_seek_frame(self, abs_idx: int) -> bool:
+        return self._index.frame_pts[abs_idx] == self._index.safe_seek_pts[abs_idx]
+
+    def _copy_rgb_frame(self, frame) -> _GpuRgbBuffer:
+        """Copy a decoder-owned RGB uint8 frame into an owned GPU buffer."""
+        from cuda.bindings import driver
+
+        h, w = self.original_imshape
+        views = frame.cuda()
+        view = views[0] if isinstance(views, (list, tuple)) else views
+        cai = view.__cuda_array_interface__
+        src_ptr = cai['data'][0]
+        strides = cai.get('strides')
+        src_pitch = strides[0] if strides else w * 3
+        row_bytes = w * 3
+        if src_pitch < row_bytes:
+            raise RuntimeError(f'Unexpected RGB frame pitch {src_pitch} for width {w}')
+
+        err, device = driver.cuDeviceGet(self._gpu)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'cuDeviceGet({self._gpu}) failed: {err}')
+        err, ctx = driver.cuDevicePrimaryCtxRetain(device)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
+        try:
+            with cuda_ctx_pushed(ctx):
+                err, devptr = driver.cuMemAlloc(row_bytes * h)
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f'Failed to allocate frame copy buffer: {err}')
+                devptr = int(devptr)
+                try:
+                    copy = driver.CUDA_MEMCPY2D()
+                    copy.srcMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+                    copy.srcDevice = src_ptr
+                    copy.srcPitch = src_pitch
+                    copy.dstMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+                    copy.dstDevice = devptr
+                    copy.dstPitch = row_bytes
+                    copy.WidthInBytes = row_bytes
+                    copy.Height = h
+                    (err,) = driver.cuMemcpy2D(copy)
+                    if err != driver.CUresult.CUDA_SUCCESS:
+                        raise RuntimeError(f'Failed to copy RGB frame: {err}')
+                except BaseException:
+                    driver.cuMemFree(devptr)
+                    raise
+        finally:
+            driver.cuDevicePrimaryCtxRelease(device)
+
+        return _GpuRgbBuffer(devptr, h, w, row_bytes, self._gpu, owns_memory=True, bits=8)
 
     # ── NPP pipeline ─────────────────────────────────────────────────
 
@@ -905,6 +1152,7 @@ class _GpuRgbBuffer:
         '_own_ctx',
         '_shape_arr',
         '_strides_arr',
+        '_bits',
     )
 
     def __init__(
@@ -916,6 +1164,7 @@ class _GpuRgbBuffer:
         gpu_id: int,
         *,
         owns_memory: bool,
+        bits: int = 16,
     ) -> None:
         self._devptr = devptr
         self._height = height
@@ -923,6 +1172,7 @@ class _GpuRgbBuffer:
         self._pitch = pitch
         self._gpu_id = gpu_id
         self._owns_memory = owns_memory
+        self._bits = bits
         self._own_device = None
         self._own_ctx = None
         if owns_memory:
@@ -950,7 +1200,7 @@ class _GpuRgbBuffer:
         mt.dl_tensor.data = self._devptr
         mt.dl_tensor.device = _DLDevice(2, self._gpu_id)  # kDLCUDA
         mt.dl_tensor.ndim = 3
-        mt.dl_tensor.dtype = _DLDataType(1, 16, 1)  # kDLUInt 16-bit
+        mt.dl_tensor.dtype = _DLDataType(1, self._bits, 1)  # kDLUInt
         mt.dl_tensor.shape = ctypes.cast(self._shape_arr, ctypes.POINTER(ctypes.c_int64))
         mt.dl_tensor.strides = ctypes.cast(self._strides_arr, ctypes.POINTER(ctypes.c_int64))
         mt.dl_tensor.byte_offset = 0

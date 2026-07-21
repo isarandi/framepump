@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All FFmpeg-level decode failures (unknown decoder errors, unimplemented features,
   DRM permission errors, ...) are wrapped into `VideoDecodeError` — previously only
   invalid-data errors were, and the rest leaked as raw `av.error.*` internals.
+- `VideoFramesCuda` indexed access and offset slices segfaulted outright on
+  driver/PyNvVideoCodec combinations where `PyNvDemuxer.Seek()` crashes (observed with
+  PyNvVideoCodec 2.0.3 on driver 590.48, for every nonzero seek target). Seek support
+  is now probed once per process in a throwaway subprocess; when broken, access falls
+  back to decode-from-start with a warning (correct but slower).
 
 - Writing float16 frames produced an all-black video on numpy >= 2 (NEP 50 promotion
   overflowed the scaling to inf inside float16); scaling now happens in float32.
@@ -172,8 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Negative-step slicing: `frames[::-1]`, `frames[100:10:-3]` and friends iterate in
   reverse, decoded internally as memory-bounded forward chunks anchored at keyframes
   (large step magnitudes use per-frame seeking). Composes with slicing, CFR mode,
-  `repeat_each_frame()`, resizing and all dtypes; `VideoFramesCuda` still rejects
-  negative steps.
+  `repeat_each_frame()`, resizing and all dtypes.
+- `VideoFramesCuda` gained the same lazy indexing and negative-step slicing: forward
+  streaming access never scans packets, and reverse iteration buffers chunk frames in
+  owned GPU copies (safe to keep without `.clone()`, unlike forward iteration's shared
+  buffers).
 - File-like objects (anything with `read`/`seek`/`tell`, e.g. `BytesIO`) are accepted as
   video sources by `VideoFrames`. `BytesIO` sources support multiple concurrently active
   iterators; other file-like objects support one.

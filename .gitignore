@@ -1,3 +1,20 @@
+# Local test data and reference material (not part of the repo)
+/data/
+/fate/
+/ffmpeg_src/
+/education/
+
+# Local dev scripts, examples and working notes
+/examples/
+/scripts/
+/test_yuv444_cuda13.py
+/AUDIT.md
+/FUTURE.md
+/NAIVE_USER_FINDINGS.md
+/FRAME_INDEXING.md
+/DATASET_STORAGE_NOTES.md
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

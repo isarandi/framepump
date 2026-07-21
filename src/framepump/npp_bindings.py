@@ -63,7 +63,11 @@ class NppStreamContext(Structure):
 # Constants
 # ---------------------------------------------------------------------------
 NPP_SUCCESS = 0
-NPPI_INTER_SUPER = 16  # area-averaging downsample (box filter for integer ratios)
+# Interpolation modes from nppdefs.h. SUPER (area averaging) requires both
+# scale factors to be < 1 and returns NPP_RESIZE_FACTOR_ERROR otherwise.
+NPPI_INTER_LINEAR = 2
+NPPI_INTER_SUPER = 8
+NPPI_INTER_LANCZOS = 16
 
 # BT.709 / BT.601 limited-range YUV→RGB color twist matrices (16-bit scale).
 #
@@ -560,14 +564,17 @@ def resize_plane_8u(
         dst_pitch,
         dst_size,
         dst_roi,
-        NPPI_INTER_SUPER,
+        # Area averaging for true 2D downsampling; NPP rejects SUPER when one
+        # axis keeps its size (the 4:2:2 chroma geometry), so use LINEAR there
+        # (a 2-tap average at the exact 2:1 horizontal ratio).
+        NPPI_INTER_SUPER if dst_w < src_w and dst_h < src_h else NPPI_INTER_LINEAR,
         ctx,
     )
     _check(status, 'Resize 8u C1R')
 
 
 _INTERLEAVE_UV_PTX = b"""\
-.version 9.1
+.version 7.0
 .target sm_52
 .address_size 64
 .visible .entry interleave_uv(
@@ -610,7 +617,14 @@ def _get_interleave_func():
     err, ctx = driver.cuCtxGetCurrent()
     if err != driver.CUresult.CUDA_SUCCESS or ctx is None or int(ctx) == 0:
         raise RuntimeError('interleave_uv requires a current CUDA context')
-    key = int(ctx)
+    # cuCtxGetId is unique per context *incarnation*: a new context reusing a
+    # destroyed context's address must not hit the stale cached CUfunction.
+    # (CUDA 12+ driver; fall back to the address on older drivers.)
+    if hasattr(driver, 'cuCtxGetId'):
+        err, ctx_id = driver.cuCtxGetId(ctx)
+        key = int(ctx_id) if err == driver.CUresult.CUDA_SUCCESS else int(ctx)
+    else:
+        key = int(ctx)
     func = _interleave_funcs.get(key)
     if func is None:
         err, mod = driver.cuModuleLoadData(_INTERLEAVE_UV_PTX)

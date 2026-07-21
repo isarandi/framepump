@@ -269,11 +269,14 @@ class JpegVideoWriterCUDA(
 ):
     """Zero-copy JPEG to video writer using nvJPEG decoder and NVENC encoder.
 
-    Decodes JPEG to YUV420 on GPU with nvJPEG and encodes with NVENC using
-    the IYUV (I420) format - all without CPU-GPU data transfers.
+    Decodes JPEG to YUV on GPU with nvJPEG and encodes with NVENC - all
+    without CPU-GPU data transfers. 4:2:0 input is encoded as 4:2:0 and
+    4:4:4 input as 4:4:4, unless ``chroma`` requests downsampling.
 
     Ending a sequence to which no frame was written is a no-op: no output
-    file is created.
+    file is created. ``start_sequence`` returns a context manager that
+    finalizes the sequence on clean exit and aborts it (deleting the output)
+    if the body raised.
 
     Example:
         >>> with JpegVideoWriterCUDA('output.mp4', fps=30) as writer:
@@ -335,7 +338,15 @@ class JpegVideoWriterCUDA(
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
     ) -> SequenceContext:
-        del gpu  # Always uses GPU; device set in constructor
+        """Start a new video sequence.
+
+        Returns a ``SequenceContext`` usable as a context manager: it ends the
+        sequence on clean exit and aborts it if the body raised.
+
+        The ``gpu`` parameter of the base interface is ignored: this writer
+        always encodes on the device chosen in the constructor.
+        """
+        del gpu
         if fps is None:
             if self._default_fps is None:
                 raise ValueError('fps must be provided if not set in constructor')
@@ -396,13 +407,21 @@ class JpegVideoWriterCUDA(
 
 
 class SequenceContext(AbstractContextManager['SequenceContext']):
-    """Context for a video sequence being written."""
+    """Context for a video sequence being written.
 
-    def __init__(self, multiwriter: AbstractVideoWriter) -> None:
+    On clean exit the sequence is finalized; if the body raised, the sequence
+    is aborted instead, so no partial file appears at the final path. The
+    writer remains usable for a new ``start_sequence`` either way.
+    """
+
+    def __init__(self, multiwriter: JpegVideoWriterCUDA) -> None:
         self.multiwriter = multiwriter
 
-    def __exit__(self, *args: Any, **kwargs: Any) -> None:
-        self.multiwriter.end_sequence()
+    def __exit__(self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any) -> None:
+        if exc_type is None:
+            self.multiwriter.end_sequence()
+        else:
+            self.multiwriter._abort()
 
 
 @dataclass(frozen=True)
@@ -531,7 +550,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._audio_source_path = audio_source_path
         self._encoder_config = encoder_config if encoder_config is not None else EncoderConfig()
         self._gpu = gpu
-        self._target_chroma = chroma  # None/'native', '420', or '422'
+        self._target_chroma = chroma  # None, '420', '422' or '444'
         self._video_output = video_output
         self._format = format
 
@@ -658,7 +677,13 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             self._uv_scratch = int(devptr)
             from .npp_bindings import make_npp_stream_context
 
-            self._npp_ctx = make_npp_stream_context(self._gpu)
+            # The writer may run on an adopted context whose device differs
+            # from self._gpu; NPP launch configuration must match the device
+            # the buffers actually live on.
+            err, dev = driver.cuCtxGetDevice()
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise NvencError(f'Failed to query current CUDA device: {err}')
+            self._npp_ctx = make_npp_stream_context(int(dev))
 
     @staticmethod
     def _memset_planes(base: int, layout: _EncodeBufferLayout) -> None:
@@ -800,20 +825,29 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         with cuda_ctx_pushed(self._cuda_ctx):
             # Initialize on first frame
             if self._jpeg_decoder is None:
-                self._jpeg_decoder = NvjpegPhasedDecoder(gpu=None)
-                width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
-                self._prepare_layouts(width, height, subsampling)
-                self._init_session()
-                self._alloc_buffers()
-                self._register_buffers()
-                self._open()
-                self._jpeg_decoder.decode_host()
+                try:
+                    self._jpeg_decoder = NvjpegPhasedDecoder(gpu=None)
+                    width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+                    self._prepare_layouts(width, height, subsampling)
+                    self._init_session()
+                    self._alloc_buffers()
+                    self._register_buffers()
+                    self._open()
+                    self._jpeg_decoder.decode_host()
+                except BaseException:
+                    # A failed first frame leaves half-built GPU state behind;
+                    # tear it all down so retries get a clear 'Writer is
+                    # closed' instead of using partial buffers.
+                    self._abort()
+                    raise
             else:
                 # Wait for the previous frame's async decode to complete: its
                 # buffer is submitted to NVENC below (which reads it right
                 # away), and the phased decoder's slots are recycled every
                 # other frame.
-                driver.cuStreamSynchronize(self._decode_stream)
+                (err,) = driver.cuStreamSynchronize(self._decode_stream)
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise NvencError(f'Async decode of the previous frame failed: {err}')
                 width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
                 self._check_frame_consistent(width, height, subsampling)
                 self._jpeg_decoder.decode_host()
@@ -960,7 +994,9 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 if self._muxer is not None:
                     # Encode the last frame (still in the previous buffer)
                     if self._frame_idx > 0:
-                        driver.cuStreamSynchronize(self._decode_stream)
+                        (err,) = driver.cuStreamSynchronize(self._decode_stream)
+                        if err != driver.CUresult.CUDA_SUCCESS:
+                            raise NvencError(f'Async decode of the last frame failed: {err}')
                         last_buf = (self._current_buffer - 1) % self._num_yuv_buffers
                         self._encode_buffer(last_buf)
                     self._mux_packets(self._session.flush())

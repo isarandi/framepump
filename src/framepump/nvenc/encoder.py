@@ -119,6 +119,15 @@ class NvencEncoder:
         if self._closed:
             raise EncoderNotInitialized('Encoder has been closed')
 
+        if not isinstance(texture, int):
+            # A larger texture would otherwise be silently cropped to the
+            # encoder dimensions (raw GL ids cannot be checked).
+            if texture.size != (self._width, self._height):
+                raise ValueError(
+                    f'Texture size {texture.size} does not match encoder '
+                    f'dimensions ({self._width}, {self._height})'
+                )
+
         texture_id = _get_texture_id(texture)
         if self._staging_ids is None:
             self._create_staging_textures()
@@ -197,6 +206,8 @@ class NvencEncoder:
             self._gl.texture_storage_2d(staging_id, 1, GL_RGBA8, self._width, self._height)
         gl_error = self._gl.get_error()
         if gl_error != 0:
+            # Delete the created names so a failed allocation leaks nothing
+            self._gl.delete_textures(n, ids)
             raise NvencError(f'Failed to allocate staging textures (GL error 0x{gl_error:04X})')
         self._staging_ids = list(ids)
 

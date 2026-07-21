@@ -73,14 +73,18 @@ class NvjpegDecoder:
     """
 
     def __init__(self, gpu: int = 0):
+        # Defaults first, so __del__/close are safe if construction raises
+        self._closed = False
+        self._cuda_ctx = None
+        self._cuda_device = None
+        self._handle = nvjpegHandle_t()
+        self._state = nvjpegJpegState_t()
+
         if _lib is None:
             raise ImportError(
                 'nvJPEG library not available. '
                 'Ensure libnvjpeg.so is installed (part of CUDA toolkit).'
             )
-        self._handle = nvjpegHandle_t()
-        self._state = nvjpegJpegState_t()
-        self._closed = False
 
         self._cuda_device, self._cuda_ctx = retain_primary_context(gpu)
         try:
@@ -125,6 +129,9 @@ class NvjpegDecoder:
             - 2: 4:2:0
             - 6: grayscale
         """
+        if self._closed:
+            raise RuntimeError('Decoder is closed')
+
         n_components = c_int()
         subsampling = c_int()
         widths = (c_int * NVJPEG_MAX_COMPONENT)()
@@ -207,13 +214,21 @@ class NvjpegDecoder:
         return width, height
 
     def close(self):
-        """Release resources."""
+        """Release resources.
+
+        Synchronizes the last-used stream first: an async decode may still be
+        reading state that is about to be destroyed.
+        """
         if self._closed:
             return
         self._closed = True
 
         if self._cuda_ctx is not None:
             with cuda_ctx_pushed(self._cuda_ctx):
+                # An async decode may still be reading state that is about to
+                # be destroyed. Context-wide sync: the caller's stream handle
+                # may already be destroyed, so it cannot be synced by handle.
+                driver.cuCtxSynchronize()
                 self._cleanup_partial()
             driver.cuDevicePrimaryCtxRelease(self._cuda_device)
             self._cuda_ctx = None
@@ -270,6 +285,13 @@ class NvjpegPhasedDecoder:
                 the caller is responsible for providing a current CUDA context
                 around every call.
         """
+        # Defaults first, so __del__/close are safe if construction raises
+        self._closed = False
+        self._cuda_ctx = None
+        self._cuda_device = None
+        self._owns_cuda_ctx = gpu is not None
+        self._host_pending = False
+
         if _lib is None:
             raise ImportError(
                 'nvJPEG library not available. '
@@ -284,10 +306,6 @@ class NvjpegPhasedDecoder:
         self._device_buffer = nvjpegBufferDevice_t()
         # parse() rotates first, so the first frame lands in slot 0.
         self._slot = _NUM_SLOTS - 1
-        self._closed = False
-        self._cuda_ctx = None
-        self._cuda_device = None
-        self._owns_cuda_ctx = gpu is not None
 
         if gpu is not None:
             self._cuda_device, self._cuda_ctx = retain_primary_context(gpu)
@@ -414,13 +432,15 @@ class NvjpegPhasedDecoder:
         data_ptr, data_size = _get_data_ptr_and_size(jpeg_data)
 
         with self._ctx_guard():
-            # Rotate to the next slot and attach its pinned buffer, so this
-            # frame's CPU stages never touch the buffers that the previous
-            # frame's in-flight transfer still reads.
-            self._slot = (self._slot + 1) % _NUM_SLOTS
-            jpeg_stream = self._jpeg_streams[self._slot]
+            # This frame goes into the next slot, so its CPU stages never
+            # touch the buffers that the previous frame's in-flight transfer
+            # still reads. The rotation is committed only after a fully
+            # successful parse: a failed parse must not advance the slots
+            # (a retry could otherwise overwrite an in-flight slot).
+            next_slot = (self._slot + 1) % _NUM_SLOTS
+            jpeg_stream = self._jpeg_streams[next_slot]
             status = _lib.nvjpegStateAttachPinnedBuffer(
-                self._state, self._pinned_buffers[self._slot]
+                self._state, self._pinned_buffers[next_slot]
             )
             if status != NVJPEG_STATUS_SUCCESS:
                 raise RuntimeError(nvjpeg_status_message(status, 'Failed to attach pinned buffer'))
@@ -452,6 +472,8 @@ class NvjpegPhasedDecoder:
                     nvjpeg_status_message(status, 'Failed to get chroma subsampling')
                 )
 
+        self._slot = next_slot
+        self._host_pending = True
         self._parsed_width = width.value
         self._parsed_height = height.value
         self._parsed_subsampling = subsampling.value
@@ -465,6 +487,11 @@ class NvjpegPhasedDecoder:
         """
         if self._closed:
             raise RuntimeError('Decoder is closed')
+        if not self._host_pending:
+            # Would silently Huffman-decode a stale slot (e.g. after a failed
+            # parse) — the frame in the buffers would not be the caller's.
+            raise RuntimeError('decode_host() requires a successful parse() first')
+        self._host_pending = False
 
         with self._ctx_guard():
             status = _lib.nvjpegDecodeJpegHost(
@@ -586,12 +613,18 @@ class NvjpegPhasedDecoder:
         return self._parsed_subsampling
 
     def close(self):
-        """Release resources."""
+        """Release resources.
+
+        Synchronizes the context first: the async transfer/device stages may
+        still be reading buffers that are about to be destroyed (the caller's
+        stream handle may itself be gone, so syncing by handle is not safe).
+        """
         if self._closed:
             return
         self._closed = True
 
         with self._ctx_guard():
+            driver.cuCtxSynchronize()
             self._cleanup_partial()
 
         if self._owns_cuda_ctx and self._cuda_device is not None:

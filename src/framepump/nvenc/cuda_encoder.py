@@ -92,9 +92,11 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         self._staging_arrays: list[Any] | None = None
         self._registered_staging: list[c_void_p] = []
 
-        # Initialize CUDA context
+        # Initialize CUDA context. _cuda_ctx starts as None so __del__ stays
+        # safe if context acquisition itself raises.
         self._cuda_device = None
         self._owns_cuda_ctx = False
+        self._cuda_ctx: Any = None
         self._cuda_ctx = self._ensure_cuda_context()
 
         try:
@@ -110,6 +112,9 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
             )
         except Exception:
             self._release_owned_ctx()
+            # The context is gone; mark closed so __del__ doesn't push it
+            self._cuda_ctx = None
+            self._closed = True
             raise
 
     def _ensure_cuda_context(self) -> Any:
@@ -134,10 +139,17 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
             raise NvencError(f'Failed to get CUDA context: {err}')
 
         if ctx is not None and int(ctx) != 0:
-            # Use existing context (caller's responsibility to ensure it matches GL)
-            return ctx
+            if self._gpu is not None:
+                # An explicit ordinal overrides the current context if they
+                # disagree (e.g. torch active on another device).
+                err, current_device = driver.cuCtxGetDevice()
+                if err == driver.CUresult.CUDA_SUCCESS and int(current_device) == self._gpu:
+                    return ctx
+            else:
+                # Use existing context (caller ensures it matches GL)
+                return ctx
 
-        # No context — pick device: explicit ordinal or auto-detect from GL
+        # Pick device: explicit ordinal or auto-detect from GL
         if self._gpu is not None:
             err, device = driver.cuDeviceGet(self._gpu)
             if err != driver.CUresult.CUDA_SUCCESS:
@@ -244,6 +256,15 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         if self._closed:
             raise EncoderNotInitialized('Encoder has been closed')
 
+        if not isinstance(texture, int):
+            # A larger texture would otherwise be silently cropped to the
+            # encoder dimensions (raw GL ids cannot be checked).
+            if texture.size != (self._width, self._height):
+                raise ValueError(
+                    f'Texture size {texture.size} does not match encoder '
+                    f'dimensions ({self._width}, {self._height})'
+                )
+
         texture_id = self._get_texture_id(texture)
 
         with cuda_ctx_pushed(self._cuda_ctx):
@@ -291,11 +312,16 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         desc.NumChannels = 4
 
         arrays = []
-        for i in range(self._session.ring_size):
-            err, array = driver.cuArrayCreate(desc)
-            if err != driver.CUresult.CUDA_SUCCESS:
-                raise NvencError(f'Failed to allocate staging array {i}: {err}')
-            arrays.append(array)
+        try:
+            for i in range(self._session.ring_size):
+                err, array = driver.cuArrayCreate(desc)
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise NvencError(f'Failed to allocate staging array {i}: {err}')
+                arrays.append(array)
+        except BaseException:
+            for array in arrays:
+                driver.cuArrayDestroy(array)
+            raise
         self._staging_arrays = arrays
 
         for array in arrays:
@@ -342,6 +368,10 @@ class NvencCudaEncoder(AbstractContextManager['NvencCudaEncoder']):
         if self._closed:
             return
         self._closed = True
+
+        if self._cuda_ctx is None:
+            # Context acquisition failed during __init__; nothing to release
+            return
 
         with cuda_ctx_pushed(self._cuda_ctx):
             if self._session is not None:

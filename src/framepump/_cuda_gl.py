@@ -15,7 +15,11 @@ Example:
 
 from __future__ import annotations
 
+import warnings
+
 from cuda.bindings import driver  # type: ignore[attr-defined]
+
+from ._cuda_compat import cuda_ctx_pushed
 
 # OpenGL constants
 GL_TEXTURE_2D = 0x0DE1
@@ -55,6 +59,10 @@ class CudaToGLUploader:
                 f'Failed to register GL texture {self._texture_id} with CUDA: {err}'
             )
         self._resource = resource
+        # Unregistering must happen under the registering context; capture it
+        # so close()/GC from another thread can restore it.
+        err, ctx = driver.cuCtxGetCurrent()
+        self._owner_ctx = ctx if err == driver.CUresult.CUDA_SUCCESS and int(ctx) != 0 else None
 
     def upload(self, tensor) -> None:
         """Copy a CUDA tensor to the GL texture (GPU-to-GPU).
@@ -98,12 +106,27 @@ class CudaToGLUploader:
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f'Failed to copy CUDA→GL: {err}')
         finally:
-            driver.cuGraphicsUnmapResources(1, self._resource, 0)
+            (err,) = driver.cuGraphicsUnmapResources(1, self._resource, 0)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                # Never raise over an in-flight exception, but a failed unmap
+                # leaves the texture mapped to CUDA (GL access is then UB)
+                warnings.warn(f'Failed to unmap GL resource: {err}', RuntimeWarning, stacklevel=2)
 
     def close(self) -> None:
         """Unregister the GL texture from CUDA."""
         if self._resource is not None:
-            driver.cuGraphicsUnregisterResource(self._resource)
+            if self._owner_ctx is not None:
+                with cuda_ctx_pushed(self._owner_ctx):
+                    (err,) = driver.cuGraphicsUnregisterResource(self._resource)
+            else:
+                (err,) = driver.cuGraphicsUnregisterResource(self._resource)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                warnings.warn(
+                    f'Failed to unregister GL texture from CUDA: {err} '
+                    '(interop registration leaked)',
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             self._resource = None
 
     def __del__(self) -> None:

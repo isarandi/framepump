@@ -40,6 +40,7 @@ from __future__ import annotations
 import bisect
 import ctypes
 import itertools
+import threading
 import warnings
 from pathlib import Path
 from typing import Union
@@ -257,12 +258,14 @@ class VideoFramesCuda:
     def __init__(
         self,
         video_path: PathLike,
+        *,
         gpu: int = 0,
         dtype: DTypeLike = np.uint8,
         color_space: str = 'auto',
     ) -> None:
         self.path = str(video_path)
         self._gpu = gpu
+        self._npp_init_lock = threading.Lock()
 
         # Validate dtype.
         dtype = np.dtype(dtype)
@@ -385,7 +388,11 @@ class VideoFramesCuda:
         return self.original_fps / self._frame_range.step
 
     def close(self) -> None:
-        """Release GPU resources allocated for the NPP pipeline."""
+        """Release GPU resources allocated for the NPP pipeline.
+
+        The reader remains usable afterwards: the pipeline is re-created
+        lazily on the next iteration or indexed access.
+        """
         self._cleanup_npp()
 
     def __enter__(self) -> VideoFramesCuda:
@@ -403,6 +410,7 @@ class VideoFramesCuda:
         result = VideoFramesCuda.__new__(VideoFramesCuda)
         result.path = self.path
         result._gpu = self._gpu
+        result._npp_init_lock = threading.Lock()
         result.dtype = self.dtype
         result._source_format = self._source_format
         result._npp_mode = self._npp_mode
@@ -590,55 +598,58 @@ class VideoFramesCuda:
     # ── NPP pipeline ─────────────────────────────────────────────────
 
     def _init_npp_pipeline(self) -> None:
-        """Lazy-initialize NPP conversion resources."""
+        """Lazy-initialize NPP conversion resources (idempotent, thread-safe)."""
         if hasattr(self, '_npp_ctx'):
             return
-
-        from . import npp_bindings
-        from cuda.bindings import driver
-
-        # Initialize CUDA driver API (no-op if already initialized).
-        driver.cuInit(0)
-
-        # Retain the primary context for this GPU. It is made current only
-        # for the duration of the pipeline's own calls, never left current.
-        err, device = driver.cuDeviceGet(self._gpu)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'cuDeviceGet({self._gpu}) failed: {err}')
-        err, cuda_ctx = driver.cuDevicePrimaryCtxRetain(device)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
-        self._cuda_device = device
-        self._npp_cuda_ctx = cuda_ctx
-
-        try:
-            with cuda_ctx_pushed(cuda_ctx):
-                self._npp_bindings = npp_bindings
-
-                # Build NppStreamContext (uses default stream = 0).
-                self._npp_ctx = npp_bindings.make_npp_stream_context(self._gpu)
-
-                # Select color twist matrix.
-                if self._color_space == 'bt709':
-                    self._twist = npp_bindings.BT709_YUV_TO_RGB_16
-                else:
-                    self._twist = npp_bindings.BT601_YUV_TO_RGB_16
-
-                # Allocate reusable output buffer for iteration.
-                h, w = self.original_imshape
-                self._out_pitch = w * 3 * 2  # uint16 packed RGB: 3 ch * 2 bytes
-                buf_size = self._out_pitch * h
-                err, devptr = driver.cuMemAlloc(buf_size)
-                if err != driver.CUresult.CUDA_SUCCESS:
-                    raise RuntimeError(f'Failed to allocate NPP output buffer: {err}')
-                self._iter_buf_ptr = int(devptr)
-        except Exception:
-            driver.cuDevicePrimaryCtxRelease(device)
-            del self._cuda_device
-            del self._npp_cuda_ctx
+        with self._npp_init_lock:
             if hasattr(self, '_npp_ctx'):
-                del self._npp_ctx
-            raise
+                return
+
+            from . import npp_bindings
+            from cuda.bindings import driver
+
+            # Initialize CUDA driver API (no-op if already initialized).
+            driver.cuInit(0)
+
+            # Retain the primary context for this GPU. It is made current only
+            # for the duration of the pipeline's own calls, never left current.
+            err, device = driver.cuDeviceGet(self._gpu)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f'cuDeviceGet({self._gpu}) failed: {err}')
+            err, cuda_ctx = driver.cuDevicePrimaryCtxRetain(device)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
+
+            try:
+                with cuda_ctx_pushed(cuda_ctx):
+                    # Build NppStreamContext (uses default stream = 0).
+                    npp_ctx = npp_bindings.make_npp_stream_context(self._gpu)
+
+                    # Select color twist matrix.
+                    if self._color_space == 'bt709':
+                        twist = npp_bindings.BT709_YUV_TO_RGB_16
+                    else:
+                        twist = npp_bindings.BT601_YUV_TO_RGB_16
+
+                    # Allocate reusable output buffer for iteration.
+                    h, w = self.original_imshape
+                    out_pitch = w * 3 * 2  # uint16 packed RGB: 3 ch * 2 bytes
+                    err, devptr = driver.cuMemAlloc(out_pitch * h)
+                    if err != driver.CUresult.CUDA_SUCCESS:
+                        raise RuntimeError(f'Failed to allocate NPP output buffer: {err}')
+            except Exception:
+                driver.cuDevicePrimaryCtxRelease(device)
+                raise
+
+            # Publish only on full success; the sentinel (_npp_ctx) goes last
+            # so the unlocked fast path never sees a partial pipeline.
+            self._cuda_device = device
+            self._npp_cuda_ctx = cuda_ctx
+            self._npp_bindings = npp_bindings
+            self._twist = twist
+            self._out_pitch = out_pitch
+            self._iter_buf_ptr = int(devptr)
+            self._npp_ctx = npp_ctx
 
     def _cleanup_npp(self) -> None:
         """Free NPP pipeline GPU resources."""
@@ -660,6 +671,12 @@ class VideoFramesCuda:
             del self._cuda_device
         if ctx is not None:
             del self._npp_cuda_ctx
+        # Remove the lazy-init sentinel (and everything published with it) so
+        # the pipeline re-initializes on the next use instead of hitting
+        # AttributeError on the freed resources.
+        for attr in ('_npp_ctx', '_npp_bindings', '_twist', '_out_pitch'):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def _convert_frame_shared(self, frame) -> _GpuRgbBuffer:
         """Convert a frame into the reusable iteration buffer."""
@@ -686,15 +703,27 @@ class VideoFramesCuda:
             raise RuntimeError(f'Failed to allocate frame buffer: {err}')
         devptr = int(devptr)
 
-        self._do_convert(frame, devptr)
-        return _GpuRgbBuffer(
-            devptr,
-            h,
-            w,
-            pitch,
-            self._gpu,
-            owns_memory=True,
-        )
+        try:
+            self._do_convert(frame, devptr)
+            with cuda_ctx_pushed(self._npp_cuda_ctx):
+                # The NPP kernels run async on the default stream and read the
+                # decoder-owned frame memory; sync before the caller drops its
+                # frame/decoder references.
+                (err,) = driver.cuStreamSynchronize(0)
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f'cuStreamSynchronize failed: {err}')
+            return _GpuRgbBuffer(
+                devptr,
+                h,
+                w,
+                pitch,
+                self._gpu,
+                owns_memory=True,
+            )
+        except BaseException:
+            with cuda_ctx_pushed(self._npp_cuda_ctx):
+                driver.cuMemFree(devptr)
+            raise
 
     def _do_convert(self, frame, dst_ptr: int) -> None:
         """Dispatch NPP conversion based on mode and source format."""
@@ -787,7 +816,14 @@ def _plane_layouts(frame, num_planes: int, min_row_bytes: int, height: int) -> l
         strides = cai.get('strides')
         if strides:
             s0 = strides[0]
-            pitch = s0 if s0 >= min_row_bytes else s0 * itemsize
+            if itemsize == 1 or s0 < min_row_bytes:
+                pitch = s0 if s0 >= min_row_bytes else s0 * itemsize
+            else:
+                # Ambiguous window (small widths): s0 could be a byte pitch,
+                # or an element count that still exceeds the row byte width.
+                # Corroborate with the plane-pointer delta; raise rather than
+                # guess, per this function's contract.
+                pitch = _disambiguate_pitch(frame, num_planes, s0, itemsize, height)
         else:
             pitch = min_row_bytes
         if pitch < min_row_bytes or pitch % itemsize:
@@ -797,6 +833,30 @@ def _plane_layouts(frame, num_planes: int, min_row_bytes: int, height: int) -> l
             )
         result.append((ptr, pitch))
     return result
+
+
+def _disambiguate_pitch(frame, num_planes: int, s0: int, itemsize: int, height: int) -> int:
+    """Decide whether a reported stride is a byte pitch or an element count.
+
+    Uses the luma→chroma plane-pointer delta (pitch * plane height for the
+    contiguous allocations NVDEC produces) as the tiebreaker.
+    """
+    candidates = {s0, s0 * itemsize}
+    if len(candidates) == 1:
+        return s0
+    if num_planes >= 2:
+        try:
+            delta = frame.GetPtrToPlane(1) - frame.GetPtrToPlane(0)
+        except Exception:
+            delta = None
+        if delta is not None:
+            matching = [c for c in sorted(candidates) if delta == c * height]
+            if len(matching) == 1:
+                return matching[0]
+    raise RuntimeError(
+        f'Cannot determine whether the reported stride {s0} (itemsize {itemsize}) '
+        f'is a byte pitch or an element count; refusing to guess.'
+    )
 
 
 def _plane_layouts_from_deltas(frame, num_planes: int, min_row_bytes: int, height: int) -> list:
@@ -881,6 +941,11 @@ class _GpuRgbBuffer:
         self._strides_arr = (ctypes.c_int64 * 3)(width * 3, 3, 1)
 
     def __dlpack__(self, *args, **kwargs):
+        if self._owns_memory is False and self._devptr == 0:
+            raise RuntimeError(
+                'This buffer already handed its memory to a previous __dlpack__ '
+                'export; it cannot be exported again.'
+            )
         mt = _DLManagedTensor()
         mt.dl_tensor.data = self._devptr
         mt.dl_tensor.device = _DLDevice(2, self._gpu_id)  # kDLCUDA
@@ -1014,7 +1079,10 @@ _PyCapsule_SetName.argtypes = [ctypes.py_object, ctypes.c_char_p]
 # Prevent-GC store: maps integer keys to tuples of Python objects that must
 # stay alive until the DLPack consumer calls the deleter.
 _prevent_gc_store: dict[int, tuple] = {}
-_prevent_gc_counter = itertools.count()
+# Keys start at 1: key 0 stored into the c_void_p manager_ctx field becomes
+# NULL and reads back as None, so the deleter's pop() would never find it and
+# the entry (decoder session or GPU buffer) would be pinned forever.
+_prevent_gc_counter = itertools.count(1)
 
 
 # ── _GpuRgbBuffer deleters (module-level to survive GC) ──────────────

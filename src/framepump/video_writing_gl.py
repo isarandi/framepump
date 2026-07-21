@@ -239,6 +239,18 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
                 'or an object with size/width/height attributes.'
             )
 
+        # The NVENC session hardcodes H.264 with preset P4; reject config
+        # values it cannot honor instead of silently encoding something else.
+        if self._encoder_config.codec != 'h264':
+            raise ValueError(
+                f'GLVideoWriter only encodes H.264, got codec={self._encoder_config.codec!r}'
+            )
+        if self._encoder_config.preset not in (None, 'p4'):
+            raise ValueError(
+                f'GLVideoWriter only supports preset p4 (or None), '
+                f'got preset={self._encoder_config.preset!r}'
+            )
+
         # Create the NVENC encoder first - this is the most likely step to fail
         # (e.g., GL context on wrong GPU). Fail before creating files on disk.
         encoder_kwargs = dict(

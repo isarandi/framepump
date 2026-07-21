@@ -135,19 +135,23 @@ class NvencEncodeSession:
         self._pending_inputs: dict[int, tuple[c_void_p, Callable[[], None] | None]] = {}
 
         self._open_session(device_type, device, open_error_hint)
-        self._configure(width, height, fps, crf, gop, bframes, dar_size, tune_config)
+        try:
+            self._configure(width, height, fps, crf, gop, bframes, dar_size, tune_config)
 
-        # Ring sizing from the *finalized* config: the encoder may hold
-        # frameIntervalP - 1 frames for reordering plus lookaheadDepth for
-        # lookahead, and one more submission is in flight; one extra slot
-        # of margin.
-        config = self._config
-        if config.rcParams.rcFlags & _RC_FLAG_ENABLE_LOOKAHEAD:
-            lookahead = config.rcParams.lookaheadDepth
-        else:
-            lookahead = 0
-        self._ring_size = config.frameIntervalP + lookahead + 1
-        self._create_bitstream_buffers()
+            # Ring sizing from the *finalized* config: the encoder may hold
+            # frameIntervalP - 1 frames for reordering plus lookaheadDepth for
+            # lookahead, and one more submission is in flight; one extra slot
+            # of margin.
+            config = self._config
+            if config.rcParams.rcFlags & _RC_FLAG_ENABLE_LOOKAHEAD:
+                lookahead = config.rcParams.lookaheadDepth
+            else:
+                lookahead = 0
+            self._ring_size = config.frameIntervalP + lookahead + 1
+            self._create_bitstream_buffers()
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def ring_size(self) -> int:
@@ -312,6 +316,9 @@ class NvencEncodeSession:
 
         status = self._api.nvEncEncodePicture(self._encoder, byref(pic_params))
         if status not in (NV_ENC_SUCCESS, NV_ENC_ERR_NEED_MORE_INPUT):
+            # Roll back the submission slot: nothing was submitted for it, so a
+            # later flush must not lock its (never-filled) bitstream buffer.
+            self._next_submit = bs_idx
             self._api.nvEncUnmapInputResource(self._encoder, mapped_resource)
             if cleanup is not None:
                 cleanup()

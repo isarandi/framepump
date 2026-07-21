@@ -179,3 +179,55 @@ def test_invalid_chroma_rejected():
         pytest.skip('JpegVideoWriterCUDA not available (no CUDA)')
     with pytest.raises(ValueError, match='chroma'):
         writer_cls(chroma='422p')
+
+
+@needs_gpu
+class TestSequenceAbortOnException:
+    def test_exception_in_sequence_context_leaves_no_file(self, tmp_path):
+        from framepump import JpegVideoWriterCUDA
+
+        out = tmp_path / 'aborted.mp4'
+        writer = JpegVideoWriterCUDA(gpu=0)
+        with pytest.raises(RuntimeError, match='simulated'):
+            with writer.start_sequence(str(out), fps=30):
+                writer.append_data(make_jpeg(320, 240, 0, PIL_420))
+                writer.append_data(make_jpeg(320, 240, 1, PIL_420))
+                raise RuntimeError('simulated failure')
+        assert not out.exists()
+        assert not list(tmp_path.glob('*.tmp_*'))
+
+    def test_writer_usable_after_aborted_sequence(self, tmp_path):
+        from framepump import JpegVideoWriterCUDA, VideoFrames
+
+        aborted = tmp_path / 'aborted.mp4'
+        good = tmp_path / 'good.mp4'
+        writer = JpegVideoWriterCUDA(gpu=0)
+        with pytest.raises(RuntimeError, match='simulated'):
+            with writer.start_sequence(str(aborted), fps=30):
+                writer.append_data(make_jpeg(320, 240, 0, PIL_420))
+                raise RuntimeError('simulated failure')
+        with writer.start_sequence(str(good), fps=30):
+            for i in range(4):
+                writer.append_data(make_jpeg(320, 240, i, PIL_420))
+        writer.close()
+        assert not aborted.exists()
+        assert len(VideoFrames(str(good))) == 4
+
+
+@needs_gpu
+class TestFailedFirstFrame:
+    def test_corrupt_first_jpeg_fails_cleanly(self, tmp_path):
+        from framepump import JpegVideoWriterCUDA
+
+        out = tmp_path / 'out.mp4'
+        writer = JpegVideoWriterCUDA(str(out), fps=30)
+        with pytest.raises(Exception):
+            writer.append_data(b'\xff\xd8\xff\xe0garbage-not-a-jpeg')
+        # A retry must fail with a clear error, never ZeroDivisionError or
+        # nonsense geometry comparisons against a never-accepted first frame.
+        with pytest.raises((RuntimeError, ValueError)) as excinfo:
+            writer.append_data(make_jpeg(320, 240, 0, PIL_420))
+        assert not isinstance(excinfo.value, ZeroDivisionError)
+        assert '0x0' not in str(excinfo.value)
+        assert not out.exists()
+        assert not list(tmp_path.glob('*.tmp_*'))

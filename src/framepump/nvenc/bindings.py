@@ -428,7 +428,15 @@ class NV_ENC_MAP_INPUT_RESOURCE(Structure):
 
 
 class NV_ENC_CODEC_PIC_PARAMS(Union):
-    _fields_ = [('reserved', c_uint32 * 256)]
+    # The SDK union holds NV_ENC_PIC_PARAMS_{H264,HEVC,AV1} alongside the
+    # reserved array; the pointer-bearing codec structs make it 1544 bytes
+    # with 8-byte alignment. The codec structs are not bound (this codebase
+    # never sets per-picture codec params), so a pointer-typed filler
+    # mirrors their size and alignment instead.
+    _fields_ = [
+        ('reserved', c_uint32 * 256),
+        ('_codec_params_size', c_void_p * 193),
+    ]
 
 
 class NV_ENC_PIC_PARAMS(Structure):
@@ -450,15 +458,20 @@ class NV_ENC_PIC_PARAMS(Structure):
         ('codecPicParams', NV_ENC_CODEC_PIC_PARAMS),
         ('meHintCountsPerBlock', NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE * 2),
         ('meExternalHints', c_void_p),
-        ('reserved1', c_uint32 * 6),
-        ('reserved2', c_void_p * 2),
+        ('reserved2', c_uint32 * 7),
+        ('reserved5', c_void_p * 2),
         ('qpDeltaMap', c_void_p),
         ('qpDeltaMapSize', c_uint32),
         ('reservedBitFields', c_uint32),
         ('meHintRefPicDist', c_uint16 * 2),
+        ('reserved4', c_uint32),
         ('alphaBuffer', c_void_p),
-        ('reserved3', c_uint32 * 286),
-        ('reserved4', c_void_p * 59),
+        ('meExternalSbHints', c_void_p),
+        ('meSbHintsCount', c_uint32),
+        ('stateBufferIdx', c_uint32),
+        ('outputReconBuffer', c_void_p),
+        ('reserved3', c_uint32 * 284),
+        ('reserved6', c_void_p * 57),
     ]
 
 

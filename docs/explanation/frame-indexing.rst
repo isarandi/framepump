@@ -162,3 +162,15 @@ One Python-protocol subtlety: ``list(frames)`` calls ``len()`` as a
 preallocation hint before iterating, which builds the index. A ``for`` loop
 or comprehension over the same view streams without it.
 
+Reverse Iteration
+-----------------
+
+Slices with negative step (``frames[::-1]``, ``frames[100:10:-3]``) decode
+in chunks: the selected frames are walked from the end, and each chunk is
+decoded forward through the normal machinery (seeking, CFR mapping and all
+fallbacks behave identically), buffered, and yielded in reverse. Chunk
+starts prefer frames that are their own safe seek point, so each chunk's
+seek lands exactly where decoding must begin; the chunk length is bounded
+by a memory budget (chunks are held in memory while being reversed). For
+large step magnitudes the per-frame seeking path is used instead, walking
+the range backward directly.

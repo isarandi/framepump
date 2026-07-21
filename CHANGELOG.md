@@ -169,6 +169,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds, CFR mode and reverse iteration build it on first use, once, shared across all
   views. Note that `list(frames)` calls `len()` as a preallocation hint and therefore
   builds the index; a `for` loop or comprehension streams without it.
+- Negative-step slicing: `frames[::-1]`, `frames[100:10:-3]` and friends iterate in
+  reverse, decoded internally as memory-bounded forward chunks anchored at keyframes
+  (large step magnitudes use per-frame seeking). Composes with slicing, CFR mode,
+  `repeat_each_frame()`, resizing and all dtypes; `VideoFramesCuda` still rejects
+  negative steps.
 - File-like objects (anything with `read`/`seek`/`tell`, e.g. `BytesIO`) are accepted as
   video sources by `VideoFrames`. `BytesIO` sources support multiple concurrently active
   iterators; other file-like objects support one.

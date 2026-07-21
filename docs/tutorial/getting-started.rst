@@ -80,7 +80,9 @@ Slicing
 -------
 
 Slicing is lazy — it returns a new :class:`~framepump.VideoFrames` without
-reading any pixel data:
+reading any pixel data. Negative steps are supported: ``frames[::-1]``
+iterates the video backwards (decoded internally in forward chunks, so it
+stays efficient and memory-bounded):
 
 .. code-block:: python
 

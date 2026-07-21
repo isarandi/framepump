@@ -42,6 +42,10 @@ _SEEK_UNRELIABLE_CODECS = frozenset({'mpeg1video', 'mpeg2video', 'mpeg4', 'fic',
 # index and seek, which amortizes better than decoding and discarding.
 _STREAM_MAX_SKIP = 256
 
+# Reverse iteration buffers one chunk of decoded frames at a time; the chunk
+# frame count is derived from this budget (clamped to [4, 64] frames).
+_REVERSE_CHUNK_BYTES = 256 * 1024 * 1024
+
 
 class _LazyIndexState:
     """Frame-index state shared between a VideoFrames and all its views.
@@ -343,9 +347,6 @@ class VideoFrames:
                     'frames.repeat_each_frame(3)[::2].'
                 )
 
-            if item.step is not None and item.step < 0:
-                raise ValueError('Negative step not supported. Use list(frames)[::-1] instead.')
-
             if item.step == 0:
                 raise ValueError('slice step cannot be zero')
 
@@ -478,12 +479,18 @@ class VideoFrames:
         slice_stop = frame_range.stop
         slice_step = frame_range.step
 
-        # Large step: more efficient to seek to each frame individually
-        # Threshold is lower with PyAV since seeking is fast (~10ms vs ~100ms)
-        if slice_step > 30:
+        # Large step (either direction): more efficient to seek to each frame
+        # individually. Threshold is lower with PyAV since seeking is fast
+        # (~10ms vs ~100ms). range() iterates backward natively for step < 0.
+        if abs(slice_step) > 30:
             return self._iter_with_individual_seeks(
                 reader, slice_start, slice_stop, slice_step, internal_dtype
             )
+
+        # Small negative step: chunked reverse (buffer forward windows,
+        # yield them reversed)
+        if slice_step < 0:
+            return self._iter_reversed(reader, frame_range, internal_dtype)
 
         # Use index-based seeking if we have an offset
         if slice_start > 0:
@@ -492,6 +499,65 @@ class VideoFrames:
             )
 
         return self._iter_sequential(reader, slice_stop, slice_step, internal_dtype)
+
+    def _iter_reversed(
+        self,
+        reader: PyAVReader,
+        frame_range: range,
+        internal_dtype: DTypeLike,
+    ) -> Generator[NDArray, None, None]:
+        """Iterate a negative-step range via backward chunks decoded forward.
+
+        Walks the selected frames from the end in chunks; each chunk is a
+        forward sub-range decoded through the normal forward machinery (so
+        seeking, CFR mapping and all fallbacks behave identically), buffered,
+        and yielded in reverse. Chunk starts prefer frames that are their own
+        safe seek point (keyframes), so each chunk's seek is cheap; the chunk
+        length is bounded by a memory budget since a chunk is held in memory.
+        """
+        fwd = frame_range[::-1]
+        min_chunk, max_chunk, fallback_chunk = self._reverse_chunk_bounds(internal_dtype)
+
+        pos = len(fwd)
+        while pos > 0:
+            lo = self._pick_reverse_chunk_start(fwd, pos, min_chunk, max_chunk, fallback_chunk)
+            buf = list(self._iter_decoded(reader, fwd[lo:pos], internal_dtype))
+            yield from reversed(buf)
+            pos = lo
+
+    def _reverse_chunk_bounds(self, internal_dtype: DTypeLike) -> tuple[int, int, int]:
+        """(min, max, fallback) chunk lengths for reverse iteration.
+
+        Derived from a byte budget so 4K chunks stay reasonable; clamped to
+        the empirically tuned 32-64 frame window from the original
+        implementation where memory allows.
+        """
+        h, w = self.imshape
+        itemsize = 1 if internal_dtype == np.uint8 else 2
+        frame_bytes = max(h * w * 3 * itemsize, 1)
+        max_chunk = max(4, min(64, _REVERSE_CHUNK_BYTES // frame_bytes))
+        min_chunk = max(1, max_chunk // 2)
+        return min_chunk, max_chunk, (min_chunk + max_chunk) // 2
+
+    def _pick_reverse_chunk_start(
+        self, fwd: range, hi_pos: int, min_chunk: int, max_chunk: int, fallback_chunk: int
+    ) -> int:
+        """Position in ``fwd`` where the next (backward) chunk should start.
+
+        Searches the window [hi_pos - max_chunk, hi_pos - min_chunk] backward
+        for a selected frame that is its own safe seek point; falls back to a
+        fixed chunk length when none is found.
+        """
+        lo_limit = max(hi_pos - max_chunk, 0)
+        for p in range(max(hi_pos - min_chunk, 0), lo_limit - 1, -1):
+            if p == 0 or self._is_safe_seek_frame(fwd[p]):
+                return p
+        return max(hi_pos - fallback_chunk, 0)
+
+    def _is_safe_seek_frame(self, abs_idx: int) -> bool:
+        """Whether this output frame's source is its own safe seek point."""
+        src = self._abs_to_source(abs_idx)
+        return self._index.frame_pts[src] == self._index.safe_seek_pts[src]
 
     def _iter_sequential(
         self,

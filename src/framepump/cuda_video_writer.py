@@ -37,7 +37,7 @@ from .nvenc.bindings import (
 from .nvenc.exceptions import NvencError
 from .nvjpeg import NvjpegPhasedDecoder
 from .nvjpeg.bindings import NVJPEG_CSS_420, NVJPEG_CSS_444
-from .video_writing import AbstractVideoWriter, VideoOutput
+from .video_writing import AbstractVideoWriter, SequenceContext, VideoOutput
 
 PathLike = Union[str, Path]
 
@@ -404,24 +404,6 @@ class JpegVideoWriterCUDA(
             self.close()
         else:
             self._abort()
-
-
-class SequenceContext(AbstractContextManager['SequenceContext']):
-    """Context for a video sequence being written.
-
-    On clean exit the sequence is finalized; if the body raised, the sequence
-    is aborted instead, so no partial file appears at the final path. The
-    writer remains usable for a new ``start_sequence`` either way.
-    """
-
-    def __init__(self, multiwriter: JpegVideoWriterCUDA) -> None:
-        self.multiwriter = multiwriter
-
-    def __exit__(self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any) -> None:
-        if exc_type is None:
-            self.multiwriter.end_sequence()
-        else:
-            self.multiwriter._abort()
 
 
 @dataclass(frozen=True)

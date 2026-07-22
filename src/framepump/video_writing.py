@@ -56,8 +56,11 @@ class AbstractVideoWriter(ABC, Generic[T]):
         gpu: bool | int = False,
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
-    ) -> None:
+    ) -> SequenceContext:
         """Start a new video sequence.
+
+        Returns a ``SequenceContext`` usable as a context manager: it ends the
+        sequence on clean exit and aborts it if the body raised.
 
         Args:
             video_path: Output path (str/Path) or file-like object (BinaryIO).
@@ -101,6 +104,24 @@ class Message:
     """Base class for queue messages."""
 
     pass
+
+
+class SequenceContext(AbstractContextManager['SequenceContext']):
+    """Context for a video sequence being written.
+
+    On clean exit the sequence is finalized; if the body raised, the sequence
+    is aborted instead, so no partial file appears at the final path. The
+    writer remains usable for a new ``start_sequence`` either way.
+    """
+
+    def __init__(self, multiwriter) -> None:
+        self.multiwriter = multiwriter
+
+    def __exit__(self, exc_type: type[BaseException] | None, *args: Any, **kwargs: Any) -> None:
+        if exc_type is None:
+            self.multiwriter.end_sequence()
+        else:
+            self.multiwriter._abort()
 
 
 class _WriterState(Enum):
@@ -197,8 +218,11 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         gpu: bool | int | None = None,
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
-    ) -> None:
+    ) -> SequenceContext:
         """Start a new video sequence.
+
+        Returns a ``SequenceContext`` usable as a context manager: it ends the
+        sequence on clean exit and aborts it if the body raised.
 
         Args:
             video_output: Output path (str/Path) or file-like object (BinaryIO).
@@ -237,6 +261,21 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
             )
         )
         self._accepts_new_frames = True
+        return SequenceContext(self)
+
+    def _abort(self) -> None:
+        """Discard the current sequence (no file at the final path).
+
+        The writer stays usable for a new ``start_sequence``. Used by
+        SequenceContext and __exit__ when the body raised.
+        """
+        if not self._accepts_new_frames:
+            return
+        self._consume_stale_feedback()
+        msg = AbortSequence()
+        self._put_checked(msg)
+        self._accepts_new_frames = False
+        self._wait_for_confirmation(msg)
 
     def append_data(self, data: NDArray) -> None:
         """Append a frame to the current video sequence.
@@ -267,6 +306,9 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
 
         if not block:
             return
+        self._wait_for_confirmation(msg)
+
+    def _wait_for_confirmation(self, msg: Message) -> None:
         while True:
             try:
                 feedback = self._feedback_queue.get(timeout=0.5)
@@ -360,6 +402,19 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
             # On Ctrl+C, don't wait for pending work
             self.shutdown()
+        elif exc_type is not None:
+            # An exception escaped the with-block: discard the in-flight
+            # sequence instead of promoting a partial file to the final path
+            # (matching GLVideoWriter and JpegVideoWriterCUDA). Secondary
+            # errors must not mask the original exception.
+            try:
+                self._abort()
+            except Exception:
+                pass
+            try:
+                self.close()
+            except Exception:
+                pass
         else:
             self.close()
 
@@ -497,6 +552,11 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                         encoder_config=msg.encoder_config,
                         format=msg.format,
                     )
+                elif isinstance(msg, AbortSequence):
+                    if writer is not None:
+                        writer._abort()
+                        writer = None
+                    self._feedback_queue.put(EndSequenceDone(msg))
                 elif isinstance(msg, EndSequence):
                     if writer is not None:
                         writer.close()
@@ -1148,6 +1208,12 @@ class StartSequence(Message):
 @dataclass
 class AppendFrame(Message):
     frame: NDArray
+
+
+class AbortSequence(Message):
+    """Discard the current sequence: no file appears at the final path."""
+
+    pass
 
 
 class EndSequence(Message):

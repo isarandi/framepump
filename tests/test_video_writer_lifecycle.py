@@ -349,3 +349,55 @@ class TestWorkerErrorTypePreserved:
         with pytest.raises(NoAudioStreamError):
             call_with_timeout(lambda: writer.end_sequence(block=True))
         call_with_timeout(writer.close)
+
+
+class TestSequenceContextAndAbort:
+    """start_sequence returns a context manager; exceptions abort the sequence."""
+
+    def test_sequence_context_finalizes_on_clean_exit(self, tmp_path):
+        video_path = tmp_path / 'out.mp4'
+        writer = VideoWriter()
+        with writer.start_sequence(str(video_path), fps=30):
+            for _ in range(3):
+                writer.append_data(good_frame())
+        assert not writer.accepts_new_frames
+        assert len(VideoFrames(str(video_path))) == 3
+        call_with_timeout(writer.close)
+        assert no_temp_files(tmp_path)
+
+    def test_sequence_context_aborts_on_exception(self, tmp_path):
+        video_path = tmp_path / 'out.mp4'
+        writer = VideoWriter()
+        with pytest.raises(RuntimeError, match='boom'):
+            with writer.start_sequence(str(video_path), fps=30):
+                writer.append_data(good_frame())
+                raise RuntimeError('boom')
+        assert not video_path.exists()
+        assert no_temp_files(tmp_path)
+        assert not writer.accepts_new_frames
+
+        # Writer stays usable for a new sequence after the abort
+        with writer.start_sequence(str(video_path), fps=30):
+            writer.append_data(good_frame())
+        assert video_path.exists()
+        call_with_timeout(writer.close)
+
+    def test_writer_exit_aborts_inflight_sequence_on_exception(self, tmp_path):
+        video_path = tmp_path / 'out.mp4'
+        with pytest.raises(RuntimeError, match='boom'):
+            with VideoWriter(str(video_path), fps=30) as writer:
+                writer.append_data(good_frame())
+                raise RuntimeError('boom')
+        assert not video_path.exists()
+        assert no_temp_files(tmp_path)
+
+    def test_writer_exit_exception_not_masked_by_abort_failure(self, tmp_path):
+        """The body's exception propagates even if the worker already died."""
+        video_path = tmp_path / 'out.mp4'
+        with pytest.raises(RuntimeError, match='boom'):
+            with VideoWriter(str(video_path), fps=30) as writer:
+                writer.append_data(np.zeros((49, 49, 3), np.uint8))  # odd dims: worker fails
+                wait_for_worker_death(writer)
+                raise RuntimeError('boom')
+        assert not video_path.exists()
+        assert no_temp_files(tmp_path)

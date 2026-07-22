@@ -17,7 +17,7 @@ import simplepyutils as spu
 
 from ._h264_mux import H264PassthroughMuxer
 from .encoder_config import EncoderConfig
-from .video_writing import AbstractVideoWriter, VideoOutput
+from .video_writing import AbstractVideoWriter, SequenceContext, VideoOutput
 
 if TYPE_CHECKING:
     import moderngl
@@ -93,8 +93,11 @@ class GLVideoWriter(
         gpu: bool | int = True,
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
-    ) -> None:
+    ) -> SequenceContext:
         """Start a new video sequence.
+
+        Returns a ``SequenceContext`` usable as a context manager: it ends the
+        sequence on clean exit and aborts it if the body raised.
 
         Args:
             video_output: Output path (str/Path) or file-like object (BinaryIO).
@@ -129,6 +132,7 @@ class GLVideoWriter(
             gpu=gpu,
         )
         self._accepts_new_frames = True
+        return SequenceContext(self)
 
     def append_data(self, data: moderngl.Texture) -> None:
         """Append a GL texture to the current video sequence.
@@ -157,6 +161,12 @@ class GLVideoWriter(
             self._writer = None
         self._accepts_new_frames = False
 
+    def _abort(self) -> None:
+        if self._writer is not None:
+            self._writer._abort()
+            self._writer = None
+        self._accepts_new_frames = False
+
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
@@ -166,10 +176,7 @@ class GLVideoWriter(
         if exc_type is None:
             self.close()
         else:
-            if self._writer is not None:
-                self._writer._abort()
-                self._writer = None
-            self._accepts_new_frames = False
+            self._abort()
 
 
 class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):

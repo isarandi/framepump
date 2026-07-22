@@ -108,15 +108,16 @@ class TestNumFramesMethods:
 class TestGrayscaleHandling:
     """Test behavior with grayscale input."""
 
-    def test_write_grayscale_fails(self, tmp_path):
-        """Writing grayscale frames should fail or be handled."""
+    def test_write_grayscale_replicates_channels(self, tmp_path):
+        """(H, W) grayscale input is accepted and replicated to 3 channels."""
         video_path = tmp_path / 'gray.mp4'
 
-        # This should probably fail since the writer expects RGB
-        with pytest.raises(Exception):
-            with VideoWriter(str(video_path), fps=10) as writer:
-                frame = np.zeros((64, 64), dtype=np.uint8)  # 2D, not 3D
-                writer.append_data(frame)
+        with VideoWriter(str(video_path), fps=10) as writer:
+            writer.append_data(np.full((64, 64), 200, dtype=np.uint8))
+
+        frame = VideoFrames(str(video_path))[0]
+        assert frame.shape == (64, 64, 3)
+        assert abs(int(frame.mean()) - 200) <= 2
 
 
 class TestNonContiguousArrays:

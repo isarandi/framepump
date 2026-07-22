@@ -708,6 +708,12 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
 
     def _prepare_frame(self, frame: NDArray) -> NDArray:
         """Normalize an incoming frame before validation and encoding."""
+        # Accept grayscale input by replicating to 3 channels (symmetric
+        # with VideoFrames(gray=True) on the reading side)
+        if frame.ndim == 2:
+            frame = frame[:, :, None]
+        if frame.ndim == 3 and frame.shape[2] == 1:
+            frame = np.repeat(frame, 3, axis=2)
         # Convert float to uint16 for high precision encoding
         if np.issubdtype(frame.dtype, np.floating):
             return _float_to_uint16(frame)
@@ -883,6 +889,22 @@ class DepthVideoWriter(VideoWriter):
     """
 
     _sequence_writer_cls = None  # bound below
+
+    def __init__(self, *args: Any, gpu: bool | int = False, **kwargs: Any) -> None:
+        if gpu:
+            raise ValueError(
+                'DepthVideoWriter is CPU-only (FFV1 has no hardware encoder); '
+                'remove the gpu argument'
+            )
+        super().__init__(*args, gpu=False, **kwargs)
+
+    def start_sequence(self, *args: Any, gpu: bool | int | None = None, **kwargs: Any):
+        if gpu:
+            raise ValueError(
+                'DepthVideoWriter is CPU-only (FFV1 has no hardware encoder); '
+                'remove the gpu argument'
+            )
+        return super().start_sequence(*args, gpu=False, **kwargs)
 
 
 class _DepthSequenceWriter(SequenceWriter):
@@ -1214,6 +1236,14 @@ def _nvenc_available() -> bool:
 
 def _float_to_uint16(frame: NDArray) -> NDArray:
     """Convert float frame [0,1] to uint16 [0,65535] for high precision encoding."""
+    # Raw depth/label arrays fed by accident would silently clip to white;
+    # tolerate float rounding jitter just past the bounds.
+    if float(np.max(frame, initial=0.0)) > 1.001 or float(np.min(frame, initial=0.0)) < -0.001:
+        warnings.warn(
+            'Float frames are expected in [0, 1]; values outside this range are '
+            'clipped. Scale your data (e.g. divide by its maximum) before writing.',
+            stacklevel=3,
+        )
     # Scale in float32: under NEP 50 promotion (numpy >= 2), float16 * 65535
     # stays float16 and overflows to inf, which the uint16 cast maps to 0.
     scaled = frame.astype(np.float32, copy=False) * np.float32(65535)

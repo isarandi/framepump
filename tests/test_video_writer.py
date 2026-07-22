@@ -629,3 +629,44 @@ class TestClearErrorMessages:
             writer.append_data(np.zeros((64, 64, 3), np.uint8))
         assert video_path.exists()
 
+
+class TestGrayscaleInput:
+    """(H, W) and (H, W, 1) frames are accepted and replicated to 3 channels."""
+
+    def test_2d_and_3d_single_channel(self, tmp_path):
+        video_path = tmp_path / 'gray.mp4'
+        with VideoWriter(str(video_path), fps=10) as writer:
+            writer.append_data(np.full((64, 64), 128, np.uint8))
+            writer.append_data(np.full((64, 64, 1), 128, np.uint8))
+        frames = list(VideoFrames(str(video_path)))
+        assert len(frames) == 2
+        assert frames[0].shape == (64, 64, 3)
+        assert abs(int(frames[0].mean()) - 128) <= 2
+
+    def test_gray_float_roundtrip(self, tmp_path):
+        video_path = tmp_path / 'grayf.mp4'
+        with VideoWriter(str(video_path), fps=10) as writer:
+            writer.append_data(np.full((64, 64), 0.5, np.float32))
+        frame = VideoFrames(str(video_path))[0]
+        assert frame.shape == (64, 64, 3)
+
+
+class TestFloatRangeWarning:
+    def test_out_of_range_warns(self, tmp_path):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with VideoWriter(str(tmp_path / 'f.mp4'), fps=10) as writer:
+                writer.append_data(np.full((64, 64, 3), 3.7, np.float32))
+        assert any('clipped' in str(w.message) for w in caught)
+
+    def test_in_range_does_not_warn(self, tmp_path):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with VideoWriter(str(tmp_path / 'f.mp4'), fps=10) as writer:
+                writer.append_data(np.full((64, 64, 3), 0.5, np.float32))
+                writer.append_data(np.ones((64, 64, 3), np.float32))
+        assert not any('clipped' in str(w.message) for w in caught)

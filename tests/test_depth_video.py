@@ -104,3 +104,20 @@ class TestMkvContainerAlias:
             for i in range(5):
                 writer.append_data(np.full((64, 64, 3), i * 40, np.uint8))
         assert len(VideoFrames(str(path))) == 5
+
+
+class TestDepthGpuRejected:
+    """FFV1 has no hardware encoder; a gpu request must fail loudly instead of
+    being silently ignored."""
+
+    def test_constructor_rejects_gpu(self, tmp_path):
+        with pytest.raises(ValueError, match='CPU-only'):
+            DepthVideoWriter(str(tmp_path / 'd.mkv'), fps=5, gpu=True)
+
+    def test_start_sequence_rejects_gpu(self, tmp_path):
+        writer = DepthVideoWriter()
+        try:
+            with pytest.raises(ValueError, match='CPU-only'):
+                writer.start_sequence(str(tmp_path / 'd.mkv'), fps=5, gpu=True)
+        finally:
+            writer.close()

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `VideoFrames(gpu=True)` silently decoded on the CPU: the CUDA hwaccel flags it
+  passed to `av.open()` are ffmpeg CLI options that the libav libraries ignore, so
+  since the 0.2.0 PyAV rewrite no GPU decoding ever happened (the 0.1.x ffmpeg-
+  subprocess implementation did decode on GPU). Decoding now uses PyAV's HWAccel
+  API for real NVDEC decoding, verified by decoder utilization and by construction:
+  software fallback is disabled, so `gpu=True` either decodes on the GPU or raises.
+  Output is bit-identical to CPU decoding (NVDEC's semi-planar frames are repacked
+  losslessly so RGB conversion uses the same swscale path), including 10-bit
+  streams, slicing and reverse iteration. The codec allowlist and FLV blocklist
+  probe are gone — FFmpeg itself reports NVDEC compatibility at open time, without
+  the extra probe open.
+
 - Random access on streams whose containers misreport keyframes (screen codecs like
   FIC/VMware, open-GOP MPEG-1/2 in TS/raw containers, packed-B MPEG-4) silently
   returned different pixels than iteration — up to near-garbage frames. `VideoFrames`
@@ -140,9 +152,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `codec='h265'` silently encoded H.264).
 - `CudaToGLUploader` rejects tensors with wrong dtype, device, shape or memory layout
   instead of silently producing garbled textures.
+- Streams whose decoder emits frames in a different order than the packet index implies
+  (broken muxers, non-monotonic PTS) could return wrong frames on indexed/sliced access.
+  Frame emission is now checked during decoding (free for well-behaved files: it reuses
+  the frames already being decoded) and on any mismatch the access transparently degrades
+  to decode-from-start, which is always correct.
+- `VideoFramesCuda`: files NVDEC cannot actually decode (e.g. VP8 with resolution
+  changes) raise `VideoDecodeError` instead of silently yielding zero frames or raw
+  internal exceptions; interlaced JPEG streams, which NVDEC decodes at half height,
+  are detected and raise instead of returning distorted frames.
+- `trim_video` with an empty time range (`start == end`, or end before start) failed
+  with a confusing `FileNotFoundError`, and a start time past the end of the video
+  silently produced a one-frame video; both now raise a clear `ValueError`.
+- `VideoWriter`: an exception inside the `with` block finalized the partially written
+  sequence to the final path; the in-flight sequence is now discarded (matching the
+  GL/CUDA writers), and the writer remains usable afterwards.
+- `VideoWriter(gpu=True)` with uint16/float frames produced a broken encode attempt
+  deep inside NVENC; it now raises a clear `ValueError` up front (h264_nvenc is 8-bit
+  only).
+- Codec/container mismatches (e.g. H.264 into `.webm`) and other libav-level encoder
+  setup failures surfaced as raw `av` errors; they are now wrapped in
+  `VideoEncodeError`, and no partial file is left behind.
+- `JpegVideoWriterCUDA`: bytes that are not a decodable JPEG raise
+  `ValueError('Could not parse JPEG data: ...')` instead of a confusing internal
+  `NvencError`/`RuntimeError` (nvJPEG "successfully" parses some garbage as 0x0).
+- `VideoWriter.append_data` with a non-array argument (e.g. a list or string) raises
+  `TypeError` immediately in the caller's thread instead of killing the worker.
+- libx265 printed its build-info banner to stderr on every CPU HEVC encode; it is now
+  silenced (encoder errors are still shown).
+- Truncated videos with interleaved audio recovered only a fraction of their
+  decodable frames: the corrupt tail of the audio stream ended demuxing for the
+  video stream too. Non-video streams are now discarded at the demuxer level, so
+  recovery matches the ffmpeg CLI (e.g. one broken sample: 105 frames instead of
+  30) — and intact multi-stream files skip the demuxer work for streams that are
+  never read.
+- `DepthVideoWriter` silently ignored a `gpu=` request (FFV1 has no hardware
+  encoder); it now raises a clear `ValueError`.
+- Float frames with values outside [0, 1] (e.g. raw depth in meters) silently
+  clipped to white; writing such frames now emits a warning explaining the
+  expected range.
+- Documentation: the lazy-evaluation and frame-accurate-processing pages still
+  described the old eager packet-index construction (the index is built lazily on
+  first use); the README's 10-bit example wrote the same gradient to two channels
+  (`gradient.T` of a 1-D array is a no-op) and omitted `DepthVideoWriter` from the
+  overview. Also documented that metadata (`len()`, `fps`) can succeed on damaged
+  files whose frames later fail to decode; that `num_frames()` defaults to a
+  duration-based estimate (use `exact=True` or `len(VideoFrames(...))`); the
+  `seekable` parameter; `VideoWriter`'s `gpu`/`encoder_config` arguments;
+  `GLVideoWriter`'s expected texture type; that `VideoFramesCuda` output is not
+  bit-identical to CPU decoding (unlike `VideoFrames(gpu=True)`, which is); that
+  `resized()` stretches without preserving aspect ratio; and that `.fps` reflects
+  slicing/repetition. The GPU-acceleration page no longer claims FLV cannot be
+  GPU-decoded (it can, since FFmpeg 8).
 
 ### Changed
 
+- PyAV >= 17.1 is now required (previously unpinned, developed against 12.x):
+  needed for the HWAccel decoding API and `Stream.discard`, and the bundled
+  FFmpeg is now the 8.x generation.
+  Adjustments for FFmpeg 8: format/resize filter graphs are built from the first
+  decoded frame's actual properties instead of stream metadata; illegal 'reserved'
+  color metadata emitted by some decoders is sanitized to 'unspecified' before
+  conversion (FFmpeg 8's colorspace-managed swscale rejects it, e.g. some ProRes
+  files); conversion errors for colorspaces swscale cannot convert (DXV3's YCgCo)
+  and truncated-tail demuxer errors during frame counting are wrapped into
+  `VideoDecodeError` instead of leaking raw `av` errors. The pin stays below av 18,
+  which drops Python 3.10.
 - Errors from `VideoWriter`'s background thread are re-raised with their original
   exception type (e.g. `ValueError` for a bad frame, `VideoEncodeError` for encoder
   failures) instead of being wrapped in a `RuntimeError`; the worker traceback is
@@ -201,6 +276,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - File-like objects (anything with `read`/`seek`/`tell`, e.g. `BytesIO`) are accepted as
   video sources by `VideoFrames`. `BytesIO` sources support multiple concurrently active
   iterators; other file-like objects support one.
+- `VideoWriter.append_data` accepts grayscale `(H, W)` and `(H, W, 1)` frames by
+  replicating to 3 channels, symmetric with `VideoFrames(gray=True)` on the
+  reading side.
+- `start_sequence()` on all writers returns a context manager: on clean exit it ends
+  the sequence, and if the body raised it aborts it, leaving no file at the output
+  path (previously only `JpegVideoWriterCUDA` supported this).
 - `IndexBuildError` and `FilterConfigError` are exported from the package root.
 
 ## [0.2.0] - 2026-03-09

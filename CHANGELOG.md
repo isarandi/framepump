@@ -191,6 +191,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Float frames with values outside [0, 1] (e.g. raw depth in meters) silently
   clipped to white; writing such frames now emits a warning explaining the
   expected range.
+- Palettized (pal8) video from palette-carrying codecs (QuickTime RLE/SMC,
+  RSCC screen capture) decoded to a single flat color: seeking a container to 0
+  before decoding wipes the decoder's palette state, and every read path did
+  exactly that on freshly opened containers. Fresh containers are no longer
+  seeked at all (they are already at the start), which also removes a spurious
+  trailing decode error on raw VC-1 streams and a stale-position bug where an
+  MPEG-PS packet index built after the seekability probe missed half the file.
+- Containers that flag every packet as a keyframe (screen/animation codecs like
+  Cinepak and CamStudio) silently returned wrong pixels on deep indexed access:
+  the shallow seek-verification probe sampled only early frames. Both codecs are
+  now content-verified, and files claiming dense keyframes get two deeper
+  (budget-capped) probe positions; sparse-GOP files pay nothing extra.
+- Streams where packets and frames are not 1:1 (multi-frame packets, flushed
+  frames, no-op packets, duplicate timestamps) had a wrong `len()`, and in the
+  worst case iterating after `len()` lost frames (an SMV file dropped 10 of 12).
+  A full streaming pass now reconciles the index against the observed frame
+  count, and duplicate packet timestamps trigger a decoder-verified rebuild -
+  both free for well-behaved files. `len()` before any decode remains
+  packet-based (exact for 1:1 streams, the overwhelming majority).
+- `len()` on raw VVC bitstreams leaked raw internal `av` errors
+  (`PatchWelcomeError`); all decoder-side failures during sequential frame
+  counting are now tolerated like truncation, ending in typed errors.
+- Interlaced 4:2:0 content decoded with progressive chroma upsampling, smearing
+  color between the two fields (the scale filter's legacy default). Conversion
+  is now field-aware exactly for interlaced-flagged frames - matching FFmpeg 8's
+  frame-based swscale API and PyAV's `to_ndarray` - and bit-identical to before
+  on all progressive content.
 - Documentation: the lazy-evaluation and frame-accurate-processing pages still
   described the old eager packet-index construction (the index is built lazily on
   first use); the README's 10-bit example wrote the same gradient to two channels

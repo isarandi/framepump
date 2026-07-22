@@ -35,7 +35,32 @@ __all__ = [
 # (screen codecs) or whose GOP structure defeats keyframe seeking (open-GOP
 # MPEG-1/2, packed-B MPEG-4). Seeking is content-verified for these when the
 # index is built and disabled when it does not reproduce sequential decode.
-_SEEK_UNRELIABLE_CODECS = frozenset({'mpeg1video', 'mpeg2video', 'mpeg4', 'fic', 'vmnc'})
+_SEEK_UNRELIABLE_CODECS = frozenset(
+    {
+        'mpeg1video',
+        'mpeg2video',
+        'mpeg4',
+        'fic',
+        'vmnc',
+        'cavs',
+        'ansi',
+        'rv10',
+        'rv20',
+        'rv30',
+        'rv40',
+    }
+)
+
+
+class _SeekPathUnsound(Exception):
+    """Internal: a PTS regression was observed during a seek-based access
+    before the target frame was delivered; the caller retries sequentially."""
+
+
+class _RetrySequential(Exception):
+    """Internal: decoding after a real seek failed before anything was
+    delivered; the caller disables seeking for the file and retries."""
+
 
 # Streaming (decode-from-start-and-skip, no index) is used for forward
 # selections whose start is at most this many frames; larger starts build the
@@ -60,6 +85,7 @@ class _LazyIndexState:
         'cfr_source_map',
         'seek_disabled',
         'pts_unreliable',
+        'emission_disorder',
         'seekable_probed',
     )
 
@@ -72,6 +98,9 @@ class _LazyIndexState:
         # True when decoded frame PTS cannot be trusted for locating frames
         # (the index had to synthesize timestamps); frame counting is used
         self.pts_unreliable = False
+        # True when a display-order PTS regression was observed in decoder
+        # output: sorted-PTS frame location is unsound for this video
+        self.emission_disorder = False
         # Cached container-seekability auto-probe verdict (None = not probed)
         self.seekable_probed: bool | None = None
 
@@ -221,6 +250,10 @@ class VideoFrames:
                         f'recorded {len(frame_range)} for this range'
                     ),
                 )
+            if reader.pts_regression_seen and not self._lazy.seek_disabled:
+                # Observed in-band and remembered, so future seek-based access
+                # is served from decoder output instead of sorted PTS
+                self._flag_emission_disorder()
         finally:
             reader.close()
 
@@ -244,6 +277,8 @@ class VideoFrames:
             for frame in self._convert_and_repeat(raw):
                 yield frame
                 count += 1
+            if reader.pts_regression_seen and not self._lazy.seek_disabled:
+                self._flag_emission_disorder()
         finally:
             reader.close()
 
@@ -332,10 +367,34 @@ class VideoFrames:
                 # seeking), so rebuild it from what the decoder produces.
                 self._rebuild_index_from_decode()
 
+            # A PTS regression observed during earlier (index-less) streaming
+            # means sorted-PTS location is unsound: use decoder output instead
+            if self._lazy.emission_disorder:
+                self._lazy.seek_disabled = True
+                self._rebuild_index_from_decode()
+
             # In CFR mode, all behavior (count, indexing, iteration, seeking)
             # derives from this single output-index -> source-index map.
             if self.constant_framerate:
                 self._lazy.cfr_source_map = self._build_cfr_source_map()
+
+    def _degrade_to_sequential(self) -> None:
+        """Seeking or PTS-based frame location proved unsound for this video.
+
+        Disables seeking, rebuilds the index from actual decoder output
+        (count-based access then matches iteration, the ground truth), and
+        refreshes the CFR map. The verdict is shared by all views; healthy
+        videos never reach this path, so they pay nothing.
+        """
+        self._lazy.seek_disabled = True
+        if self._lazy.index is not None:
+            self._rebuild_index_from_decode()
+            if self.constant_framerate:
+                self._lazy.cfr_source_map = self._build_cfr_source_map()
+
+    def _flag_emission_disorder(self) -> None:
+        self._lazy.emission_disorder = True
+        self._degrade_to_sequential()
 
     @overload
     def __getitem__(self, item: int) -> NDArray: ...
@@ -637,6 +696,43 @@ class VideoFrames:
         # Get target PTS and seek to safe position (keyframe before target)
         target_pts_frac = self._index.get_frame_pts_fraction(slice_start)
         safe_pts_frac = self._index.safe_seek_pts[slice_start]
+        watch_disorder = not self._lazy.seek_disabled
+        try:
+            yield from self._iter_with_seek_attempt(
+                reader,
+                slice_start,
+                slice_stop,
+                slice_step,
+                internal_dtype,
+                target_pts_frac,
+                safe_pts_frac,
+                watch_disorder,
+            )
+            return
+        except _SeekPathUnsound:
+            self._flag_emission_disorder()
+        except _RetrySequential:
+            self._degrade_to_sequential()
+        # Retry against the rebuilt, decoder-ordered index (safe seeks are
+        # now all zero and matching is count-based, mirroring iteration).
+        # Only reachable before the first yield, so no frames are duplicated.
+        reader._reopen()
+        yield from self._iter_with_seek(
+            reader, slice_start, slice_stop, slice_step, internal_dtype
+        )
+
+    def _iter_with_seek_attempt(
+        self,
+        reader: PyAVReader,
+        slice_start: int,
+        slice_stop: int,
+        slice_step: int,
+        internal_dtype: DTypeLike,
+        target_pts_frac,
+        safe_pts_frac,
+        watch_disorder: bool,
+    ) -> Generator[NDArray, None, None]:
+        max_frames = slice_stop - slice_start
         reader.seek_to_time(safe_pts_frac)
 
         # Build filter graph
@@ -647,15 +743,36 @@ class VideoFrames:
         target_pts_float = float(target_pts_frac)
         time_base = reader.time_base
         reached_target = False
+        # See _decode_at_source_once: accepting the target earlier than this
+        # many emissions means out-of-order decoder output
+        min_skips = slice_start - bisect_left(self._index.frame_pts, safe_pts_frac)
 
         frame_count = 0
         skip_count = 0
-        for frame in reader.decode_raw():
+        frames = reader.decode_raw()
+        while True:
+            # The skip phase (nothing yielded yet) is safely retryable: a PTS
+            # regression or a decode failure after a real seek both trigger a
+            # sequential retry in the caller.
+            try:
+                frame = next(frames)
+            except StopIteration:
+                break
+            except VideoDecodeError:
+                if (
+                    not reached_target
+                    and not self._lazy.seek_disabled
+                    and float(safe_pts_frac) > 0
+                ):
+                    raise _RetrySequential() from None
+                raise
             # Check if we've reached the target frame. Match by PTS if available,
             # otherwise by decoded-frame count (timestampless streams, e.g. raw
             # H.264 elementary streams, where the index has synthetic PTS and
             # decoding starts from frame 0).
             if not reached_target:
+                if watch_disorder and reader.pts_regression_seen:
+                    raise _SeekPathUnsound()
                 usable_pts = frame.pts is not None and not self._pts_unreliable
                 frame_pts = Fraction(frame.pts) * time_base if usable_pts else None
                 if not (
@@ -664,6 +781,8 @@ class VideoFrames:
                 ):
                     skip_count += 1
                     continue
+                if watch_disorder and frame_pts is not None and skip_count < min_skips:
+                    raise _SeekPathUnsound()
                 reached_target = True
 
             # Process frame through filter graph
@@ -685,10 +804,38 @@ class VideoFrames:
         internal_dtype: DTypeLike,
     ) -> Generator[NDArray, None, None]:
         """Iterate with seeking in CFR mode: walk the source map from the slice start."""
+        try:
+            yield from self._iter_with_seek_cfr_attempt(
+                reader, slice_start, slice_stop, slice_step, internal_dtype
+            )
+            return
+        except _SeekPathUnsound:
+            self._flag_emission_disorder()
+        except _RetrySequential:
+            self._degrade_to_sequential()
+        # Retry against the rebuilt, decoder-ordered index and refreshed CFR
+        # map. Only reachable before the first yield: no frames are duplicated.
+        reader._reopen()
+        yield from self._iter_with_seek_cfr(
+            reader, slice_start, slice_stop, slice_step, internal_dtype
+        )
+
+    def _iter_with_seek_cfr_attempt(
+        self,
+        reader: PyAVReader,
+        slice_start: int,
+        slice_stop: int,
+        slice_step: int,
+        internal_dtype: DTypeLike,
+    ) -> Generator[NDArray, None, None]:
         source_map = self._cfr_source_map
         first_source = source_map[slice_start]
         safe_pts_frac = self._index.safe_seek_pts[first_source]
         target_pts_frac = self._index.frame_pts[first_source]
+        watch_disorder = not self._lazy.seek_disabled
+        # See _decode_at_source_once: accepting the target earlier than this
+        # many emissions means out-of-order decoder output
+        min_skips = first_source - bisect_left(self._index.frame_pts, safe_pts_frac)
         reader.seek_to_time(safe_pts_frac)
 
         target_format = self._pix_target(internal_dtype)
@@ -707,8 +854,23 @@ class VideoFrames:
         prev_frame_arr = None
 
         skip_count = 0
-        for frame in reader.decode_raw():
+        frames = reader.decode_raw()
+        while True:
+            try:
+                frame = next(frames)
+            except StopIteration:
+                break
+            except VideoDecodeError:
+                if (
+                    not reached_target
+                    and not self._lazy.seek_disabled
+                    and float(safe_pts_frac) > 0
+                ):
+                    raise _RetrySequential() from None
+                raise
             if not reached_target:
+                if watch_disorder and reader.pts_regression_seen:
+                    raise _SeekPathUnsound()
                 # Match by PTS if available, otherwise by decoded-frame count
                 # (timestampless streams, e.g. raw H.264 elementary streams).
                 usable_pts = frame.pts is not None and not self._pts_unreliable
@@ -719,6 +881,8 @@ class VideoFrames:
                 ):
                     skip_count += 1
                     continue
+                if watch_disorder and frame_pts is not None and skip_count < min_skips:
+                    raise _SeekPathUnsound()
                 reached_target = True
                 source_idx = first_source
 
@@ -813,6 +977,14 @@ class VideoFrames:
         if internal_dtype is None:
             internal_dtype = np.uint8 if self.dtype == np.uint8 else np.uint16
 
+        if source_idx >= self._index.frame_count:
+            # Reachable when a view resolved its length against the packet
+            # index before a disorder trigger shrank it to decoder output
+            raise IndexError(
+                f'Frame {source_idx} is out of range: {self.path} decodes to '
+                f'{self._index.frame_count} frames'
+            )
+
         # Get safe seek point and target PTS
         safe_pts_frac = self._index.safe_seek_pts[source_idx]
         target_pts_frac = self._index.frame_pts[source_idx]
@@ -823,36 +995,81 @@ class VideoFrames:
             reader = self._create_reader()
 
         try:
-            # Seek to safe point (keyframe before target)
-            reader.seek_to_time(safe_pts_frac)
-
-            # Build filter graph for exact FFmpeg compatibility
-            target_format = self._pix_target(internal_dtype)
-            graph = reader._build_filter_graph(self.resized_imshape, target_format)
-
-            # Decode frames until we reach the target PTS
-            target_pts_float = float(target_pts_frac)
-            time_base = reader.time_base
-
-            frame_count = 0
-            for frame in reader.decode_raw():
-                usable_pts = frame.pts is not None and not self._pts_unreliable
-                frame_pts = Fraction(frame.pts) * time_base if usable_pts else None
-                # Match by PTS if available, otherwise by frame count (for attached pictures etc.)
-                if (
-                    frame_pts is not None and float(frame_pts) >= target_pts_float - 1e-6
-                ) or frame_count == source_idx:
-                    graph.push(frame)
-                    filtered_frame = graph.pull()
-                    return filtered_frame.to_ndarray()
-                frame_count += 1
-
-            raise VideoDecodeError(
-                self.path, source_idx, RuntimeError(f'Failed to decode frame {source_idx}')
+            try:
+                return self._decode_at_source_once(
+                    reader, source_idx, safe_pts_frac, target_pts_frac, internal_dtype
+                )
+            except _SeekPathUnsound:
+                # PTS regression observed before delivery: the sorted-PTS
+                # match would return the wrong frame. Degrade (shared verdict)
+                # and retry against the rebuilt, decoder-ordered index.
+                self._flag_emission_disorder()
+            except VideoDecodeError:
+                if self._lazy.seek_disabled or float(safe_pts_frac) <= 0:
+                    raise
+                # Decoding after a real seek failed (some containers cannot
+                # resume mid-stream even though sequential decode works);
+                # remember and retry from the start.
+                self._degrade_to_sequential()
+            reader._reopen()
+            source_idx = min(source_idx, self._index.frame_count - 1)
+            return self._decode_at_source_once(
+                reader,
+                source_idx,
+                self._index.safe_seek_pts[source_idx],
+                self._index.frame_pts[source_idx],
+                internal_dtype,
             )
         finally:
             if own_reader:
                 reader.close()
+
+    def _decode_at_source_once(
+        self,
+        reader: PyAVReader,
+        source_idx: int,
+        safe_pts_frac: Fraction,
+        target_pts_frac: Fraction,
+        internal_dtype: DTypeLike,
+    ) -> NDArray:
+        """One seek-and-match attempt; raises _SeekPathUnsound on a PTS
+        regression observed before the target frame was delivered."""
+        # Seek to safe point (keyframe before target)
+        reader.seek_to_time(safe_pts_frac)
+
+        # Build filter graph for exact FFmpeg compatibility
+        target_format = self._pix_target(internal_dtype)
+        converter = reader.frame_converter(self.resized_imshape, target_format)
+
+        # Decode frames until we reach the target PTS
+        target_pts_float = float(target_pts_frac)
+        time_base = reader.time_base
+        watch_disorder = not self._lazy.seek_disabled
+        # After a seek to the safe point, the target must arrive at exactly
+        # source_idx - safe_pos emissions. Arriving EARLIER means the decoder
+        # emitted a future frame ahead of order (leading extra frames only
+        # ever inflate the count, so this cannot false-trigger on open GOPs).
+        min_skips = source_idx - bisect_left(self._index.frame_pts, safe_pts_frac)
+
+        frame_count = 0
+        for frame in reader.decode_raw():
+            if watch_disorder and reader.pts_regression_seen:
+                raise _SeekPathUnsound()
+            usable_pts = frame.pts is not None and not self._pts_unreliable
+            frame_pts = Fraction(frame.pts) * time_base if usable_pts else None
+            # Match by PTS if available, otherwise by frame count (for attached pictures etc.)
+            if (
+                frame_pts is not None and float(frame_pts) >= target_pts_float - 1e-6
+            ) or frame_count == source_idx:
+                if watch_disorder and frame_pts is not None and frame_count < min_skips:
+                    raise _SeekPathUnsound()
+                filtered_frame = converter.convert(frame)
+                return filtered_frame.to_ndarray()
+            frame_count += 1
+
+        raise VideoDecodeError(
+            self.path, source_idx, RuntimeError(f'Failed to decode frame {source_idx}')
+        )
 
     def _seek_reproduces_sequential(self) -> bool:
         """Check whether seek-based access decodes the same pixels as iteration.

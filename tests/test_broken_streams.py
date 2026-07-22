@@ -105,3 +105,41 @@ class TestStreamErrors:
             VideoFrames(path)
         assert issubclass(NoVideoStreamError, FramePumpError)
         assert issubclass(UnsupportedCodecError, FramePumpError)
+
+
+class TestRuntimeDisorderTrigger:
+    """With the suspect list disabled, runtime detection alone must deliver
+    correct frames: the seek path self-detects PTS disorder while decoding
+    (at no cost to well-behaved files) and degrades to decode-from-start."""
+
+    @pytest.fixture(autouse=True)
+    def _no_suspect_list(self, monkeypatch):
+        from framepump import _core
+
+        monkeypatch.setattr(_core, '_SEEK_UNRELIABLE_CODECS', frozenset())
+
+    def test_indexed_first_access_is_correct(self):
+        path = str(DATA_DIR / 'unreliable_seek.ts')
+        vf = VideoFrames(path)
+        frame2 = vf[2].copy()  # indexed access before any sequential iteration
+        seq = [f.copy() for f in VideoFrames(path)]
+        assert np.array_equal(frame2, seq[2])
+        assert vf._lazy.seek_disabled, 'runtime trigger must have degraded this file'
+
+    def test_slice_after_trigger_is_correct(self):
+        path = str(DATA_DIR / 'unreliable_seek.ts')
+        vf = VideoFrames(path)
+        seq = [f.copy() for f in VideoFrames(path)]
+        got = [f.copy() for f in vf[3:6]]
+        assert len(got) == 3
+        for a, b in zip(got, seq[3:6]):
+            assert np.array_equal(a, b)
+
+    def test_out_of_range_after_trigger_raises_clean_index_error(self):
+        path = str(DATA_DIR / 'unreliable_seek.ts')
+        vf = VideoFrames(path)
+        stale_len = len(vf)  # packet-index length, resolved before the trigger
+        vf[2]  # triggers degradation; the rebuilt index has fewer frames
+        with pytest.raises(IndexError, match='out of range'):
+            vf[stale_len - 1]
+

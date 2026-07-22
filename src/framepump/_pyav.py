@@ -276,6 +276,8 @@ class PyAVReader:
                 )
         finally:
             probe.close()
+        # Sticky: set when decode_raw observes display-order PTS regressing
+        self.pts_regression_seen: bool = False
 
     @property
     def seekable(self) -> bool:
@@ -499,8 +501,17 @@ class PyAVReader:
         containers).
         """
         count = 0
+        prev_pts = None
         try:
             for frame in self._container.decode(self._stream):
+                if frame.pts is not None:
+                    if prev_pts is not None and frame.pts < prev_pts:
+                        # Decoders emit display order, so PTS should never
+                        # regress; a regression means emission order and
+                        # sorted-PTS order disagree, which breaks PTS-based
+                        # frame location. Callers consult this flag.
+                        self.pts_regression_seen = True
+                    prev_pts = frame.pts
                 yield frame
                 count += 1
         except av.error.EOFError:

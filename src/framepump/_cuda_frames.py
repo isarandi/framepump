@@ -60,7 +60,11 @@ from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
 from ._cuda_compat import cuda_ctx_pushed
-from ._pyav import PyAVReader, UnsupportedCodecError
+from ._pyav import (
+    PyAVReader,
+    UnsupportedCodecError,
+    VideoDecodeError,
+)
 from ._selection import FrameSelection
 
 PathLike = Union[str, Path]
@@ -112,6 +116,10 @@ _NVDEC_CODECS = {
 # the NVDEC parser
 _ANNEXB_FILTERS = {'h264': 'h264_mp4toannexb', 'hevc': 'hevc_mp4toannexb'}
 
+# Raw PyNvVideoCodec exceptions, wrapped into VideoDecodeError wherever the
+# decoder is driven (unsupported profiles, reconfiguration limits, ...)
+_NVC_ERRORS = (nvc.PyNvVCException, nvc.PyNvVCExceptionUnsupported)
+
 
 class _PyAVPacketSource:
     """Demux packets with PyAV and present them as NVDEC PacketData.
@@ -144,10 +152,13 @@ class _PyAVPacketSource:
         self._bsf = self._make_bsf()
 
     def packets(self):
-        """Yield NVDEC PacketData for the remaining packets."""
+        """Yield NVDEC PacketData for the remaining packets.
+
+        Packets without timestamps (raw elementary streams) are fed too —
+        skipping them would starve the parser entirely; their PacketData pts
+        stays 0 and callers must use positional access for such streams.
+        """
         for packet in self._container.demux(self._stream):
-            if packet.pts is None and packet.dts is None:
-                continue
             filtered = self._bsf.filter(packet) if self._bsf is not None else (packet,)
             for fp in filtered:
                 data = bytes(fp)
@@ -241,27 +252,42 @@ class _NvDecSession:
         codec_name: str,
         output_color_type,
     ) -> None:
+        self._path = video_path
         self._src = _PyAVPacketSource(video_path, codec_name)
-        self._dec = nvc.CreateDecoder(
-            gpuid=gpu,
-            codec=codec,
-            usedevicememory=True,
-            outputColorType=output_color_type,
-            latency=nvc.DisplayDecodeLatencyType.LOW,
-        )
+        try:
+            self._dec = nvc.CreateDecoder(
+                gpuid=gpu,
+                codec=codec,
+                usedevicememory=True,
+                outputColorType=output_color_type,
+                latency=nvc.DisplayDecodeLatencyType.LOW,
+            )
+        except _NVC_ERRORS as e:
+            raise VideoDecodeError(video_path, 0, e) from e
 
     def _decode_all(self):
-        """Feed every remaining packet and flush; yield (pts, frame)."""
-        for pd in self._src.packets():
-            for f in self._dec.Decode(pd):
-                yield f.getPTS(), f
-        empty = nvc.PacketData()
-        while True:
-            frames = self._dec.Decode(empty)
-            if not frames:
-                break
-            for f in frames:
-                yield f.getPTS(), f
+        """Feed every remaining packet and flush; yield (pts, frame).
+
+        NVDEC/driver errors (unsupported profile, mid-stream reconfiguration
+        beyond limits, ...) are wrapped so callers never see raw
+        PyNvVideoCodec exceptions.
+        """
+        count = 0
+        try:
+            for pd in self._src.packets():
+                for f in self._dec.Decode(pd):
+                    count += 1
+                    yield f.getPTS(), f
+            empty = nvc.PacketData()
+            while True:
+                frames = self._dec.Decode(empty)
+                if not frames:
+                    break
+                for f in frames:
+                    count += 1
+                    yield f.getPTS(), f
+        except _NVC_ERRORS as e:
+            raise VideoDecodeError(self._path, count, e) from e
 
     def iter_from_start(self):
         """Decode all frames sequentially from the beginning.
@@ -366,6 +392,7 @@ class VideoFramesCuda:
         # never needs it. Shared with all views cloned from this instance.
         self._lazy = _CudaLazyIndexState()
         self._selection = FrameSelection.identity()
+        self._dims_checked = False
 
         # Probe source pixel format (needs one decoded NATIVE frame).
         self._source_format = self._probe_source_format()
@@ -450,15 +477,46 @@ class VideoFramesCuda:
         step = streamable.step or 1
 
         frame_count = 0
+        yielded = 0
         for _pts, frame in session.iter_from_start():
             if stop is not None and frame_count >= stop:
                 break
             if frame_count >= start and (frame_count - start) % step == 0:
+                self._check_decoded_dims(frame)
                 if convert:
                     yield self._convert_frame_shared(frame)
                 else:
                     yield frame
+                yielded += 1
             frame_count += 1
+        if yielded == 0 and frame_count == 0 and (stop is None or stop > 0) and start == 0:
+            # The decoder produced nothing for a nonempty request — silence
+            # here would look like a valid empty video
+            raise VideoDecodeError(self.path, 0, RuntimeError('NVDEC decoder produced no frames'))
+
+    def _check_decoded_dims(self, frame) -> None:
+        """Detect decoders returning unexpected dimensions (e.g. NVDEC
+        splitting interlaced MJPEG into half-height fields) instead of
+        silently yielding wrong-shaped frames. Checked once per instance;
+        only the RGB path is checked (the NPP path validates plane layouts).
+        """
+        if self._dims_checked or self._npp_mode is not None:
+            return
+        self._dims_checked = True
+        views = frame.cuda()
+        view = views[0] if isinstance(views, (list, tuple)) else views
+        shape = view.__cuda_array_interface__['shape']
+        expected = self.original_imshape
+        if tuple(shape[:2]) != expected:
+            raise VideoDecodeError(
+                self.path,
+                0,
+                RuntimeError(
+                    f'NVDEC decoded frames of size {shape[1]}x{shape[0]} but the '
+                    f'container reports {expected[1]}x{expected[0]} (interlaced '
+                    f'field decoding?). Use the CPU VideoFrames class for this file.'
+                ),
+            )
 
     def __getitem__(self, item):
         if isinstance(item, int):
@@ -560,6 +618,7 @@ class VideoFramesCuda:
         result._chroma_is_444 = self._chroma_is_444
         result._colorspace_id = self._colorspace_id
         result._selection = self._selection
+        result._dims_checked = self._dims_checked
         # Index state is shared: whichever view builds it, all views see it
         result._lazy = self._lazy
         # NPP pipeline state is NOT shared — each clone initializes lazily.
@@ -610,29 +669,34 @@ class VideoFramesCuda:
         """
         # Create a fresh packet source + decoder per seek for clean state.
         src = _PyAVPacketSource(self.path, self._codec_name)
-        dec = nvc.CreateDecoder(
-            gpuid=self._gpu,
-            codec=self._codec,
-            usedevicememory=True,
-            outputColorType=self._color_type,
-            latency=nvc.DisplayDecodeLatencyType.LOW,
-        )
+        try:
+            dec = nvc.CreateDecoder(
+                gpuid=self._gpu,
+                codec=self._codec,
+                usedevicememory=True,
+                outputColorType=self._color_type,
+                latency=nvc.DisplayDecodeLatencyType.LOW,
+            )
 
-        if self._index.seekable and safe_pts > 0:
-            src.seek(safe_pts)
+            if self._index.seekable and safe_pts > 0:
+                src.seek(safe_pts)
 
-        for pd in src.packets():
-            for f in dec.Decode(pd):
-                if f.getPTS() >= target_pts:
-                    return f, dec
-        empty = nvc.PacketData()
-        while True:
-            frames = dec.Decode(empty)
-            if not frames:
-                break
-            for f in frames:
-                if f.getPTS() >= target_pts:
-                    return f, dec
+            for pd in src.packets():
+                for f in dec.Decode(pd):
+                    if f.getPTS() >= target_pts:
+                        self._check_decoded_dims(f)
+                        return f, dec
+            empty = nvc.PacketData()
+            while True:
+                frames = dec.Decode(empty)
+                if not frames:
+                    break
+                for f in frames:
+                    if f.getPTS() >= target_pts:
+                        self._check_decoded_dims(f)
+                        return f, dec
+        except _NVC_ERRORS as e:
+            raise VideoDecodeError(self.path, 0, e) from e
         raise RuntimeError(f'Failed to decode frame at PTS {target_pts} (seeked to {safe_pts})')
 
     def _wrap_frame(self, frame, dec, *, owns_memory: bool):
@@ -674,12 +738,17 @@ class VideoFramesCuda:
         step = frame_range.step
 
         frame_count = 0
+        yielded = 0
         for _pts, frame in session.iter_from_start():
             if frame_count >= stop:
                 break
             if frame_count >= start and (frame_count - start) % step == 0:
+                self._check_decoded_dims(frame)
                 yield self._emit(frame, owned)
+                yielded += 1
             frame_count += 1
+        if yielded == 0 and frame_count == 0 and stop > start:
+            raise VideoDecodeError(self.path, 0, RuntimeError('NVDEC decoder produced no frames'))
 
     def _iter_with_seek(self, frame_range: range, *, owned: bool = False):
         """Path B: seek to start, then sequential with step."""

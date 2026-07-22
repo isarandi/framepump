@@ -487,9 +487,13 @@ class VideoFrames:
         seekable = self._seekable if self._seekable is not None else self._lazy.seekable_probed
         if seekable is None:
             # First reader for this video: let it auto-probe (seek + decode
-            # one frame) and cache the verdict so later readers skip it
+            # one frame) and cache the verdict so later readers skip it.
+            # The probe pollutes the decoder state — codecs with delayed
+            # frames can emit the probe's frame after a later seek(0) — so
+            # reopen the container before handing the reader out.
             seekable = reader.seekable
             self._lazy.seekable_probed = seekable
+            reader._reopen()
         reader._seekable = seekable and not self._lazy.seek_disabled
         return reader
 

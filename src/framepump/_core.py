@@ -48,6 +48,8 @@ _SEEK_UNRELIABLE_CODECS = frozenset(
         'rv20',
         'rv30',
         'rv40',
+        'cinepak',
+        'cscd',
     }
 )
 
@@ -61,6 +63,10 @@ class _RetrySequential(Exception):
     """Internal: decoding after a real seek failed before anything was
     delivered; the caller disables seeking for the file and retries."""
 
+
+# Deepest frame the seek-reliability probe references when a file claims
+# dense keyframes; bounds the probe's sequential reference decode.
+_PROBE_DEEP_MAX = 128
 
 # Streaming (decode-from-start-and-skip, no index) is used for forward
 # selections whose start is at most this many frames; larger starts build the
@@ -1091,7 +1097,17 @@ class VideoFrames:
         n = self._index.frame_count
         first_safe = self._index.safe_seek_pts[0]
         j0 = next((i for i in range(1, n) if self._index.safe_seek_pts[i] != first_safe), 1)
-        probe = sorted({i for i in (1, 2, j0, j0 + 1, j0 + 2) if 0 < i < n})
+        probe = {i for i in (1, 2, j0, j0 + 1, j0 + 2) if 0 < i < n}
+        # When nearly every packet claims to be an independently decodable
+        # keyframe (screen/animation codecs with false keyframe flags), the
+        # shallow positions above all decode from nearby "keyframes" and match
+        # even though deep seeks drift. Sample two deeper positions, bounded so
+        # the sequential reference decode stays cheap. Sparse-GOP files (real
+        # MPEG structure) skip this, keeping their probe cost at ~one GOP.
+        if 2 * len(set(self._index.safe_seek_pts)) > n:
+            deep = min(n - 1, _PROBE_DEEP_MAX)
+            probe |= {deep // 2, deep}
+        probe = sorted(i for i in probe if 0 < i < n)
         if not probe:
             return True
 

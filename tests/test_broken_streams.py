@@ -214,3 +214,16 @@ class TestPal8PaletteSurvivesFreshOpen:
         n_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
         assert n_colors > 10
 
+
+class TestFalseKeyframeSeeks:
+    """Containers that flag every packet as a keyframe (screen/animation
+    codecs) silently returned wrong pixels on deep indexed access; the
+    deep-probe verification must catch this and degrade to sequential."""
+
+    def test_indexed_access_matches_iteration(self):
+        vf = VideoFrames(str(DATA_DIR / 'false_keyframes.avi'))
+        seq = [f.copy() for f in vf]
+        for i in (0, 30, 64, 65, len(seq) - 1):
+            assert np.array_equal(vf[i], seq[i]), f'frame {i}'
+        assert vf._lazy.seek_disabled, 'deep probe must have degraded this file'
+

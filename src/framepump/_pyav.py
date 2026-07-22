@@ -258,6 +258,7 @@ class PyAVReader:
         )
         if self._use_threading:
             self._stream.thread_type = 'AUTO'
+        self._threading_active = self._use_threading
 
         # Cache metadata as Fractions for exact arithmetic
         self._fps_frac: Fraction | None = None
@@ -272,6 +273,11 @@ class PyAVReader:
 
         # Sticky: set when decode_raw observes display-order PTS regressing
         self.pts_regression_seen: bool = False
+        # False until anything demuxes, decodes or seeks: a fresh container is
+        # already at the start, so seeking it to 0 is at best pointless and at
+        # worst destructive (palette-carrying codecs lose their palette on
+        # seek, some raw demuxers report spurious EOF errors afterwards)
+        self._consumed: bool = False
 
     @property
     def seekable(self) -> bool:
@@ -299,6 +305,13 @@ class PyAVReader:
                     self._seekable = self._probe_seek_works()
                 except av.error.FFmpegError:
                     self._seekable = False
+                finally:
+                    # The probe seeks (and decodes) around; a later seek(0)
+                    # does not reliably restore the start on fuzzy-seeking
+                    # containers (MPEG-PS lands mid-file, losing half the
+                    # packets for whoever demuxes next) and stateful decoders
+                    # lose palette/history. Reopen for a clean slate.
+                    self._reopen()
         return self._seekable
 
     def _probe_seek_works(self) -> bool:
@@ -336,6 +349,7 @@ class PyAVReader:
         """
         if use_threading is None:
             use_threading = self._use_threading
+        self._threading_active = use_threading
         self._container.close()
         if self._is_fileobj:
             self._source.seek(0)
@@ -357,6 +371,7 @@ class PyAVReader:
         if use_threading:
             self._stream.thread_type = 'AUTO'
         self._current_frame_idx = 0
+        self._consumed = False
 
     def seek_to_frame(self, frame_idx: int) -> None:
         """Seek to a frame index.
@@ -463,6 +478,7 @@ class PyAVReader:
         else:
             pts_int = pts
 
+        self._consumed = True
         self._container.seek(pts_int, stream=self._stream, any_frame=any_frame)
 
     def seek_to_time(self, time_seconds: float | Fraction) -> None:
@@ -474,8 +490,16 @@ class PyAVReader:
         if isinstance(time_seconds, float):
             time_seconds = Fraction(time_seconds).limit_denominator(1000000)
 
+        if self.seekable and time_seconds == 0 and not self._consumed:
+            # Fresh container: already at the start; see _consumed above
+            return
+
         if not self.seekable:
             if time_seconds == 0:
+                # Corrupt data in non-seekable files can fail with threaded
+                # decoding; a fresh single-threaded container needs no reset
+                if not self._consumed and not self._threading_active:
+                    return
                 self._reopen(use_threading=False)
                 return
             else:
@@ -494,6 +518,7 @@ class PyAVReader:
         """
         count = 0
         prev_pts = None
+        self._consumed = True
         try:
             for frame in self._container.decode(self._stream):
                 if frame.pts is not None:
@@ -670,11 +695,16 @@ class PyAVReader:
 
     def _reset_to_start(self) -> None:
         """Reset to start of stream (seek if possible, otherwise reopen)."""
+        if not self._consumed:
+            self._consumed = True  # the caller is about to demux/decode
+            return
         if self.seekable:
             self._container.seek(0, stream=self._stream)
+            self._consumed = True
         else:
             # Non-seekable files may have corrupt data that fails with threading
             self._reopen(use_threading=False)
+            self._consumed = True
 
     def count_packets(self) -> int:
         """Count packets (for non-seekable streams that need frame count only).

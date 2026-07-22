@@ -151,7 +151,6 @@ class TestTruncatedInterleavedFile:
 
     @pytest.fixture
     def truncated(self, tmp_path):
-
         # faststart puts the index at the front so the truncated file stays openable
         path = _make(
             tmp_path,
@@ -197,3 +196,21 @@ class TestTruncatedInterleavedFile:
         assert n >= 25
         frame = vf[20]
         assert frame.shape == (96, 128, 3)
+
+
+class TestPal8PaletteSurvivesFreshOpen:
+    """Palette-carrying codecs (pal8) lose their palette when the container is
+    seeked to 0 before decoding; a fresh container must not be seeked at all."""
+
+    def test_first_frame_has_full_palette(self):
+        vf = VideoFrames(str(DATA_DIR / 'pal8_seek_sensitive.avi'))
+        frame = next(iter(vf))
+        n_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
+        assert n_colors > 10, f'palette lost: frame collapsed to {n_colors} color(s)'
+
+    def test_indexed_access_has_full_palette(self):
+        vf = VideoFrames(str(DATA_DIR / 'pal8_seek_sensitive.avi'))
+        frame = vf[0]
+        n_colors = len(np.unique(frame.reshape(-1, 3), axis=0))
+        assert n_colors > 10
+

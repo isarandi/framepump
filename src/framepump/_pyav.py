@@ -985,10 +985,11 @@ class FrameIndexPyAV:
         try:
             for _ in reader._container.decode(reader._stream):
                 frame_count += 1
-        except av.error.InvalidDataError:
-            # Truncated/corrupt tail: the frames counted so far match what
-            # decoding delivers before it raises (libav >= 8 demuxers report
-            # this instead of a clean EOF on some raw streams)
+        except av.FFmpegError:
+            # Truncated/corrupt tails and decoder-side failures (invalid data,
+            # unimplemented features like raw VVC): the frames counted so far
+            # match what decoding delivers before it raises. A file where
+            # nothing decodes raises the typed IndexBuildError downstream.
             pass
         except OSError as e:
             if e.errno != 5:  # I/O error at EOF is ok

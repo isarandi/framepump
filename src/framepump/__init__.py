@@ -100,12 +100,21 @@ __all__ = [
     '__version__',
 ]
 
+
 # Set __module__ to this module for sphinx-codeautolink to resolve references.
 # Preserve original module in _module_original_ for source code links.
-for _name in __all__:
-    if _name == '__version__':
-        continue
-    _obj = globals()[_name]
-    if hasattr(_obj, '__module__'):
-        _obj._module_original_ = _obj.__module__
-        _obj.__module__ = __name__
+def _set_module_for_docs(module_name, module_globals, all_names):
+    # Done in a function so the loop variables don't leak into the package namespace; the
+    # hasattr guard keeps aliased exports and re-imports idempotent.
+    for name in all_names:
+        if name == '__version__':
+            continue
+        obj = module_globals.get(name)
+        if obj is None or not hasattr(obj, '__module__'):
+            continue
+        if not hasattr(obj, '_module_original_'):
+            obj._module_original_ = obj.__module__
+        obj.__module__ = module_name
+
+
+_set_module_for_docs(__name__, globals(), __all__)

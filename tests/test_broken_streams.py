@@ -143,3 +143,57 @@ class TestRuntimeDisorderTrigger:
         with pytest.raises(IndexError, match='out of range'):
             vf[stale_len - 1]
 
+
+class TestTruncatedInterleavedFile:
+    """A truncated mp4 with interleaved audio: the corrupt tail of the audio
+    stream must not end video demuxing early (non-video streams are discarded
+    at the demuxer level, matching what the ffmpeg CLI recovers)."""
+
+    @pytest.fixture
+    def truncated(self, tmp_path):
+
+        # faststart puts the index at the front so the truncated file stays openable
+        path = _make(
+            tmp_path,
+            'full.mp4',
+            '-f',
+            'lavfi',
+            '-i',
+            'testsrc2=duration=2:size=128x96:rate=25',
+            '-f',
+            'lavfi',
+            '-i',
+            'sine=frequency=440:duration=2',
+            '-c:v',
+            'libx264',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-movflags',
+            '+faststart',
+            '-shortest',
+        )
+        data = Path(path).read_bytes()
+        cut = tmp_path / 'cut.mp4'
+        cut.write_bytes(data[: int(len(data) * 0.7)])
+        return str(cut)
+
+    def test_recovers_majority_of_frames(self, truncated):
+        vf = VideoFrames(truncated)
+        n = 0
+        try:
+            for _ in vf:
+                n += 1
+        except VideoDecodeError:
+            pass  # a loud error after delivering the decodable frames is fine
+        # Without demuxer-level discard of the audio stream, the corrupt audio
+        # tail ended demuxing after the first GOP (a small fraction of frames)
+        assert n >= 25, f'only {n} of 50 frames recovered'
+
+    def test_indexed_access_works(self, truncated):
+        vf = VideoFrames(truncated)
+        n = len(vf)
+        assert n >= 25
+        frame = vf[20]
+        assert frame.shape == (96, 128, 3)

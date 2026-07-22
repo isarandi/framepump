@@ -64,6 +64,7 @@ from ._pyav import (
     PyAVReader,
     UnsupportedCodecError,
     VideoDecodeError,
+    _discard_other_streams,
 )
 from ._selection import FrameSelection
 
@@ -133,6 +134,7 @@ class _PyAVPacketSource:
     def __init__(self, video_path: str, codec_name: str) -> None:
         self._container = av.open(video_path)
         self._stream = self._container.streams.video[0]
+        _discard_other_streams(self._container, self._stream)
         self._codec_name = codec_name
         self._bsf = self._make_bsf()
         # The NVDEC parser copies the bitstream during Decode(), but hold the

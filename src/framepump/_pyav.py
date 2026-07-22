@@ -133,6 +133,21 @@ _SEMIPLANAR_TO_PLANAR = {
 }
 
 
+def _discard_other_streams(container, keep) -> None:
+    """Discard all streams except ``keep`` at the demuxer level.
+
+    Skips the cost of synchronizing streams that are never read, and makes
+    truncated interleaved files recover as many video packets as the ffmpeg
+    CLI does: without this, a corrupt sample in an unrelated (e.g. audio)
+    stream ends demuxing early for the video stream too.
+    """
+    from av.stream import Discard
+
+    for other in container.streams:
+        if other.index != keep.index:
+            other.discard = Discard.all
+
+
 def _make_hwaccel(gpu: bool | int):
     """Build the PyAV HWAccel spec for NVDEC decoding, or None for CPU.
 
@@ -216,6 +231,7 @@ class PyAVReader:
         if not self._container.streams.video:
             raise NoVideoStreamError(source)
         self._stream = self._container.streams.video[0]
+        _discard_other_streams(self._container, self._stream)
 
         # codec_context is None when this FFmpeg build has no decoder for the
         # stream's codec (e.g. JPEG-XL, VVC on older builds)
@@ -337,6 +353,7 @@ class PyAVReader:
             except av.error.FFmpegError as e:
                 raise VideoDecodeError(self.path, 0, e) from e
         self._stream = self._container.streams.video[0]
+        _discard_other_streams(self._container, self._stream)
         if use_threading:
             self._stream.thread_type = 'AUTO'
         self._current_frame_idx = 0

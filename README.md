@@ -47,8 +47,10 @@ print(f"Resized shape: {resized_frames.imshape}")
 # Change the data type (e.g., to float32 for neural network processing)
 float_frames = VideoFrames('my_video.mp4', dtype=np.float32)
 
-# Use GPU acceleration for decoding (requires a CUDA-enabled ffmpeg build and a GPU).
-# Frames are decoded on GPU and returned as numpy arrays (on CPU).
+# Use NVDEC GPU acceleration for decoding (requires an NVIDIA GPU).
+# Frames are decoded on GPU and returned as numpy arrays (on CPU),
+# bit-identical to CPU decoding. Unsupported codecs raise instead of
+# silently falling back to CPU.
 frames = VideoFrames('my_video.mp4', gpu=True)
 
 # For fully GPU-resident frames (no GPU→CPU transfer), use VideoFramesCuda instead.

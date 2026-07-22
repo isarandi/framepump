@@ -119,8 +119,12 @@ class VideoFrames:
     Args:
         video_path: Path to video file.
         dtype: Output dtype (uint8, uint16, float16, float32, float64).
-        gpu: False for CPU decoding, True for GPU (CUDA) on default device,
-            or an int to select a specific GPU device ordinal.
+        gpu: False for CPU decoding, True for NVDEC hardware decoding on the
+            default GPU, or an int to select a specific GPU device ordinal.
+            Frames are decoded on the GPU and downloaded to numpy arrays;
+            output is bit-identical to CPU decoding. Codecs NVDEC cannot
+            handle raise an error instead of silently falling back (use
+            VideoFramesCuda for frames that stay in GPU memory).
         constant_framerate: False for VFR (native timestamps), True for CFR at
             original fps, or a number for CFR at that specific fps.
         gray: Decode to single-channel grayscale: frames are (height, width)

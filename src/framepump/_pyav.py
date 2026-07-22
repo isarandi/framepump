@@ -124,6 +124,29 @@ class FilterConfigError(FramePumpError):
     pass
 
 
+# Lossless repack targets for semi-planar NVDEC download formats
+_SEMIPLANAR_TO_PLANAR = {
+    'nv12': 'yuv420p',
+    'nv16': 'yuv422p',
+    'p010le': 'yuv420p10le',
+    'p016le': 'yuv420p16le',
+}
+
+
+def _make_hwaccel(gpu: bool | int):
+    """Build the PyAV HWAccel spec for NVDEC decoding, or None for CPU.
+
+    Software fallback is disabled on purpose: gpu=True must either really
+    decode on the GPU or fail loudly, never silently decode on the CPU.
+    """
+    if not gpu:
+        return None
+    from av.codec.hwaccel import HWAccel
+
+    device = str(gpu) if type(gpu) is int else None  # noqa: E721 (bool excluded on purpose)
+    return HWAccel(device_type='cuda', device=device, allow_software_fallback=False)
+
+
 class PyAVReader:
     """Persistent video reader using PyAV.
 
@@ -167,18 +190,25 @@ class PyAVReader:
             self._source = source
             if not self.path.exists():
                 raise FileNotFoundError(f'Video file not found: {source}')
-            if gpu:
-                self._probe_gpu_safety(source)
-            options = {}
-            if gpu:
-                options['hwaccel'] = 'cuda'
-                if type(gpu) is int:  # noqa: E721 (bool is excluded on purpose)
-                    options['hwaccel_device'] = str(gpu)
             try:
                 self._container = av.open(
-                    str(source), options=options, metadata_errors='surrogateescape'
+                    str(source),
+                    hwaccel=_make_hwaccel(gpu),
+                    metadata_errors='surrogateescape',
                 )
-            except av.error.FFmpegError as e:
+            except RuntimeError as e:
+                # PyAV raises a plain RuntimeError when no stream is
+                # NVDEC-compatible and software fallback is disabled
+                raise FramePumpError(
+                    f'GPU decode is not supported for this codec: {source}. '
+                    f'Use gpu=False for software decoding. ({e})'
+                ) from e
+            except av.FFmpegError as e:
+                if gpu and isinstance(e, av.error.ExternalError):
+                    raise ValueError(
+                        f'GPU decoding failed to initialize on device {gpu!r} '
+                        f'(is the device ordinal valid?): {e}'
+                    ) from e
                 raise VideoDecodeError(source, 0, e) from e
 
         self._gpu = gpu
@@ -224,58 +254,6 @@ class PyAVReader:
         self._seekable: bool | None = None
         self._current_frame_idx: int = 0  # Track position for non-seekable streams
 
-    # Codecs with NVIDIA CUVID hardware decoder support.
-    _CUVID_CODECS = {
-        'h264',
-        'hevc',
-        'mpeg1video',
-        'mpeg2video',
-        'mpeg4',
-        'av1',
-        'vp8',
-        'vp9',
-        'vc1',
-        'mjpeg',
-    }
-
-    # Container formats where hwaccel=cuda causes segfaults in av.open().
-    _GPU_UNSAFE_FORMATS = {'flv'}
-
-    @staticmethod
-    def _probe_gpu_safety(path: PathLike) -> None:
-        """Check if GPU decode is safe, to avoid segfaults in FFmpeg's CUDA path.
-
-        Opens the file without hwaccel to inspect the container format and codec.
-        Raises VideoDecodeError if GPU decode would be unsafe.
-        """
-        try:
-            probe = av.open(str(path), metadata_errors='surrogateescape')
-        except av.error.FFmpegError as e:
-            raise VideoDecodeError(path, 0, e) from e
-        try:
-            if not probe.streams.video:
-                raise NoVideoStreamError(path)
-            if probe.streams.video[0].codec_context is None:
-                raise UnsupportedCodecError(path)
-            fmt = probe.format.name
-            codec = probe.streams.video[0].codec_context.codec.name
-
-            # FLV containers segfault in FFmpeg when opened with hwaccel=cuda
-            fmt_parts = set(fmt.split(','))
-            if fmt_parts & PyAVReader._GPU_UNSAFE_FORMATS:
-                raise FramePumpError(
-                    f'GPU decode is not supported for the {fmt!r} container format '
-                    f'(causes a crash in FFmpeg). Use gpu=False.'
-                )
-
-            if codec not in PyAVReader._CUVID_CODECS:
-                raise FramePumpError(
-                    f'GPU decode is not supported for the {codec!r} codec. '
-                    f'Supported codecs: {", ".join(sorted(PyAVReader._CUVID_CODECS))}. '
-                    f'Use gpu=False.'
-                )
-        finally:
-            probe.close()
         # Sticky: set when decode_raw observes display-order PTS regressing
         self.pts_regression_seen: bool = False
 
@@ -350,14 +328,11 @@ class PyAVReader:
             except av.error.FFmpegError as e:
                 raise VideoDecodeError('<file-like>', 0, e) from e
         else:
-            options = {}
-            if self._gpu:
-                options['hwaccel'] = 'cuda'
-                if type(self._gpu) is int:  # noqa: E721 (bool is excluded on purpose)
-                    options['hwaccel_device'] = str(self._gpu)
             try:
                 self._container = av.open(
-                    str(self.path), options=options, metadata_errors='surrogateescape'
+                    str(self.path),
+                    hwaccel=_make_hwaccel(self._gpu),
+                    metadata_errors='surrogateescape',
                 )
             except av.error.FFmpegError as e:
                 raise VideoDecodeError(self.path, 0, e) from e
@@ -603,13 +578,26 @@ class PyAVReader:
 
         last_filter = buffer_in
 
+        # NVDEC downloads arrive semi-planar (nv12/p010le). Repack losslessly
+        # to the planar equivalent first, so RGB conversion runs through the
+        # exact same swscale path as CPU decoding: direct nv12->rgb uses a
+        # different chroma interpolation and differs on most pixels.
+        planar = _SEMIPLANAR_TO_PLANAR.get(frame.format.name)
+        if planar is not None:
+            repack = graph.add('format', f'pix_fmts={planar}')
+            last_filter.link_to(repack)
+            last_filter = repack
+
         # Work around libswscale's SSSE3 pmulhw truncation bug: the fused
         # chroma-upsample + color-convert path truncates instead of rounding,
         # causing ~2% darkening on full-range subsampled content.
         # accurate_rnd bypasses the SSSE3 path; full_chroma_int fixes chroma
-        # interpolation. Only needed for subsampled full-range (yuvj420p/yuvj422p).
-        pix_fmt = self._stream.codec_context.pix_fmt or ''
-        needs_sws_fix = pix_fmt in ('yuvj420p', 'yuvj422p')
+        # interpolation. Needed for subsampled full-range content: yuvj
+        # formats from CPU decoding, or full-range nv12 from NVDEC (mjpeg).
+        pix_fmt = frame.format.name
+        needs_sws_fix = pix_fmt in ('yuvj420p', 'yuvj422p') or (
+            pix_fmt in ('nv12', 'nv16') and frame.color_range == 2  # JPEG/full range
+        )
 
         # Add scale filter if resize needed or if we need SWS flags
         if output_shape is not None:

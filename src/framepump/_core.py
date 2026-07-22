@@ -54,6 +54,29 @@ _SEEK_UNRELIABLE_CODECS = frozenset(
 )
 
 
+class _CountingIterator:
+    """Iterator wrapper counting consumed items and noticing exhaustion."""
+
+    __slots__ = ('_it', 'count', 'exhausted')
+
+    def __init__(self, iterable) -> None:
+        self._it = iter(iterable)
+        self.count = 0
+        self.exhausted = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            item = next(self._it)
+        except StopIteration:
+            self.exhausted = True
+            raise
+        self.count += 1
+        return item
+
+
 class _SeekPathUnsound(Exception):
     """Internal: a PTS regression was observed during a seek-based access
     before the target frame was delivered; the caller retries sequentially."""
@@ -92,6 +115,7 @@ class _LazyIndexState:
         'seek_disabled',
         'pts_unreliable',
         'emission_disorder',
+        'observed_seq_count',
         'seekable_probed',
     )
 
@@ -107,6 +131,9 @@ class _LazyIndexState:
         # True when a display-order PTS regression was observed in decoder
         # output: sorted-PTS frame location is unsound for this video
         self.emission_disorder = False
+        # Total frame count observed by an index-less streaming pass that
+        # exhausted the decoder (ground truth to reconcile the index against)
+        self.observed_seq_count: int | None = None
         # Cached container-seekability auto-probe verdict (None = not probed)
         self.seekable_probed: bool | None = None
 
@@ -287,10 +314,18 @@ class VideoFrames:
                 dtype=internal_dtype,
                 target_format=self._pix_target(internal_dtype),
             )
-            raw = itertools.islice(raw, start, streamable.stop, step)
-            for frame in self._convert_and_repeat(raw):
+            # Count every decoded frame (not just yielded ones): when this
+            # pass exhausts the decoder, the count is the file's true frame
+            # count and is used to reconcile the packet index (packets and
+            # frames are not always 1:1 - multi-frame packets, flush frames,
+            # no-op packets). Costs one counter increment per frame.
+            decoded = _CountingIterator(raw)
+            sliced = itertools.islice(decoded, start, streamable.stop, step)
+            for frame in self._convert_and_repeat(sliced):
                 yield frame
                 count += 1
+            if decoded.exhausted:
+                self._lazy.observed_seq_count = decoded.count
             if reader.pts_regression_seen and not self._lazy.seek_disabled:
                 self._flag_emission_disorder()
         finally:
@@ -384,6 +419,19 @@ class VideoFrames:
             # A PTS regression observed during earlier (index-less) streaming
             # means sorted-PTS location is unsound: use decoder output instead
             if self._lazy.emission_disorder:
+                self._lazy.seek_disabled = True
+                self._rebuild_index_from_decode()
+
+            # Duplicate packet timestamps collapse in the sorted-unique index,
+            # so the packet count is provably not the frame count; and an
+            # earlier full streaming pass that saw a different total is ground
+            # truth. Either way the packet index is wrong: rebuild it from
+            # decoder output (only such broken files pay for the decode).
+            elif self._lazy.index.had_duplicate_pts or (
+                self._lazy.observed_seq_count is not None
+                and self._lazy.observed_seq_count > 0
+                and self._lazy.observed_seq_count != self._lazy.index.frame_count
+            ):
                 self._lazy.seek_disabled = True
                 self._rebuild_index_from_decode()
 
@@ -1179,6 +1227,11 @@ class VideoFrames:
             pts_list = [start + Fraction(i) / fps for i in range(n)]
             self._lazy.pts_unreliable = True
 
+        if n == 0:
+            # Nothing decodes: keep the packet-based index so len() stays > 0
+            # and empty iteration raises loudly instead of looking like a
+            # legitimately empty video
+            return
         self._index.frame_pts = pts_list
         self._index.safe_seek_pts = [Fraction(0)] * n
         self._index.frame_count = n

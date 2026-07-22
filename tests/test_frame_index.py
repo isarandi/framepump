@@ -250,3 +250,38 @@ class TestSeekAccuracy:
         # Compare with iteration
         frame_iter = list(frames[5:6])[0]
         np.testing.assert_array_equal(frame, frame_iter)
+
+
+class TestDuplicatePtsDetection:
+    """Duplicate packet timestamps prove packet count != frame count; the
+    index must report it so the caller can rebuild from decoder output."""
+
+    class _StubReader:
+        seekable = True
+
+        def __init__(self, pts_values):
+            self._pts = pts_values
+
+        def iter_packets(self):
+            from fractions import Fraction
+
+            from framepump._pyav import PacketInfo
+
+            for p in self._pts:
+                yield PacketInfo(pts=Fraction(p), dts=Fraction(p), is_keyframe=True)
+
+        def close(self):
+            pass
+
+    def test_duplicates_flagged(self):
+        from framepump._pyav import FrameIndexPyAV
+
+        index = FrameIndexPyAV('stub.mp4', reader=self._StubReader([0, 1, 1, 2]))
+        assert index.had_duplicate_pts
+        assert index.frame_count == 3
+
+    def test_unique_not_flagged(self):
+        from framepump._pyav import FrameIndexPyAV
+
+        index = FrameIndexPyAV('stub.mp4', reader=self._StubReader([0, 1, 2]))
+        assert not index.had_duplicate_pts

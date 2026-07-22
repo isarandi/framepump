@@ -875,6 +875,7 @@ class FrameIndexPyAV:
     frame_pts: list[Fraction]  # PTS in Fraction (seconds)
     safe_seek_pts: list[Fraction]  # Safe seek points in Fraction
     frame_count: int
+    had_duplicate_pts: bool  # packet PTS collapsed in the index (count suspect)
 
     def __init__(self, video_path, reader: PyAVReader | None = None) -> None:
         """Build index from video file using PyAV.
@@ -894,8 +895,11 @@ class FrameIndexPyAV:
             if not reader.seekable:
                 # Non-seekable: trivial index (count only, always seek to 0)
                 self.frame_pts, self.safe_seek_pts = self._build_sequential_index(reader)
+                self.had_duplicate_pts = False
             else:
-                self.frame_pts, self.safe_seek_pts = self._build_from_packets(reader)
+                self.frame_pts, self.safe_seek_pts, self.had_duplicate_pts = (
+                    self._build_from_packets(reader)
+                )
         finally:
             if own_reader:
                 reader.close()
@@ -906,7 +910,7 @@ class FrameIndexPyAV:
         self.frame_count = len(self.frame_pts)
 
     @staticmethod
-    def _build_from_packets(reader: PyAVReader) -> tuple[list[Fraction], list[Fraction]]:
+    def _build_from_packets(reader: PyAVReader) -> tuple[list[Fraction], list[Fraction], bool]:
         """Build index from packet metadata (fast, no decoding)."""
         file_order_pts: list[Fraction] = []
         running_max_at: list[Fraction] = []
@@ -926,8 +930,11 @@ class FrameIndexPyAV:
             running_max = max(running_max, pts)
             running_max_at.append(running_max)
 
-        # Sort by PTS for display order, remove duplicates
+        # Sort by PTS for display order, remove duplicates. Duplicates mean
+        # packet count != frame count; the flag lets the caller distrust the
+        # index and rebuild it from decoder output.
         frame_pts = sorted(set(file_order_pts))
+        had_duplicates = len(frame_pts) < len(file_order_pts)
 
         # Build safe seek points using binary search
         # Safe seek point = last packet in file order where running_max <= target
@@ -942,7 +949,7 @@ class FrameIndexPyAV:
                 # Seek to whichever is earlier: first packet or position 0
                 safe_seek_pts.append(min(file_order_pts[0], Fraction(0)))
 
-        return frame_pts, safe_seek_pts
+        return frame_pts, safe_seek_pts, had_duplicates
 
     @staticmethod
     def _build_sequential_index(reader: PyAVReader) -> tuple[list[Fraction], list[Fraction]]:

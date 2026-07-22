@@ -227,3 +227,16 @@ class TestFalseKeyframeSeeks:
             assert np.array_equal(vf[i], seq[i]), f'frame {i}'
         assert vf._lazy.seek_disabled, 'deep probe must have degraded this file'
 
+
+class TestMultiFramePackets:
+    """Streams where one packet decodes to several frames: the packet index
+    undercounts, and iterating after len() lost most frames. A full streaming
+    pass reconciles the index with the observed frame count."""
+
+    def test_iteration_reconciles_index(self):
+        path = str(DATA_DIR / 'multiframe_packets.smv')
+        vf = VideoFrames(path)
+        n_first = sum(1 for _ in vf)
+        assert n_first == 12  # 2 packets, 6 sub-frames each
+        assert len(vf) == 12, 'index must reconcile with the observed count'
+        assert sum(1 for _ in vf) == 12, 'post-index iteration must not lose frames'

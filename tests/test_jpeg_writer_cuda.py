@@ -196,6 +196,18 @@ class TestSequenceAbortOnException:
         assert not out.exists()
         assert not list(tmp_path.glob('*.tmp_*'))
 
+    def test_corrupt_later_jpeg_raises_value_error(self, tmp_path):
+        from framepump import JpegVideoWriterCUDA
+
+        out = tmp_path / 'out.mp4'
+        writer = JpegVideoWriterCUDA(str(out), fps=30)
+        writer.append_data(make_jpeg(320, 240, 0, PIL_420))
+        with pytest.raises(ValueError, match='Could not parse JPEG data'):
+            writer.append_data(b'\xff\xd8\xff\xe0garbage-not-a-jpeg')
+        writer._abort()
+        assert not out.exists()
+        assert not list(tmp_path.glob('*.tmp_*'))
+
     def test_writer_usable_after_aborted_sequence(self, tmp_path):
         from framepump import JpegVideoWriterCUDA, VideoFrames
 
@@ -221,7 +233,7 @@ class TestFailedFirstFrame:
 
         out = tmp_path / 'out.mp4'
         writer = JpegVideoWriterCUDA(str(out), fps=30)
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match='Could not parse JPEG data'):
             writer.append_data(b'\xff\xd8\xff\xe0garbage-not-a-jpeg')
         # A retry must fail with a clear error, never ZeroDivisionError or
         # nonsense geometry comparisons against a never-accepted first frame.

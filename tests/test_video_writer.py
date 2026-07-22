@@ -591,3 +591,41 @@ class TestQueueSizeValidation:
     def test_negative_queue_size_rejected(self):
         with pytest.raises(ValueError, match='queue_size'):
             VideoWriter(queue_size=-1)
+
+
+class TestClearErrorMessages:
+    """Common misuse gets a typed, self-explanatory error instead of a raw av error."""
+
+    def test_webm_with_default_codec_raises_encode_error(self, tmp_path):
+        video_path = tmp_path / 'out.webm'
+        with pytest.raises(VideoEncodeError, match='webm'):
+            with VideoWriter(str(video_path), fps=30) as writer:
+                writer.append_data(np.zeros((64, 64, 3), np.uint8))
+        assert not video_path.exists()
+
+    def test_gpu_with_uint16_raises_before_encoding(self, tmp_path):
+        # The dtype check fires before any NVENC use, so no GPU is needed
+        video_path = tmp_path / 'out.mp4'
+        with pytest.raises(ValueError, match='8-bit'):
+            with VideoWriter(str(video_path), fps=30, gpu=True) as writer:
+                writer.append_data(np.zeros((64, 64, 3), np.uint16))
+        assert not video_path.exists()
+
+    def test_gpu_with_float_raises_before_encoding(self, tmp_path):
+        video_path = tmp_path / 'out.mp4'
+        with pytest.raises(ValueError, match='8-bit'):
+            with VideoWriter(str(video_path), fps=30, gpu=True) as writer:
+                writer.append_data(np.zeros((64, 64, 3), np.float32))
+        assert not video_path.exists()
+
+    def test_append_data_non_array_raises_type_error(self, tmp_path):
+        video_path = tmp_path / 'out.mp4'
+        with VideoWriter(str(video_path), fps=30) as writer:
+            writer.append_data(np.zeros((64, 64, 3), np.uint8))
+            with pytest.raises(TypeError, match='ndarray'):
+                writer.append_data('not an array')
+            with pytest.raises(TypeError, match='ndarray'):
+                writer.append_data([[0, 1], [2, 3]])
+            writer.append_data(np.zeros((64, 64, 3), np.uint8))
+        assert video_path.exists()
+

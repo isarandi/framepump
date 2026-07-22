@@ -450,6 +450,33 @@ class TestTrimVideo:
         trim_video(src, str(out), 0.5, 1.5, gpu=False)  # 1 second at 12 fps
         assert num_frames(str(out), exact=True) == fps
 
+    def test_trim_empty_range_raises(self, tmp_path):
+        from framepump import trim_video
+
+        src, _, _ = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+        with pytest.raises(ValueError, match='contains no frames'):
+            trim_video(src, str(out), 0.5, 0.5, gpu=False)
+        assert not out.exists()
+
+    def test_trim_end_before_start_raises(self, tmp_path):
+        from framepump import trim_video
+
+        src, _, _ = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+        with pytest.raises(ValueError, match='contains no frames'):
+            trim_video(src, str(out), 1.0, 0.5, gpu=False)
+        assert not out.exists()
+
+    def test_trim_start_past_end_raises(self, tmp_path):
+        from framepump import trim_video
+
+        src, _, _ = self._make_video(tmp_path)
+        out = tmp_path / 'trimmed.mp4'
+        with pytest.raises(ValueError, match='past the last frame'):
+            trim_video(src, str(out), 100.0, 200.0, gpu=False)
+        assert not out.exists()
+
     def test_trim_error_leaves_no_output_file(self, tmp_path, monkeypatch):
         from framepump import trim_video
         from framepump import video_writing as vw

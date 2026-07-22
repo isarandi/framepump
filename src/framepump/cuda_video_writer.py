@@ -790,6 +790,24 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             stream_options={'strict': 'experimental'},
         )
 
+    def _parse_jpeg_checked(self, jpeg_data: bytes) -> tuple[int, int, int]:
+        """Parse JPEG headers, raising ValueError on data nvJPEG cannot read.
+
+        nvJPEG sometimes "succeeds" on garbage input but reports zero
+        dimensions or unknown subsampling; both must be rejected here, before
+        the values reach layout math.
+        """
+        try:
+            width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+        except RuntimeError as e:
+            raise ValueError(f'Could not parse JPEG data: {e}') from e
+        if width <= 0 or height <= 0 or subsampling < 0:
+            raise ValueError(
+                f'Could not parse JPEG data: got dimensions {width}x{height} '
+                f'with chroma subsampling {_css_name(subsampling)}'
+            )
+        return width, height, subsampling
+
     def write_jpeg(self, jpeg_data: bytes) -> None:
         """Decode JPEG and encode to video using pipelined GPU processing.
 
@@ -809,7 +827,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             if self._jpeg_decoder is None:
                 try:
                     self._jpeg_decoder = NvjpegPhasedDecoder(gpu=None)
-                    width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+                    width, height, subsampling = self._parse_jpeg_checked(jpeg_data)
                     self._prepare_layouts(width, height, subsampling)
                     self._init_session()
                     self._alloc_buffers()
@@ -830,7 +848,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 (err,) = driver.cuStreamSynchronize(self._decode_stream)
                 if err != driver.CUresult.CUDA_SUCCESS:
                     raise NvencError(f'Async decode of the previous frame failed: {err}')
-                width, height, subsampling = self._jpeg_decoder.parse(jpeg_data)
+                width, height, subsampling = self._parse_jpeg_checked(jpeg_data)
                 self._check_frame_consistent(width, height, subsampling)
                 self._jpeg_decoder.decode_host()
 

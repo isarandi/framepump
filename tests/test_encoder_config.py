@@ -105,3 +105,17 @@ class TestInvalidConfigs:
     def test_with_overrides_revalidates(self):
         with pytest.raises(ValueError, match='crf'):
             EncoderConfig().with_overrides(crf=100)
+
+
+class TestBuildOptions:
+    def test_hevc_cpu_suppresses_x265_banner(self):
+        options = EncoderConfig(codec='hevc').build_options(gpu=False)
+        assert options['x265-params'] == 'log-level=error'
+
+    def test_h264_cpu_has_no_x265_params(self):
+        options = EncoderConfig().build_options(gpu=False)
+        assert 'x265-params' not in options
+
+    def test_hevc_gpu_has_no_x265_params(self):
+        options = EncoderConfig(codec='hevc').build_options(gpu=True)
+        assert 'x265-params' not in options

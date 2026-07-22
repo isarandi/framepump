@@ -286,6 +286,8 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                 - uint16: High precision 10-bit encoding
                 - float16/float32/float64: Auto-converted to uint16 ([0,1] -> [0,65535])
         """
+        if not isinstance(data, np.ndarray):
+            raise TypeError(f'append_data expects a numpy ndarray, got {type(data).__name__}')
         if not self._accepts_new_frames:
             raise ValueError('start_sequence has to be called before appending data')
         self._put_checked(AppendFrame(data))
@@ -689,7 +691,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
         try:
             for packet in self._video_stream.encode(video_frame):
                 self._output_container.mux(packet)
-        except av.error.ValueError as e:
+        except av.FFmpegError as e:
             # NVENC minimum size is ~145x49 (varies by driver/GPU)
             # If encoding fails with "Invalid argument" and we're using GPU, check frame size
             if self._gpu and (frame.shape[0] < 50 or frame.shape[1] < 150):
@@ -700,7 +702,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
                     resolution=(frame.shape[1], frame.shape[0]),
                     codec='h264_nvenc',
                 ) from e
-            raise
+            raise VideoEncodeError(self.output_path or '<file-like>', self._pts, e) from e
 
         self._pts += 1
 
@@ -714,6 +716,14 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
     def _validate_first_frame(self, first_frame: NDArray) -> None:
         if first_frame.dtype not in (np.uint8, np.uint16):
             raise ValueError(f'Unsupported frame dtype: {first_frame.dtype}')
+
+        if self._gpu and first_frame.dtype == np.uint16:
+            # h264_nvenc only takes 8-bit input; 10-bit NVENC output would
+            # need hevc_nvenc with p010le, which is not implemented.
+            raise ValueError(
+                'GPU encoding (h264_nvenc) supports only 8-bit uint8 frames; '
+                'uint16/float high-bit-depth frames require CPU encoding (gpu=False).'
+            )
 
         height, width = first_frame.shape[:2]
         if height % 2 != 0 or width % 2 != 0:
@@ -733,7 +743,12 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
     def _setup_video_stream(self, first_frame: NDArray) -> None:
         height, width = first_frame.shape[:2]
         codec_name = self._encoder_config.get_codec_name(self._gpu)
-        self._video_stream = self._output_container.add_stream(codec_name, rate=self._fps_frac)
+        try:
+            self._video_stream = self._output_container.add_stream(codec_name, rate=self._fps_frac)
+        except (av.FFmpegError, ValueError) as e:
+            raise VideoEncodeError(
+                self.output_path or '<file-like>', 0, e, codec=codec_name
+            ) from e
         self._video_stream.width = width
         self._video_stream.height = height
 
@@ -1023,8 +1038,19 @@ def trim_video(
             f'is {_NVENC_MIN_W}x{_NVENC_MIN_H}. Use gpu=False.'
         )
 
-    start_frame_idx = min(_find_frame_at_time(index, start_time), index.frame_count - 1)
+    start_frame_idx = _find_frame_at_time(index, start_time)
     end_frame_idx = _find_frame_at_time(index, end_time)
+    if start_frame_idx >= index.frame_count:
+        duration = float(index.frame_pts[-1]) if index.frame_count else 0.0
+        raise ValueError(
+            f'start_time {start_time} is past the last frame of {input_path} '
+            f'(last frame at {duration:.3f} s)'
+        )
+    if end_frame_idx <= start_frame_idx:
+        raise ValueError(
+            f'Requested range [{start_time}, {end_time}) contains no frames: '
+            f'end_time must be greater than start_time by at least one frame interval'
+        )
     target_pts = index.frame_pts[start_frame_idx]
     # None means "no end bound": the requested end is at/past the last frame
     end_pts = index.frame_pts[end_frame_idx] if end_frame_idx < index.frame_count else None

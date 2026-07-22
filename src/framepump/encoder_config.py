@@ -110,6 +110,10 @@ class EncoderConfig:
                 options['gpu'] = str(gpu)
         else:
             options['crf'] = str(self.crf)
+            if self.codec == 'hevc':
+                # Silence the x265 build-info banner printed to stderr on
+                # every encode; actual errors are still shown.
+                options['x265-params'] = 'log-level=error'
 
         if preset is not None:
             options['preset'] = preset

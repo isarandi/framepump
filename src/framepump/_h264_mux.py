@@ -175,7 +175,7 @@ class H264PassthroughMuxer:
             self._audio_input_container = None
             raise NoAudioStreamError(audio_source_path)
         src_audio = self._audio_input_container.streams.audio[0]
-        self._audio_stream = self._output_container.add_stream(template=src_audio)
+        self._audio_stream = self._output_container.add_stream_from_template(src_audio)
         self._audio_time_base = src_audio.time_base
         self._audio_pkts = (
             pkt for pkt in self._audio_input_container.demux(src_audio) if pkt.dts is not None

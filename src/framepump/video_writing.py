@@ -713,7 +713,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
                     f'file has {len(self._audio_input_container.streams.audio)} audio streams'
                 )
             src_audio = self._audio_input_container.streams.audio[self._audio_stream_index]
-            self._audio_stream = self._output_container.add_stream(template=src_audio)
+            self._audio_stream = self._output_container.add_stream_from_template(src_audio)
             self._audio_time_base = src_audio.time_base
             self._audio_pkts = (
                 pkt for pkt in self._audio_input_container.demux(src_audio) if pkt.dts is not None
@@ -894,8 +894,8 @@ def _video_audio_mux_to_path(
         if not audio_src.streams.audio:
             raise NoAudioStreamError(vidpath_audiosource)
         src_audio = audio_src.streams.audio[0]
-        out_video = output.add_stream(template=src_video)
-        out_audio = output.add_stream(template=src_audio)
+        out_video = output.add_stream_from_template(src_video)
+        out_audio = output.add_stream_from_template(src_audio)
 
         audio_pkts = (p for p in audio_src.demux(src_audio) if p.dts is not None)
         video_pkts = (p for p in video_src.demux(src_video) if p.dts is not None)
@@ -1021,7 +1021,7 @@ def _trim_video_to_path(
         audio_stream = None
         if input_audio:
             try:
-                audio_stream = output_container.add_stream(template=input_audio)
+                audio_stream = output_container.add_stream_from_template(input_audio)
             except (av.error.FFmpegError, ValueError):
                 warnings.warn(
                     'Audio codec is not compatible with the output format, '

@@ -641,7 +641,7 @@ class VideoFrames:
 
         # Build filter graph
         target_format = self._pix_target(internal_dtype)
-        graph = reader._build_filter_graph(self.resized_imshape, target_format)
+        converter = reader.frame_converter(self.resized_imshape, target_format)
 
         # Skip frames until we reach the target PTS (mimics FFmpeg's -ss behavior)
         target_pts_float = float(target_pts_frac)
@@ -667,8 +667,7 @@ class VideoFrames:
                 reached_target = True
 
             # Process frame through filter graph
-            graph.push(frame)
-            filtered_frame = graph.pull()
+            filtered_frame = converter.convert(frame)
 
             if frame_count % slice_step == 0:
                 yield filtered_frame.to_ndarray()
@@ -693,7 +692,7 @@ class VideoFrames:
         reader.seek_to_time(safe_pts_frac)
 
         target_format = self._pix_target(internal_dtype)
-        graph = reader._build_filter_graph(self.resized_imshape, target_format)
+        converter = reader.frame_converter(self.resized_imshape, target_format)
 
         target_pts_float = float(target_pts_frac)
         time_base = reader.time_base
@@ -723,8 +722,7 @@ class VideoFrames:
                 reached_target = True
                 source_idx = first_source
 
-            graph.push(frame)
-            filtered_frame = graph.pull()
+            filtered_frame = converter.convert(frame)
             frame_arr = filtered_frame.to_ndarray()
 
             # Output this frame for all CFR output indices that map to this source
@@ -768,7 +766,7 @@ class VideoFrames:
         target_format = self._pix_target(dtype)
 
         # Build filter graph for exact FFmpeg compatibility
-        graph = reader._build_filter_graph(self.resized_imshape, target_format)
+        converter = reader.frame_converter(self.resized_imshape, target_format)
 
         source_idx = 0
         output_idx = 0
@@ -776,8 +774,7 @@ class VideoFrames:
 
         for frame in reader.decode_raw():
             # Process through filter graph for exact color conversion
-            graph.push(frame)
-            filtered_frame = graph.pull()
+            filtered_frame = converter.convert(frame)
             frame_arr = filtered_frame.to_ndarray()
 
             # Output this frame for all output indices that map to this source index

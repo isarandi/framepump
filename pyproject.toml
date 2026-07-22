@@ -39,7 +39,7 @@ classifiers = [
 
 dependencies = [
     "numpy",
-    "av",  # PyAV for video I/O
+    "av>=17.1,<18",  # PyAV for video I/O (HWAccel decode, Stream.discard; 18 drops Python 3.10)
     "simplepyutils",
     "more-itertools",
     "slicecompose",  # lazy slice-chain composition for deferred frame indexing

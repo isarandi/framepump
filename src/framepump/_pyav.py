@@ -518,6 +518,17 @@ class PyAVReader:
             if e.errno != 5:
                 raise
 
+    def frame_converter(
+        self, output_shape: tuple[int, int] | None, target_format: str
+    ) -> '_FrameConverter':
+        """Create a converter that runs decoded frames through the filter graph.
+
+        The graph is built lazily from the first frame's actual properties
+        (see _build_filter_graph) and libav-level conversion errors are
+        wrapped into VideoDecodeError.
+        """
+        return _FrameConverter(self, output_shape, target_format)
+
     def decode_frames(
         self,
         max_frames: int | None = None,
@@ -545,14 +556,11 @@ class PyAVReader:
             # Choose pixel format based on dtype
             target_format = 'rgb48' if dtype == np.uint16 else 'rgb24'
 
-        # Build filter graph for exact FFmpeg compatibility
-        graph = self._build_filter_graph(output_shape, target_format)
+        converter = self.frame_converter(output_shape, target_format)
 
         count = 0
         for frame in self.decode_raw():
-            # Push frame through filter graph
-            graph.push(frame)
-            filtered_frame = graph.pull()
+            filtered_frame = converter.convert(frame)
 
             # Convert to numpy
             arr = filtered_frame.to_ndarray()
@@ -564,14 +572,22 @@ class PyAVReader:
                 break
 
     def _build_filter_graph(
-        self, output_shape: tuple[int, int] | None, target_format: str
+        self, output_shape: tuple[int, int] | None, target_format: str, frame: av.VideoFrame
     ) -> av.filter.Graph:
         """Build a filter graph for format/resize conversion.
 
-        Uses FFmpeg's filter system for exact compatibility with subprocess output.
+        Configured from the first decoded frame's actual properties (with
+        hwaccel the stream-level pix_fmt is 'cuda', not the format frames
+        actually arrive in). Uses FFmpeg's filter system for exact
+        compatibility with subprocess output.
         """
         graph = av.filter.Graph()
-        buffer_in = graph.add_buffer(template=self._stream)
+        buffer_in = graph.add_buffer(
+            width=frame.width,
+            height=frame.height,
+            format=frame.format.name,
+            time_base=self._stream.time_base,
+        )
         buffer_out = graph.add('buffersink')
 
         last_filter = buffer_in
@@ -604,7 +620,7 @@ class PyAVReader:
         try:
             graph.configure()
         except av.error.NotImplementedError as e:
-            input_fmt = self._stream.codec_context.pix_fmt
+            input_fmt = frame.format.name
             raise FilterConfigError(
                 f'Failed to configure filter graph (input: {input_fmt}, output: {target_format}). '
                 f'The pixel format may not be supported for conversion.'
@@ -759,6 +775,49 @@ class PacketInfo:
     is_keyframe: bool
 
 
+class _FrameConverter:
+    """Runs decoded frames through a lazily built format/resize filter graph.
+
+    The graph is created from the first frame's actual properties, not the
+    stream metadata: with hwaccel the stream reports pix_fmt='cuda' while
+    frames arrive as downloaded nv12/p010le software frames, and even in CPU
+    decoding the frames are the ground truth.
+    """
+
+    def __init__(
+        self, reader: PyAVReader, output_shape: tuple[int, int] | None, target_format: str
+    ) -> None:
+        self._reader = reader
+        self._output_shape = output_shape
+        self._target_format = target_format
+        self._graph: av.filter.Graph | None = None
+        self._count = 0
+
+    def convert(self, frame: av.VideoFrame) -> av.VideoFrame:
+        """Convert one decoded frame, building the graph on first use."""
+        # Decoders can emit the illegal 'reserved' (0) value for color
+        # metadata, which FFmpeg >= 8 swscale rejects (ENOTSUP) instead of
+        # assuming defaults; both 0 and 2 mean 'unknown' in practice.
+        if frame.color_primaries == 0:
+            frame.color_primaries = 2  # AVCOL_PRI_UNSPECIFIED
+        if frame.color_trc == 0:
+            frame.color_trc = 2  # AVCOL_TRC_UNSPECIFIED
+
+        try:
+            if self._graph is None:
+                self._graph = self._reader._build_filter_graph(
+                    self._output_shape, self._target_format, frame
+                )
+            self._graph.push(frame)
+            filtered = self._graph.pull()
+        except av.FFmpegError as e:
+            # e.g. colorspaces swscale cannot convert to RGB (YCgCo)
+            path = self._reader.path if self._reader.path is not None else '<file-like>'
+            raise VideoDecodeError(path, self._count, e) from e
+        self._count += 1
+        return filtered
+
+
 class FrameIndexPyAV:
     """Frame index built using PyAV packet iteration.
 
@@ -873,6 +932,11 @@ class FrameIndexPyAV:
         try:
             for _ in reader._container.decode(reader._stream):
                 frame_count += 1
+        except av.error.InvalidDataError:
+            # Truncated/corrupt tail: the frames counted so far match what
+            # decoding delivers before it raises (libav >= 8 demuxers report
+            # this instead of a clean EOF on some raw streams)
+            pass
         except OSError as e:
             if e.errno != 5:  # I/O error at EOF is ok
                 raise

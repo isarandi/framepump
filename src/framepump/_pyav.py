@@ -641,15 +641,24 @@ class PyAVReader:
             pix_fmt in ('nv12', 'nv16') and frame.color_range == 2  # JPEG/full range
         )
 
+        # Interlaced 4:2:0 chroma is sited per-field; the scale filter's
+        # default interl=0 upsamples it as progressive, smearing chroma
+        # between the two fields. interl=-1 converts field-aware exactly for
+        # frames flagged interlaced (matching FFmpeg 8's frame-based
+        # sws_scale_frame API) and is a no-op for progressive frames, which
+        # also keeps mixed progressive/interlaced streams correct per frame.
+        interl = ':interl=-1' if frame.interlaced_frame else ''
+
         # Add scale filter if resize needed or if we need SWS flags
         if output_shape is not None:
             height, width = output_shape
             flags = ':flags=accurate_rnd+full_chroma_int' if needs_sws_fix else ''
-            scale_filter = graph.add('scale', f'{width}:{height}{flags}')
+            scale_filter = graph.add('scale', f'{width}:{height}{flags}{interl}')
             last_filter.link_to(scale_filter)
             last_filter = scale_filter
-        elif needs_sws_fix:
-            scale_filter = graph.add('scale', 'w=iw:h=ih:flags=accurate_rnd+full_chroma_int')
+        elif needs_sws_fix or interl:
+            flags = ':flags=accurate_rnd+full_chroma_int' if needs_sws_fix else ''
+            scale_filter = graph.add('scale', f'w=iw:h=ih{flags}{interl}')
             last_filter.link_to(scale_filter)
             last_filter = scale_filter
 

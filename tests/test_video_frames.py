@@ -305,3 +305,50 @@ class TestIndexErrorWording:
         vf = VideoFrames(video_path)
         with pytest.raises(IndexError, match=f'video with {n_frames} frames'):
             vf[n_frames]
+
+
+class TestInterlacedChroma:
+    """Interlaced 4:2:0 chroma is per-field; conversion must be field-aware
+    (matching FFmpeg's frame-based sws_scale_frame API), not progressive."""
+
+    @pytest.fixture
+    def interlaced_video(self, tmp_path):
+        import shutil
+        import subprocess
+
+        if shutil.which('ffmpeg') is None:
+            pytest.skip('ffmpeg CLI not available')
+        path = tmp_path / 'interlaced.mpg'
+        subprocess.run(
+            [
+                'ffmpeg',
+                '-y',
+                '-v',
+                'error',
+                '-f',
+                'lavfi',
+                '-i',
+                'testsrc2=duration=1:size=192x144:rate=25',
+                '-c:v',
+                'mpeg2video',
+                '-flags',
+                '+ildct+ilme',
+                '-top',
+                '1',
+                str(path),
+            ],
+            check=True,
+        )
+        return str(path)
+
+    def test_matches_field_aware_reference(self, interlaced_video):
+        import av
+
+        with av.open(interlaced_video) as container:
+            frame = next(container.decode(video=0))
+            assert frame.interlaced_frame, 'fixture must be interlaced-flagged'
+            # to_ndarray uses sws_scale_frame, which is interlace-aware
+            reference = frame.to_ndarray(format='rgb24')
+
+        got = next(iter(VideoFrames(interlaced_video)))
+        assert np.array_equal(got, reference)

@@ -8,16 +8,17 @@ B-frames, and lazy slicing. This guide covers the details.
 Exact Frame Counts
 ------------------
 
-When you create a :class:`~framepump.VideoFrames`, the constructor scans all
-packets in the container (without decoding) and builds an index. This gives an
-exact frame count:
+The first time an exact frame count is needed, FramePump scans all packets
+in the container (without decoding) and builds an index — the constructor
+itself scans nothing. ``len()`` triggers that one-time scan (shared across
+all views of the video) and gives an exact count:
 
 .. code-block:: python
 
     from framepump import VideoFrames
 
-    frames = VideoFrames('input.mp4')
-    print(len(frames))  # exact
+    frames = VideoFrames('input.mp4')  # no packet scan yet
+    print(len(frames))  # builds the index once; exact
 
 The standalone :func:`~framepump.num_frames` function offers three accuracy
 levels:

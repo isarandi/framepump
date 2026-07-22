@@ -9,24 +9,34 @@ lazy, what triggers real work, and how operations compose.
 What Happens on Construction
 ----------------------------
 
-When you create a ``VideoFrames``, the constructor does two things:
+When you create a ``VideoFrames``, the constructor only **opens the container
+to read stream metadata** (resolution, fps, duration) and closes it again. No
+packets are scanned and no frames are decoded.
 
-1. **Opens the container** to read stream metadata (resolution, fps, duration).
-2. **Builds a packet index** by scanning all packets in the file. This reads
-   packet headers but does not decode any frames.
-
-After the index is built, the file handle is closed. No pixel data has been
-touched.
+The **packet index** — the structure behind exact ``len()``, integer indexing
+and seeking — is built lazily, the first time an operation needs it. Forward
+iteration and prefix-style slicing (``frames[:100]``, ``frames[::2]``) stream
+the file in a single pass and never build the index at all. Operations that
+need it (``len()``, integer indexing, negative bounds or steps, CFR mode)
+build it once, on first use, shared across all views of the same video.
 
 .. code-block:: python
 
-    # This scans packets and builds the index, then closes the file.
-    # It does NOT decode any frames.
+    # Opens the file only to read metadata; no packet scan, no decoding.
     frames = VideoFrames('input.mp4')
 
-The cost of construction is proportional to the number of packets (typically
-a few milliseconds for a short video, up to a few hundred milliseconds for
-a multi-hour file).
+    for frame in frames[:100]:   # streams directly — still no index
+        ...
+
+    n = len(frames)              # NOW the packet index is built (once)
+
+Building the index costs one packet scan, proportional to the number of
+packets (typically a few milliseconds for a short video, up to a few hundred
+milliseconds for a multi-hour file).
+
+Note that metadata comes from container and packet headers, not from
+decoding: on a damaged file, construction and even ``len()`` can succeed
+while iterating later raises :class:`~framepump.VideoDecodeError`.
 
 
 What Triggers I/O
@@ -46,21 +56,23 @@ Everything else is metadata manipulation.
 Slicing is O(1)
 ---------------
 
-:class:`~framepump.VideoFrames` stores a Python ``range`` object that
+:class:`~framepump.VideoFrames` stores a symbolic slice chain that
 represents which frames to decode during iteration. Slicing creates a new
-instance with a modified range:
+instance with an extended chain; the chain is resolved against the real
+frame count only when an operation needs it (and chains that reduce to a
+plain forward slice stream without ever resolving):
 
 .. code-block:: python
 
-    frames = VideoFrames('input.mp4')   # range(0, 1000)
-    subset = frames[100:500:2]          # range(100, 500, 2)
-    smaller = subset[:50]               # range(100, 200, 2)
+    frames = VideoFrames('input.mp4')   # all frames
+    subset = frames[100:500:2]          # lazy, no I/O
+    smaller = subset[:50]               # lazy, still no I/O
 
-No frames are decoded. The cost is one ``range.__getitem__`` call and one
-shallow copy of the ``VideoFrames`` metadata.
+No frames are decoded and no index is built. The cost is one slice
+composition and one shallow copy of the ``VideoFrames`` metadata.
 
-Sliced instances share the same packet index (it's read-only, so sharing is
-safe).
+All views of the same video share one lazily built packet index, so it is
+built at most once no matter how many slices exist.
 
 
 Cloning Operations
@@ -75,6 +87,10 @@ modified parameters:
 
 These clones share the same packet index and path, but have independent
 metadata. None of them trigger I/O.
+
+Derived properties follow the view: e.g. ``frames[::2].fps`` is half the
+source fps, and ``repeat_each_frame(2)`` doubles it — ``.fps`` always
+describes the sequence the view actually yields.
 
 
 How Iteration Works
@@ -94,6 +110,10 @@ frame range:
 3. **Large step (> 30)**: seek individually to each frame. When the step is
    large enough, it's faster to seek per-frame than to decode and discard
    the frames in between.
+
+4. **Negative step** (``frames[::-1]``): decode memory-bounded forward
+   chunks anchored at keyframes and yield them in reverse (large step
+   magnitudes seek per frame, as above).
 
 Each iteration opens a fresh file handle and closes it when done. Multiple
 iterations over the same ``VideoFrames`` are independent.

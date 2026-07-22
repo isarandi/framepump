@@ -157,6 +157,11 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         fps: Frame rate for the first video sequence (required if video_path is provided).
         audio_source_path: Path to copy audio from, for the first video sequence.
         queue_size: Max frames to buffer before blocking on `append_data`.
+        gpu: False for CPU encoding (libx264/libx265), True for GPU (NVENC)
+            on the default device, or an int GPU device ordinal. NVENC is
+            8-bit only: uint16/float frames require gpu=False.
+        encoder_config: :class:`~framepump.EncoderConfig` with crf, preset,
+            bframes, gop and codec settings (defaults are used if omitted).
     """
 
     def __init__(

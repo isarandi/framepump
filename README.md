@@ -103,7 +103,8 @@ video_path = 'my_video.mp4'
 
 fps = get_fps(video_path)
 duration = get_duration(video_path)
-n_frames = num_frames(video_path)
+n_frames = num_frames(video_path)  # fast estimate (duration x fps)
+n_frames = num_frames(video_path, exact=True)  # exact (scans packet headers)
 width, height = video_extents(video_path)
 
 print(f"FPS: {fps}, Duration: {duration}s, Frames: {n_frames}, Dimensions: {width}x{height}")
@@ -148,6 +149,18 @@ This is the central class for reading video frames. It's a lazy, sliceable, and 
 ### `VideoWriter`
 
 This class handles writing frames to a video file. It uses a separate thread to encode and write the video, which prevents the main thread from blocking on I/O and improves performance. It can be used as a context manager for easy setup and teardown.
+
+### `DepthVideoWriter`
+
+A `VideoWriter` variant for lossless 16-bit grayscale video (e.g. depth maps in millimeters), stored as FFV1-encoded `gray16le` in MKV — bit-exact round-trips at roughly half the size of a PNG sequence. Read the result back with `VideoFrames(path, gray=True, dtype=np.uint16)`.
+
+```python
+from framepump import DepthVideoWriter
+
+with DepthVideoWriter('depth.mkv', fps=5) as writer:
+    for depth in depth_frames:  # (H, W) uint16 arrays
+        writer.append_data(depth)
+```
 
 ### Resampling Frame Rate
 
@@ -213,8 +226,8 @@ with VideoWriter('output_10bit.mp4', fps=30) as writer:
         # Generate a 16-bit frame (e.g., a gradient)
         frame = np.zeros((100, 100, 3), dtype=np.uint16)
         gradient = np.linspace(0, 65535, 100, dtype=np.uint16)
-        frame[:, :, 0] = gradient
-        frame[:, :, 1] = gradient.T
+        frame[:, :, 0] = gradient            # horizontal gradient
+        frame[:, :, 1] = gradient[:, None]   # vertical gradient
         writer.append_data(frame)
 ```
 

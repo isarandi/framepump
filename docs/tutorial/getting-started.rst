@@ -174,17 +174,16 @@ A common pattern: read a video, process frames, write the result.
 
 .. code-block:: python
 
-    from framepump import VideoFrames, VideoWriter, get_fps
+    import numpy as np
+    from framepump import VideoFrames, VideoWriter
 
     src = VideoFrames('input.mp4')
     fps = src.fps
 
     with VideoWriter('grayscale.mp4', fps=fps) as writer:
         for frame in src.resized((480, 640)):
-            # Convert to grayscale, keep 3 channels for H.264
-            gray = frame.mean(axis=2, keepdims=True).astype(np.uint8)
-            gray = np.broadcast_to(gray, frame.shape).copy()
-            writer.append_data(gray)
+            gray = frame.mean(axis=2).astype(np.uint8)
+            writer.append_data(gray)  # (H, W) input is replicated to 3 channels
 
 
 Next Steps

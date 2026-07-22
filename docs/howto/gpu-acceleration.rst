@@ -61,10 +61,15 @@ To select a specific GPU:
     frames = VideoFrames('input.mp4', gpu=0)  # first GPU
     frames = VideoFrames('input.mp4', gpu=1)  # second GPU
 
-**Supported codecs:** H.264, HEVC, MPEG-1/2/4, AV1, VP8, VP9, VC-1, MJPEG.
-Unsupported codecs or container formats (e.g. FLV) raise
-:class:`~framepump.FramePumpError` with a clear message — FramePump probes the
-file before opening with hardware acceleration to avoid FFmpeg crashes.
+**Supported codecs** are whatever the GPU's NVDEC engine handles (typically
+H.264, HEVC, MPEG-1/2/4, AV1, VP8, VP9, VC-1, MJPEG — depending on GPU
+generation). FFmpeg reports compatibility when the file is opened: an
+unsupported codec raises :class:`~framepump.FramePumpError` with a clear
+message suggesting ``gpu=False``. There is deliberately no silent fallback:
+``gpu=True`` either really decodes on the GPU or fails loudly.
+
+The decoded output is **bit-identical to CPU decoding** — you can switch
+``gpu`` on and off without affecting results.
 
 **Pipeline:**
 
@@ -101,11 +106,16 @@ exported via DLPack for zero-copy access from PyTorch, CuPy, etc.
 For 10-bit video sources, use ``dtype=np.uint16`` to preserve the full
 precision through an NPP (NVIDIA Performance Primitives) conversion pipeline.
 
+Unlike ``VideoFrames(gpu=True)``, the output of ``VideoFramesCuda`` is **not
+bit-identical** to CPU decoding: its YUV→RGB conversion runs in CUDA kernels
+rather than FFmpeg's swscale, so pixel values typically differ by a few
+counts. Don't mix the two classes when exact reproducibility matters.
+
 **Pipeline:**
 
 ::
 
-    Video file → PyNvDemuxer → NVDEC (GPU) → [NPP color conversion] → GPU buffer (DLPack)
+    Video file → PyAV demuxer → NVDEC (GPU) → [NPP color conversion] → GPU buffer (DLPack)
 
 
 CudaToGLUploader
@@ -258,8 +268,8 @@ either naming convention regardless of the target encoder.
 Requirements
 ------------
 
-- **GPU decoding** (``gpu=True``): NVIDIA GPU, CUDA-enabled FFmpeg build
-  (PyAV must be linked against it)
+- **GPU decoding** (``gpu=True``): NVIDIA GPU with driver installed; the
+  standard PyAV wheels include NVDEC support
 - **VideoFramesCuda**: ``pip install framepump[cuda]`` (requires
   ``PyNvVideoCodec``)
 - **GLVideoWriter (GLX)**: NVIDIA GPU, X11 display, ``libnvidia-encode.so``

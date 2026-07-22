@@ -127,6 +127,10 @@ class VideoFrames:
             VideoFramesCuda for frames that stay in GPU memory).
         constant_framerate: False for VFR (native timestamps), True for CFR at
             original fps, or a number for CFR at that specific fps.
+        seekable: Override seek-support detection: False forces sequential
+            decode-from-start access (for streams where seeking is unreliable
+            or unsupported), True skips the automatic probing and assumes
+            seeking works. None (default) auto-detects.
         gray: Decode to single-channel grayscale: frames are (height, width)
             instead of (height, width, 3). With dtype=np.uint16 the decode is
             bit-exact for gray16le sources (e.g. FFV1 depth videos written by
@@ -473,7 +477,8 @@ class VideoFrames:
         Args:
             shape: Target size as (height, width), following numpy/image convention.
                 Note: this is the opposite order of ``video_extents()``, which
-                returns (width, height).
+                returns (width, height). The frame is stretched to exactly this
+                size; aspect ratio is not preserved.
         """
         if (
             not isinstance(shape, tuple)
@@ -1262,6 +1267,12 @@ class VideoFrames:
 
 def num_frames(path: PathLike, exact: bool = False, absolutely_exact: bool = False) -> int:
     """Count frames in a video.
+
+    By default this returns a fast **estimate** (container duration x fps),
+    which can be wrong for variable-frame-rate videos and arbitrarily wrong
+    when the container's duration metadata is bogus. Pass ``exact=True`` (or
+    use ``len(VideoFrames(path))``, which is always exact) when the count
+    matters.
 
     Args:
         path: Path to video file.

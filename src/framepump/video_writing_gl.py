@@ -138,7 +138,9 @@ class GLVideoWriter(
         """Append a GL texture to the current video sequence.
 
         Args:
-            data: GL texture to encode.
+            data: The texture to encode: a ``moderngl.Texture``, or any object
+                with a GL texture name in ``.glo`` and its dimensions in
+                ``.size``/``.width``/``.height`` attributes.
         """
         if not self._accepts_new_frames:
             raise ValueError('start_sequence has to be called before appending data')

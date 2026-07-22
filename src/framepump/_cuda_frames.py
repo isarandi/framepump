@@ -325,6 +325,11 @@ class VideoFramesCuda:
     yield DLPack-compatible objects. Use ``torch.from_dlpack(frame)`` to get
     a CUDA tensor.
 
+    Output is not bit-identical to CPU decoding (``VideoFrames``): the
+    YUV->RGB conversion runs in CUDA kernels rather than FFmpeg's swscale,
+    so pixel values typically differ by a few counts. ``VideoFrames``
+    with ``gpu=True`` is bit-identical to CPU decoding instead.
+
     API gaps vs ``VideoFrames`` (intentional): ``resized()``,
     ``repeat_each_frame()``, and ``constant_framerate`` are not supported on
     the GPU path. Use the CPU ``VideoFrames`` class when those are needed, or

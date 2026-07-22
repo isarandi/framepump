@@ -34,7 +34,10 @@ class EncoderConfig:
 
     Attributes:
         crf: Constant Rate Factor. Lower = better quality, larger files.
-            Range 0-51, default 15. Visually lossless ~17-18.
+            Range 0-51, default 15. Visually lossless ~17-18. Note that sharp
+            color edges (e.g. mask overlays) soften slightly at any crf: the
+            4:2:0 chroma subsampling of standard H.264/HEVC stores color at
+            half resolution.
         preset: Encoder effort preset.
             - NVENC (GPU): 'p1' (fastest) to 'p7' (slowest, best compression)
             - libx264 (CPU): 'ultrafast', 'veryfast', 'fast', 'medium',

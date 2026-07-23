@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Aborting a `JpegVideoWriterCUDA` or `GLVideoWriter` sequence (an exception inside the
+  `with` block) intermittently segfaulted in `nvEncDestroyEncoder`: the abort path tore
+  the NVENC session down while frames were still queued in the encoder's B-frame reorder
+  buffer, with their input resources unmapped and bitstream buffers destroyed out from
+  under the encoder. `close()` now drains the encoder with an EOS flush (output discarded)
+  before releasing resources whenever frames are pending.
 - `VideoFrames(gpu=True)` silently decoded on the CPU: the CUDA hwaccel flags it
   passed to `av.open()` are ffmpeg CLI options that the libav libraries ignore, so
   since the 0.2.0 PyAV rewrite no GPU decoding ever happened (the 0.1.x ffmpeg-

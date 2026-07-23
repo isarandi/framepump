@@ -396,9 +396,18 @@ class NvencEncodeSession:
         return packets
 
     def close(self) -> None:
-        """Release all session resources."""
+        """Release all session resources, draining any queued frames first."""
         if self._closed:
             return
+        if self._encoder is not None and not self._flushed and self._pending_inputs:
+            # Destroying the encoder while frames sit in its reorder queue is
+            # undefined behavior (intermittent segfault in nvEncDestroyEncoder);
+            # drain via EOS and discard the output. Best-effort: if the drain
+            # fails, teardown must still proceed.
+            try:
+                self.flush()
+            except Exception:
+                pass
         self._closed = True
 
         if self._encoder:

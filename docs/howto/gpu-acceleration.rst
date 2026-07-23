@@ -95,7 +95,7 @@ exported via DLPack for zero-copy access from PyTorch, CuPy, etc.
         tensor = torch.from_dlpack(decoded_frame)  # no copy, shares GPU memory
         # tensor is (H, W, 3) uint8 on CUDA
 
-``VideoFramesCuda`` supports the same slicing and indexing as ``VideoFrames``:
+``VideoFramesCuda`` supports slicing and indexing:
 
 .. code-block:: python
 

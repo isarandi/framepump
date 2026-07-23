@@ -251,6 +251,11 @@ class VideoFrames:
         self._selection = FrameSelection.identity()
 
     def __iter__(self) -> Generator[NDArray, None, None]:
+        """Decode and yield the selected frames in order.
+
+        Each frame is a numpy array of shape (height, width, 3), or
+        (height, width) in grayscale mode, with the configured dtype.
+        """
         internal_dtype = np.uint8 if self.dtype == np.uint8 else np.uint16
 
         # Stream without the index when the selection is a plain forward
@@ -465,6 +470,15 @@ class VideoFrames:
     def __getitem__(self, item: slice) -> VideoFrames: ...
 
     def __getitem__(self, item: int | slice) -> NDArray | VideoFrames:
+        """Access a single frame by index or create a sliced lazy view.
+
+        Args:
+            item: Frame index (negative indices count from the end) or slice.
+
+        Returns:
+            The decoded frame as a numpy array for an integer index, or a
+            new lazy VideoFrames view for a slice (no decoding happens).
+        """
         if isinstance(item, int):
             # Handle negative indices
             length = len(self)
@@ -502,6 +516,10 @@ class VideoFrames:
             raise TypeError('VideoFrames indices must be integers or slices.')
 
     def __len__(self) -> int:
+        """Exact number of frames in this view.
+
+        Builds the frame index on first use, which scans the file's packets.
+        """
         return len(self._resolved_range()) * self.repeat_count
 
     def __repr__(self) -> str:
@@ -545,6 +563,15 @@ class VideoFrames:
         return result
 
     def repeat_each_frame(self, n: int) -> 'VideoFrames':
+        """Return a new VideoFrames that yields each selected frame ``n`` times.
+
+        The effective ``fps`` scales by ``n`` accordingly. Apply slicing
+        before this, not after: slicing a repeated view raises
+        NotImplementedError.
+
+        Args:
+            n: Repeat count, at least 1.
+        """
         try:
             n = operator.index(n)
         except TypeError:

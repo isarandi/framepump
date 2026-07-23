@@ -441,6 +441,11 @@ class VideoFramesCuda:
     # ── Public interface ──────────────────────────────────────────────
 
     def __iter__(self):
+        """Decode and yield the selected frames on the GPU, in order.
+
+        Each yielded frame stays in GPU memory and supports ``__dlpack__``
+        for zero-copy import into PyTorch, CuPy, etc.
+        """
         # Stream without the index when the selection is a plain forward
         # slice with a small start. If the index already exists, the
         # seek-based paths are at least as good — use them.
@@ -526,6 +531,15 @@ class VideoFramesCuda:
             )
 
     def __getitem__(self, item):
+        """Access a single frame by index or create a sliced lazy view.
+
+        Args:
+            item: Frame index (negative indices count from the end) or slice.
+
+        Returns:
+            A GPU-resident frame supporting ``__dlpack__`` for an integer
+            index, or a new lazy VideoFramesCuda view for a slice.
+        """
         if isinstance(item, int):
             length = len(self)
             if item < 0:
@@ -550,6 +564,10 @@ class VideoFramesCuda:
         raise TypeError('Indices must be integers or slices.')
 
     def __len__(self) -> int:
+        """Exact number of frames in this view.
+
+        Builds the frame index on first use, which scans the file's packets.
+        """
         return len(self._resolved_range())
 
     def __repr__(self) -> str:

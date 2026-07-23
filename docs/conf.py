@@ -107,7 +107,13 @@ autodoc_default_options = {
     'exclude-members': '__init__, __weakref__, __repr__, __str__',
 }
 
-autoapi_options = ['members', 'show-inheritance', 'special-members', 'show-module-summary']
+autoapi_options = [
+    'members',
+    'show-inheritance',
+    'special-members',
+    'show-module-summary',
+    'imported-members',
+]
 autoapi_add_toctree_entry = True
 autoapi_dirs = ['../src']
 autoapi_template_dir = '_templates/autoapi'
@@ -125,18 +131,44 @@ python_display_short_literal_types = True
 # -- Skip undocumented members -----------------------------------------------
 
 
+# The API reference shows the top-level package (the public API re-exports)
+# plus the CUDA-only modules: their classes are imported conditionally in
+# __init__, which autoapi's static analysis cannot follow, so they are
+# documented in place.
+_visible_modules = {
+    main_module_name,
+    f'{main_module_name}.cuda_video_writer',
+    f'{main_module_name}._cuda_frames',
+    f'{main_module_name}._cuda_gl',
+}
+
+
 def autodoc_skip_member(app, what, name, obj, skip, options):
-    """Skip members (functions, classes, modules) without docstrings."""
+    """Skip members without docstrings and modules outside _visible_modules.
+
+    Returns None (defer to the default decision) otherwise; the only
+    force-include (False) is for the CUDA modules whose underscore prefix
+    would hide them by default.
+    """
     if not getattr(obj, 'docstring', None):
         return True
-    elif what in ('class', 'function', 'attribute', 'exception'):
+    if what in ('module', 'package'):
+        if name not in _visible_modules:
+            return True
+        if name.rsplit('.', 1)[-1].startswith('_'):
+            return False
+        return None
+    if what in ('class', 'function', 'attribute', 'exception'):
         module_name = '.'.join(name.split('.')[:-1])
         try:
             module = importlib.import_module(module_name)
-            return not getattr(module, '__doc__', None)
-        except ModuleNotFoundError:
-            return None
-    return skip
+            if not getattr(module, '__doc__', None):
+                return True
+        except Exception:
+            # CUDA-only modules may fail to import on machines without the
+            # CUDA stack; fall through to the default decision.
+            pass
+    return None
 
 
 def setup(app):

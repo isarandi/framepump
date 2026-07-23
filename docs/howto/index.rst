@@ -9,3 +9,4 @@ Practical recipes for common tasks.
    frame-accurate-processing
    batch-video-writing
    gpu-acceleration
+   handling-errors

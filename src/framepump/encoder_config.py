@@ -39,9 +39,11 @@ class EncoderConfig:
             4:2:0 chroma subsampling of standard H.264/HEVC stores color at
             half resolution.
         preset: Encoder effort preset.
+
             - NVENC (GPU): 'p1' (fastest) to 'p7' (slowest, best compression)
             - libx264 (CPU): 'ultrafast', 'veryfast', 'fast', 'medium',
-                            'slow', 'slower', 'veryslow'
+              'slow', 'slower', 'veryslow'
+
             Auto-translated between NVENC and libx264 names.
             Default: None (uses encoder default)
         bframes: Number of B-frames. More = better compression for static

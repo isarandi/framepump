@@ -62,6 +62,7 @@ docs = [
     "sphinx",
     "pydata-sphinx-theme",
     "sphinx-autoapi",
+    "sphinx-codeautolink",
     "sphinxcontrib-bibtex",
     "setuptools-scm",
     "toml",

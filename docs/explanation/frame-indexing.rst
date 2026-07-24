@@ -44,36 +44,26 @@ From this data, FramePump computes:
 - **frame_pts**: a sorted list of unique PTS values. This is the display
   order. Its length is the exact frame count.
 
-- **safe_seek_pts**: for each frame, the latest packet position where all
-  packets needed to decode the target frame have already been seen.
+- **safe_seek_pts**: for each frame, the PTS of the last packet that
+  appears in the file before any packet with a later PTS than that frame.
+  Requesting this timestamp with a backward seek lands on a keyframe from
+  which forward decoding passes through every packet the frame needs.
 
 All timestamps are stored as exact fractions (``fractions.Fraction``) to avoid
 floating-point rounding errors.
 
 
-Safe Seek Points
-----------------
-
-The key insight is the **running maximum**: at any point in the packet stream,
-the running max tells you the latest display timestamp that has been fully
-"delivered" — all packets with PTS up to that value have been read.
-
-To find a safe seek point for a target frame:
-
-- Find the latest position in the packet stream where the running maximum is
-  less than or equal to the target PTS.
-- Seeking to that position guarantees that when you decode forward, all
-  reference frames are available.
-
-This handles B-frames correctly without parsing codec-specific bitstream
-syntax.
-
 When you access ``frames[42]``, FramePump:
 
 1. Looks up the target PTS and the safe seek point from the index.
-2. Seeks to the safe position (at or before a keyframe).
+2. Requests a backward seek to the safe seek point, landing on a keyframe
+   that precedes everything the target frame needs.
 3. Decodes forward, comparing each frame's PTS to the target.
 4. Returns the matching frame.
+
+How the safe seek point is chosen — and why it works for B-frames without
+parsing codec-specific bitstream syntax — is explained with a worked
+example in :doc:`safe-seek-points`.
 
 
 Why Duration × FPS Is Wrong

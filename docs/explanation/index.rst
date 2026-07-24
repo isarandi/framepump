@@ -8,4 +8,5 @@ These pages explain the algorithms and design decisions behind FramePump.
 
    lazy-evaluation
    frame-indexing
+   safe-seek-points
    nvenc-zero-copy

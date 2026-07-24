@@ -50,6 +50,8 @@ test = [
     "pytest>=7.0",
     "pytest-cov",
     "pytest-forked",
+    "pytest-timeout",
+    "hypothesis",
 ]
 lint = [
     "ruff==0.8.0",  # Keep in sync with .pre-commit-config.yaml

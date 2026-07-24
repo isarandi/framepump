@@ -22,9 +22,12 @@ import pytest
 def _gpu_available():
     try:
         import ctypes
+        import importlib.util
 
         ctypes.CDLL('libcuda.so.1')
         ctypes.CDLL('libnvidia-encode.so.1')
+        if importlib.util.find_spec('cuda.bindings') is None:
+            return False
         from framepump.nvjpeg.bindings import _lib
 
         return _lib is not None
@@ -173,12 +176,11 @@ def test_odd_height_420_raises(tmp_path):
 
 
 def test_invalid_chroma_rejected():
-    framepump = pytest.importorskip('framepump')
-    writer_cls = getattr(framepump, 'JpegVideoWriterCUDA', None)
-    if writer_cls is None:
-        pytest.skip('JpegVideoWriterCUDA not available (no CUDA)')
+    # Import the real module, not the package-level name: without the CUDA
+    # stack that name is a stub whose constructor raises ImportError.
+    cvw = pytest.importorskip('framepump.cuda_video_writer')
     with pytest.raises(ValueError, match='chroma'):
-        writer_cls(chroma='422p')
+        cvw.JpegVideoWriterCUDA(chroma='422p')
 
 
 @needs_gpu

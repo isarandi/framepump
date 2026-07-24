@@ -191,10 +191,11 @@ def _gpu_available():
     """Library-presence probe only: no CUDA/GL initialization at collection."""
     try:
         import ctypes
+        import importlib.util
 
         ctypes.CDLL('libnvidia-encode.so.1')
         ctypes.CDLL('libnvjpeg.so')
-        return True
+        return importlib.util.find_spec('cuda.bindings') is not None
     except Exception:
         return False
 
@@ -381,6 +382,7 @@ class TestZeroFrames:
             writer.end_sequence()
         assert list(tmp_path.iterdir()) == []
 
+    @gpu_only
     def test_jpeg_zero_frames(self, tmp_path):
         from framepump import JpegVideoWriterCUDA
 

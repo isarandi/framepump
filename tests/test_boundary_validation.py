@@ -206,7 +206,7 @@ class TestNppBindings:
 # ---------------------------------------------------------------------------
 class TestCuCtxCreateCompat:
     def test_signature_detected_at_import(self):
-        from framepump import _cuda_compat
+        _cuda_compat = pytest.importorskip('framepump._cuda_compat')
 
         assert isinstance(_cuda_compat._CTX_CREATE_TAKES_PARAMS, bool)
 

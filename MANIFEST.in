@@ -1,0 +1,2 @@
+# Keep the sdist small: the test media corpus is only needed in a git checkout.
+prune tests/data

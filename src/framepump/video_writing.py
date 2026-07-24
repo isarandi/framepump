@@ -412,7 +412,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         elif exc_type is not None:
             # An exception escaped the with-block: discard the in-flight
             # sequence instead of promoting a partial file to the final path
-            # (matching GLVideoWriter and JpegVideoWriterCUDA). Secondary
+            # (matching GLVideoWriter and NvJpegVideoWriter). Secondary
             # errors must not mask the original exception.
             try:
                 self._abort()

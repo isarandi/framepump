@@ -4,7 +4,7 @@ The muxer unit tests run CPU-only on synthetic x264 Annex-B packets shaped
 like the NVENC encoders' output, so container policy (timestamps, movflags
 scoping, avi warning, temp-file lifecycle, audio interleaving) is covered
 without a GPU. The writer integration tests exercise the same paths through
-GLVideoWriter and JpegVideoWriterCUDA on the GPU.
+GLVideoWriter and NvJpegVideoWriter on the GPU.
 """
 
 import io
@@ -277,9 +277,9 @@ def make_jpeg(idx, w=320, h=240):
 
 
 def write_jpeg_video(out, n=30, bframes=2, audio_source_path=None):
-    from framepump import EncoderConfig, JpegVideoWriterCUDA
+    from framepump import EncoderConfig, NvJpegVideoWriter
 
-    with JpegVideoWriterCUDA(encoder_config=EncoderConfig(bframes=bframes)) as writer:
+    with NvJpegVideoWriter(encoder_config=EncoderConfig(bframes=bframes)) as writer:
         writer.start_sequence(str(out), fps=30, audio_source_path=audio_source_path)
         for i in range(n):
             writer.append_data(make_jpeg(i))
@@ -352,11 +352,11 @@ class TestWriterIntegration:
 
     @gpu_only
     def test_jpeg_mux_error_leaves_no_files(self, tmp_path, monkeypatch):
-        from framepump import EncoderConfig, JpegVideoWriterCUDA
+        from framepump import EncoderConfig, NvJpegVideoWriter
         from framepump._h264_mux import H264PassthroughMuxer
 
         out = tmp_path / 'out.mp4'
-        writer = JpegVideoWriterCUDA(encoder_config=EncoderConfig(bframes=2))
+        writer = NvJpegVideoWriter(encoder_config=EncoderConfig(bframes=2))
         writer.start_sequence(str(out), fps=30)
         for i in range(10):
             writer.append_data(make_jpeg(i))
@@ -384,10 +384,10 @@ class TestZeroFrames:
 
     @gpu_only
     def test_jpeg_zero_frames(self, tmp_path):
-        from framepump import JpegVideoWriterCUDA
+        from framepump import NvJpegVideoWriter
 
         out = tmp_path / 'out.mp4'
-        with JpegVideoWriterCUDA() as writer:
+        with NvJpegVideoWriter() as writer:
             writer.start_sequence(str(out), fps=30)
             writer.end_sequence()
         assert list(tmp_path.iterdir()) == []

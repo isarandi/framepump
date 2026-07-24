@@ -1,6 +1,6 @@
 """CPU-only machines must get helpful errors from the CUDA-only classes.
 
-Without the CUDA stack, JpegVideoWriterCUDA/VideoFramesCuda/CudaToGLUploader
+Without the CUDA stack, NvJpegVideoWriter/VideoFramesCuda/CudaToGLUploader
 are import-time stubs: instantiating one must raise an ImportError naming the
 missing dependencies, not "'NoneType' object is not callable".
 """
@@ -37,7 +37,7 @@ sys.meta_path.insert(0, _Blocker())
 
 import framepump
 
-for cls_name in ('JpegVideoWriterCUDA', 'VideoFramesCuda', 'CudaToGLUploader'):
+for cls_name in ('NvJpegVideoWriter', 'VideoFramesCuda', 'CudaToGLUploader'):
     cls = getattr(framepump, cls_name)
     try:
         cls()

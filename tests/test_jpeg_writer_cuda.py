@@ -1,4 +1,4 @@
-"""Content round-trip tests for JpegVideoWriterCUDA.
+"""Content round-trip tests for NvJpegVideoWriter.
 
 The writer decodes JPEGs with nvJPEG and encodes with NVENC entirely on the
 GPU. These tests verify that the decoded video matches the JPEG content — in
@@ -65,13 +65,11 @@ def make_jpeg(width, height, idx, subsampling):
 
 
 def write_video(out_path, jpegs, chroma=None, bframes=2):
-    from framepump import JpegVideoWriterCUDA
+    from framepump import NvJpegVideoWriter
     from framepump.encoder_config import EncoderConfig
 
     config = EncoderConfig(bframes=bframes)
-    with JpegVideoWriterCUDA(
-        str(out_path), fps=30, encoder_config=config, chroma=chroma
-    ) as writer:
+    with NvJpegVideoWriter(str(out_path), fps=30, encoder_config=config, chroma=chroma) as writer:
         for jpeg in jpegs:
             writer.append_data(jpeg)
 
@@ -123,11 +121,11 @@ def test_roundtrip_unaligned_height_matches_control(tmp_path, jpeg_subsampling, 
 
 @needs_gpu
 def test_dimension_change_raises(tmp_path):
-    from framepump import JpegVideoWriterCUDA
+    from framepump import NvJpegVideoWriter
 
     out_path = tmp_path / 'out.mp4'
     with pytest.raises(ValueError, match='dimensions'):
-        with JpegVideoWriterCUDA(str(out_path), fps=30) as writer:
+        with NvJpegVideoWriter(str(out_path), fps=30) as writer:
             writer.append_data(make_jpeg(320, 240, 0, PIL_420))
             writer.append_data(make_jpeg(640, 480, 1, PIL_420))
     assert not out_path.exists()
@@ -136,11 +134,11 @@ def test_dimension_change_raises(tmp_path):
 
 @needs_gpu
 def test_subsampling_change_raises(tmp_path):
-    from framepump import JpegVideoWriterCUDA
+    from framepump import NvJpegVideoWriter
 
     out_path = tmp_path / 'out.mp4'
     with pytest.raises(ValueError, match='subsampling'):
-        with JpegVideoWriterCUDA(str(out_path), fps=30) as writer:
+        with NvJpegVideoWriter(str(out_path), fps=30) as writer:
             writer.append_data(make_jpeg(320, 240, 0, PIL_420))
             writer.append_data(make_jpeg(320, 240, 1, PIL_444))
     assert not out_path.exists()
@@ -150,14 +148,14 @@ def test_subsampling_change_raises(tmp_path):
 @needs_gpu
 def test_abort_leaves_no_files(tmp_path):
     """An exception mid-write must abort: no final file, no stranded temp."""
-    from framepump import JpegVideoWriterCUDA
+    from framepump import NvJpegVideoWriter
 
     class Boom(Exception):
         pass
 
     out_path = tmp_path / 'out.mp4'
     with pytest.raises(Boom):
-        with JpegVideoWriterCUDA(str(out_path), fps=30) as writer:
+        with NvJpegVideoWriter(str(out_path), fps=30) as writer:
             for i in range(3):
                 writer.append_data(make_jpeg(320, 240, i, PIL_420))
             raise Boom()
@@ -167,12 +165,27 @@ def test_abort_leaves_no_files(tmp_path):
 @needs_gpu
 def test_odd_height_420_raises(tmp_path):
     """4:2:0 output cannot represent odd display dimensions."""
-    from framepump import JpegVideoWriterCUDA
+    from framepump import NvJpegVideoWriter
 
     with pytest.raises(ValueError, match='even'):
-        with JpegVideoWriterCUDA(str(tmp_path / 'odd.mp4'), fps=30) as writer:
+        with NvJpegVideoWriter(str(tmp_path / 'odd.mp4'), fps=30) as writer:
             writer.append_data(make_jpeg(320, 241, 0, PIL_420))
     assert list(tmp_path.iterdir()) == []
+
+
+def test_former_name_still_resolves_with_warning():
+    import framepump
+
+    with pytest.warns(DeprecationWarning, match='renamed to NvJpegVideoWriter'):
+        alias = framepump.JpegVideoWriterCUDA
+    assert alias is framepump.NvJpegVideoWriter
+
+
+def test_unknown_attribute_still_raises_attribute_error():
+    import framepump
+
+    with pytest.raises(AttributeError, match='no attribute'):
+        framepump.NoSuchThing
 
 
 def test_invalid_chroma_rejected():
@@ -180,16 +193,16 @@ def test_invalid_chroma_rejected():
     # stack that name is a stub whose constructor raises ImportError.
     cvw = pytest.importorskip('framepump.cuda_video_writer')
     with pytest.raises(ValueError, match='chroma'):
-        cvw.JpegVideoWriterCUDA(chroma='422p')
+        cvw.NvJpegVideoWriter(chroma='422p')
 
 
 @needs_gpu
 class TestSequenceAbortOnException:
     def test_exception_in_sequence_context_leaves_no_file(self, tmp_path):
-        from framepump import JpegVideoWriterCUDA
+        from framepump import NvJpegVideoWriter
 
         out = tmp_path / 'aborted.mp4'
-        writer = JpegVideoWriterCUDA(gpu=0)
+        writer = NvJpegVideoWriter(gpu=0)
         with pytest.raises(RuntimeError, match='simulated'):
             with writer.start_sequence(str(out), fps=30):
                 writer.append_data(make_jpeg(320, 240, 0, PIL_420))
@@ -199,10 +212,10 @@ class TestSequenceAbortOnException:
         assert not list(tmp_path.glob('*.tmp_*'))
 
     def test_corrupt_later_jpeg_raises_value_error(self, tmp_path):
-        from framepump import JpegVideoWriterCUDA
+        from framepump import NvJpegVideoWriter
 
         out = tmp_path / 'out.mp4'
-        writer = JpegVideoWriterCUDA(str(out), fps=30)
+        writer = NvJpegVideoWriter(str(out), fps=30)
         writer.append_data(make_jpeg(320, 240, 0, PIL_420))
         with pytest.raises(ValueError, match='Could not parse JPEG data'):
             writer.append_data(b'\xff\xd8\xff\xe0garbage-not-a-jpeg')
@@ -211,11 +224,11 @@ class TestSequenceAbortOnException:
         assert not list(tmp_path.glob('*.tmp_*'))
 
     def test_writer_usable_after_aborted_sequence(self, tmp_path):
-        from framepump import JpegVideoWriterCUDA, VideoFrames
+        from framepump import NvJpegVideoWriter, VideoFrames
 
         aborted = tmp_path / 'aborted.mp4'
         good = tmp_path / 'good.mp4'
-        writer = JpegVideoWriterCUDA(gpu=0)
+        writer = NvJpegVideoWriter(gpu=0)
         with pytest.raises(RuntimeError, match='simulated'):
             with writer.start_sequence(str(aborted), fps=30):
                 writer.append_data(make_jpeg(320, 240, 0, PIL_420))
@@ -231,10 +244,10 @@ class TestSequenceAbortOnException:
 @needs_gpu
 class TestFailedFirstFrame:
     def test_corrupt_first_jpeg_fails_cleanly(self, tmp_path):
-        from framepump import JpegVideoWriterCUDA
+        from framepump import NvJpegVideoWriter
 
         out = tmp_path / 'out.mp4'
-        writer = JpegVideoWriterCUDA(str(out), fps=30)
+        writer = NvJpegVideoWriter(str(out), fps=30)
         with pytest.raises(ValueError, match='Could not parse JPEG data'):
             writer.append_data(b'\xff\xd8\xff\xe0garbage-not-a-jpeg')
         # A retry must fail with a clear error, never ZeroDivisionError or

@@ -264,9 +264,7 @@ def _patch_sps_crop(data: bytes, crop_right: int, crop_bottom: int) -> bytes:
     return bytes(result)
 
 
-class JpegVideoWriterCUDA(
-    AbstractVideoWriter[bytes], AbstractContextManager['JpegVideoWriterCUDA']
-):
+class NvJpegVideoWriter(AbstractVideoWriter[bytes], AbstractContextManager['NvJpegVideoWriter']):
     """Zero-copy JPEG to video writer using nvJPEG decoder and NVENC encoder.
 
     Decodes JPEG to YUV on GPU with nvJPEG and encodes with NVENC - all
@@ -279,7 +277,7 @@ class JpegVideoWriterCUDA(
     if the body raised.
 
     Example:
-        >>> with JpegVideoWriterCUDA('output.mp4', fps=30) as writer:
+        >>> with NvJpegVideoWriter('output.mp4', fps=30) as writer:
         ...     for jpeg_bytes in jpeg_frames:
         ...         writer.append_data(jpeg_bytes)
     """

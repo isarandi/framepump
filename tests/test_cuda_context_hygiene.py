@@ -103,13 +103,13 @@ class TestWriterEncoderContextNeutral:
     def test_jpeg_writer_leaves_no_ctx(self, tmp_path):
         driver = _cuda()
         framepump = pytest.importorskip('framepump')
-        if not hasattr(framepump, 'JpegVideoWriterCUDA'):
-            pytest.skip('JpegVideoWriterCUDA not available')
+        if not hasattr(framepump, 'NvJpegVideoWriter'):
+            pytest.skip('NvJpegVideoWriter not available')
 
         out = tmp_path / 'ctx.mp4'
         jpeg = _make_jpeg(256, 128)  # NVENC has a minimum frame size (~145x49)
         assert _current_ctx(driver) == 0
-        writer = framepump.JpegVideoWriterCUDA(str(out), fps=30)
+        writer = framepump.NvJpegVideoWriter(str(out), fps=30)
         for _ in range(3):
             writer.append_data(jpeg)
             assert _current_ctx(driver) == 0, 'append_data left a context current'

@@ -28,7 +28,7 @@ Choosing the Right Class
      - Encode
      - MP4 file
      - You're encoding OpenGL textures to video (zero CPU transfer)
-   * - ``JpegVideoWriterCUDA``
+   * - ``NvJpegVideoWriter``
      - Encode
      - MP4 file
      - You have JPEG byte streams and want fully GPU-resident encoding
@@ -200,7 +200,7 @@ each frame. It's useful when your frames are already in numpy arrays and you
 want faster encoding than libx264.
 
 
-JpegVideoWriterCUDA
+NvJpegVideoWriter
 ~~~~~~~~~~~~~~~~~~~
 
 A specialized writer for the case when the input data consists of frames in JPEG
@@ -216,9 +216,9 @@ Common use cases:
 
 .. code-block:: python
 
-    from framepump import JpegVideoWriterCUDA
+    from framepump import NvJpegVideoWriter
 
-    with JpegVideoWriterCUDA('output.mp4', fps=30, gpu=0) as writer:
+    with NvJpegVideoWriter('output.mp4', fps=30, gpu=0) as writer:
         for jpeg_bytes in camera_stream:
             writer.append_data(jpeg_bytes)  # bytes object
 
@@ -231,7 +231,7 @@ first JPEG frame, or set explicitly:
 
 .. code-block:: python
 
-    writer = JpegVideoWriterCUDA('output.mp4', fps=30, gpu=0, chroma='444')
+    writer = NvJpegVideoWriter('output.mp4', fps=30, gpu=0, chroma='444')
 
 **Pipeline:**
 
@@ -275,5 +275,5 @@ Requirements
 - **GLVideoWriter (GLX)**: NVIDIA GPU, X11 display, ``libnvidia-encode.so``
 - **GLVideoWriter (headless)**: ``pip install framepump[nvenc-cuda]``
   (``cuda-python``)
-- **JpegVideoWriterCUDA**: ``pip install framepump[cuda]`` (``cuda-python``,
+- **NvJpegVideoWriter**: ``pip install framepump[cuda]`` (``cuda-python``,
   nvJPEG)

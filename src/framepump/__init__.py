@@ -5,6 +5,8 @@ and threaded video writing via VideoWriter. For GPU encoding, GLVideoWriter
 offers zero-copy OpenGL texture to video encoding using NVENC.
 """
 
+import warnings
+
 from ._core import (
     VideoFrames,
     get_duration,
@@ -51,10 +53,10 @@ def _make_cuda_stub(class_name: str, requirements: str) -> type:
 
 
 try:
-    from .cuda_video_writer import JpegVideoWriterCUDA
+    from .cuda_video_writer import NvJpegVideoWriter
 except ImportError:
-    JpegVideoWriterCUDA = _make_cuda_stub(
-        'JpegVideoWriterCUDA', 'cuda-python and the nvJPEG/NVENC libraries (CUDA toolkit)'
+    NvJpegVideoWriter = _make_cuda_stub(
+        'NvJpegVideoWriter', 'cuda-python and the nvJPEG/NVENC libraries (CUDA toolkit)'
     )
 
 try:
@@ -86,7 +88,7 @@ __all__ = [
     'VideoWriter',
     'DepthVideoWriter',
     'GLVideoWriter',
-    'JpegVideoWriterCUDA',
+    'NvJpegVideoWriter',
     'VideoFramesCuda',
     'CudaToGLUploader',
     'EncoderConfig',
@@ -99,6 +101,22 @@ __all__ = [
     'has_audio',
     '__version__',
 ]
+
+
+_DEPRECATED_ALIASES = {'JpegVideoWriterCUDA': 'NvJpegVideoWriter'}
+
+
+def __getattr__(name: str):
+    """Resolve renamed classes under their former names, with a warning."""
+    current_name = _DEPRECATED_ALIASES.get(name)
+    if current_name is None:
+        raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    warnings.warn(
+        f'{name} was renamed to {current_name}; the old name will be removed in 1.0.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return globals()[current_name]
 
 
 # Set __module__ to this module for sphinx-codeautolink to resolve references.

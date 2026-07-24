@@ -354,11 +354,11 @@ class TestPixelRoundtrip:
 
         writer = VideoWriter()
         writer.start_sequence(str(video_path), fps=30, gpu=True)
-        for _ in range(5):
-            writer.append_data(frame)
         try:
+            for _ in range(5):
+                writer.append_data(frame)
             writer.end_sequence()
-        except RuntimeError as e:
+        except (RuntimeError, VideoEncodeError) as e:
             writer.close()
             if 'nvenc' in str(e).lower() or 'not permitted' in str(e).lower():
                 pytest.skip(f'NVENC not available: {e}')

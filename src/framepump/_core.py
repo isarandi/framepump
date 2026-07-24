@@ -144,6 +144,11 @@ class VideoFrames:
     Frames are only decoded when iterated. Slicing and resizing are lazy operations
     that return new VideoFrames instances without loading pixel data.
 
+    Output is always numpy arrays in CPU memory. ``gpu=True`` changes only
+    where the *decoding* happens (NVDEC instead of libavcodec); each frame is
+    still downloaded, and the pixels are bit-identical either way. For frames
+    that stay in GPU memory, use ``VideoFramesCuda`` instead.
+
     Example:
         >>> frames = VideoFrames('video.mp4')
         >>> for frame in frames[::2][:100].resized((128, 128)):

@@ -321,9 +321,11 @@ class _NvDecSession:
 class VideoFramesCuda:
     """Lazy, sliceable GPU video frame iterator using NVDEC (low-level API).
 
-    Frames are decoded on GPU and stay on GPU. Both iteration and indexing
-    yield DLPack-compatible objects. Use ``torch.from_dlpack(frame)`` to get
-    a CUDA tensor.
+    Frames are decoded on GPU and stay on GPU: iteration and indexing yield
+    DLPack-compatible objects, so ``torch.from_dlpack(frame)`` gives a CUDA
+    tensor with no copy. That GPU residency of the *output* is the difference
+    from ``VideoFrames(gpu=True)``, which also decodes with NVDEC but
+    downloads every frame to a numpy array.
 
     Output is not bit-identical to CPU decoding (``VideoFrames``): the
     YUV->RGB conversion runs in CUDA kernels rather than FFmpeg's swscale,

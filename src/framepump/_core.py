@@ -105,6 +105,11 @@ _STREAM_MAX_SKIP = 256
 # frame count is derived from this budget (clamped to [4, 64] frames).
 _REVERSE_CHUNK_BYTES = 256 * 1024 * 1024
 
+# Measured crossover between decoding through a gap and seeking over it
+# (seeking is fast with PyAV, ~10 ms): gaps up to this many frames decode
+# through, larger ones seek. Used by strided iteration and frames_at().
+_SEEK_VS_DECODE_MAX_SKIP = 30
+
 
 class _LazyIndexState:
     """Frame-index state shared between a VideoFrames and all its views.
@@ -591,12 +596,57 @@ class VideoFrames:
     def _frame_shape(self) -> tuple[int, ...]:
         return self.imshape if self.gray else (*self.imshape, 3)
 
+    def frames_at(self, indices) -> Generator[NDArray, None, None]:
+        """Yield the frames at the given indices, in the given order (lazy).
+
+        One reader walks the file, deciding per step whether to seek to the
+        next index or to decode through the gap (same measured crossover as
+        strided iteration), so sorted or mostly-forward index sequences
+        stream efficiently. Backward jumps work but cost a seek each.
+        Negative indices count from the end; a repeated index re-yields a
+        copy of the frame without decoding it again.
+        """
+        if self.repeat_count != 1:
+            raise NotImplementedError(
+                'frames_at() after repeat_each_frame() is not supported; '
+                'apply repeat_each_frame() afterwards or map indices yourself.'
+            )
+        length: int | None = None
+        run = None  # running sequential iterator over self[cursor:]
+        cursor: int | None = None  # index the running iterator yields next
+        last_idx: int | None = None
+        last_frame: NDArray | None = None
+        for raw in indices:
+            idx = operator.index(raw)
+            if idx < 0:
+                if length is None:
+                    length = len(self)
+                idx += length
+                if idx < 0:
+                    raise IndexError(f'Frame index {raw} out of range')
+            if idx == last_idx:
+                yield last_frame.copy()
+                continue
+            try:
+                if run is not None and cursor <= idx <= cursor + _SEEK_VS_DECODE_MAX_SKIP:
+                    for _ in range(idx - cursor):
+                        next(run)
+                else:
+                    run = iter(self[idx:])
+                frame = next(run)
+            except StopIteration:
+                raise IndexError(f'Frame index {raw} out of range') from None
+            cursor = idx + 1
+            last_idx, last_frame = idx, frame
+            yield frame
+
     def _gather_indices(self, item) -> NDArray:
         """Numpy-style integer-array indexing: decode the listed frames.
 
         Returns a stacked array (like numpy's fancy indexing, this is eager).
-        Indices may repeat and may be negative; frames are decoded in sorted
-        order so nearby indices share seek locality, each unique frame once.
+        Decodes in sorted order through ``frames_at`` — nearby indices share
+        one sequential pass, far apart ones seek — and places each frame at
+        its requested output position (inverse of the sort permutation).
         """
         indices = np.asarray(item)
         if indices.dtype == bool:
@@ -607,16 +657,15 @@ class VideoFrames:
             raise TypeError(f'Index arrays must be one-dimensional, got shape {indices.shape}.')
         length = len(self)
         normalized = np.where(indices < 0, indices + length, indices).astype(np.int64)
+        if normalized.size and (normalized.min() < 0 or normalized.max() >= length):
+            bad = indices[(normalized < 0) | (normalized >= length)][0]
+            raise IndexError(f'Frame index {bad} out of range for video with {length} frames')
 
         out = np.empty((len(normalized), *self._frame_shape()), dtype=self.dtype)
-        last_src: int | None = None
-        last_frame: NDArray | None = None
-        for out_pos in np.argsort(normalized, kind='stable'):
-            src = int(normalized[out_pos])
-            if src != last_src:
-                last_frame = self[src]  # bounds-checked, seek-based
-                last_src = src
-            out[out_pos] = last_frame
+        order = np.argsort(normalized, kind='stable')
+        frames = self.frames_at(int(normalized[k]) for k in order)
+        for k, frame in zip(order, frames):
+            out[k] = frame
         return out
 
     def __repr__(self) -> str:
@@ -763,9 +812,8 @@ class VideoFrames:
         slice_step = frame_range.step
 
         # Large step (either direction): more efficient to seek to each frame
-        # individually. Threshold is lower with PyAV since seeking is fast
-        # (~10ms vs ~100ms). range() iterates backward natively for step < 0.
-        if abs(slice_step) > 30:
+        # individually. range() iterates backward natively for step < 0.
+        if abs(slice_step) > _SEEK_VS_DECODE_MAX_SKIP:
             return self._iter_with_individual_seeks(
                 reader, slice_start, slice_stop, slice_step, internal_dtype
             )

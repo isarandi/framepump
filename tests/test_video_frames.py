@@ -403,3 +403,33 @@ class TestFancyIndexing:
             v[[0.5, 1.5]]
         with pytest.raises(IndexError):
             v[[0, 10_000]]
+
+
+class TestFramesAt:
+    """Lazy gap-aware access: decode-through small gaps, seek over large ones."""
+
+    def test_given_order_preserved(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        wanted = [2, 5, 16, 3, 3, -1]
+        resolved = [2, 5, 16, 3, 3, len(v) - 1]
+        for got, j in zip(v.frames_at(wanted), resolved):
+            assert np.array_equal(got, v[j])
+
+    def test_is_lazy(self, sample_video):
+        path, *_ = sample_video
+        gen = VideoFrames(path).frames_at([0, 10_000])  # bad index not reached
+        assert np.array_equal(next(gen), VideoFrames(path)[0])
+        with pytest.raises(IndexError):
+            next(gen)
+
+    def test_repeat_view_rejected(self, sample_video):
+        path, *_ = sample_video
+        with pytest.raises(NotImplementedError):
+            next(VideoFrames(path).repeat_each_frame(2).frames_at([0]))
+
+    def test_on_sliced_view(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)[::2]
+        for got, j in zip(v.frames_at([1, 4]), [1, 4]):
+            assert np.array_equal(got, v[j])

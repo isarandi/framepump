@@ -65,6 +65,7 @@ from .._pyav import (
 )
 from .._selection import FrameSelection
 from .decode import _NVDEC_CODECS, _CudaFrameIndex, _NvDecSession, _plane_layouts
+from .kernels import srgb_curve_inplace
 from .dlpack import _CtxFrame, _FrameWithDecoder, _GpuRgbBuffer
 
 PathLike = Union[str, Path]
@@ -1113,7 +1114,7 @@ class VideoFramesCuda:
                             npp.rgb16_to_float01(
                                 cur[0], cur[1], dst, w * 3 * 4, w, h, ctx=self._npp_ctx
                             )
-                        npp.srgb_curve_inplace(dst, w * h * 3, decode=True)
+                        srgb_curve_inplace(dst, w * h * 3, decode=True)
                         cur = (dst, w * 3 * 4)
                     elif name == 'lin_resize':
                         npp.resize_rgb(
@@ -1122,7 +1123,7 @@ class VideoFramesCuda:
                         )  # fmt: skip
                         # Re-encode; the kernel clamps to [0, 1] first, which
                         # also absorbs Lanczos over/undershoot from the resize.
-                        npp.srgb_curve_inplace(dst, tw * th * 3, decode=False)
+                        srgb_curve_inplace(dst, tw * th * 3, decode=False)
                         cur = (dst, tw * 3 * 4)
                     elif name == 'to_uint':
                         bits = self._final_format[0]

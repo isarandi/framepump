@@ -932,7 +932,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                         scratch.chroma_height,
                         ctx=self._npp_ctx,
                     )
-                from .npp_bindings import interleave_uv
+                from ._cuda.kernels import interleave_uv
 
                 interleave_uv(
                     self._uv_scratch + scratch.resized_u.offset,

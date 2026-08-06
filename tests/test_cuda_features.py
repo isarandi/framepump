@@ -202,18 +202,18 @@ class TestGammaCorrectResize:
         """The GPU kernel must implement the exact IEC 61966-2-1 piecewise
         sRGB transfer (linear toe + power segment), not a plain power law."""
         torch = _require_cuda()
-        from framepump import npp_bindings
+        from framepump._cuda.kernels import srgb_curve_inplace
 
         x = torch.linspace(0, 1, 65536, device='cuda', dtype=torch.float32)
         y = x.clone()
-        npp_bindings.srgb_curve_inplace(y.data_ptr(), y.numel(), decode=True)
+        srgb_curve_inplace(y.data_ptr(), y.numel(), decode=True)
         torch.cuda.synchronize()
         xn = x.cpu().numpy().astype(np.float64)
         ref = np.where(xn <= 0.04045, xn / 12.92, ((xn + 0.055) / 1.055) ** 2.4)
         np.testing.assert_allclose(y.cpu().numpy(), ref, atol=2e-6)
 
         z = torch.as_tensor(ref.astype(np.float32), device='cuda')
-        npp_bindings.srgb_curve_inplace(z.data_ptr(), z.numel(), decode=False)
+        srgb_curve_inplace(z.data_ptr(), z.numel(), decode=False)
         torch.cuda.synchronize()
         np.testing.assert_allclose(z.cpu().numpy(), xn, atol=3e-5)
 

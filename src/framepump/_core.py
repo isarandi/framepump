@@ -411,7 +411,7 @@ class VideoFrames:
             if self._lazy.index is not None:
                 return
 
-            reader = self._create_reader()
+            reader = self._create_reader(bookkeeping=True)
             try:
                 self._lazy.index = FrameIndexPyAV(self.path, reader=reader)
             finally:
@@ -633,8 +633,16 @@ class VideoFrames:
         result._reader = None  # Each clone gets its own reader on iteration
         return result
 
-    def _create_reader(self) -> PyAVReader:
-        """Create a new reader for iteration."""
+    def _create_reader(self, *, bookkeeping: bool = False) -> PyAVReader:
+        """Create a new reader for iteration or for index/probe bookkeeping.
+
+        Bookkeeping readers (index scans and rebuilds) are always CPU: they
+        demux packets or decode only to reach container-level verdicts, which
+        are decoder-independent — so gpu=True instances skip the NVDEC
+        decoder setup for them. The container-seekability auto-probe likewise
+        runs on a throwaway CPU reader for gpu instances, so the GPU decoder
+        is created exactly once, after the verdict is known.
+        """
         if self._is_fileobj:
             if hasattr(self.path, 'getbuffer'):
                 # BytesIO: give each reader an independent view so concurrently
@@ -648,8 +656,20 @@ class VideoFrames:
                 source = self.path
         else:
             source = self.path
-        reader = PyAVReader(source, gpu=self.gpu)
+        gpu = False if bookkeeping else self.gpu
+
         seekable = self._seekable if self._seekable is not None else self._lazy.seekable_probed
+        if seekable is None and gpu:
+            # gpu is only ever truthy for path sources, so a second open of
+            # ``source`` is safe here.
+            probe_reader = PyAVReader(source, gpu=False)
+            try:
+                seekable = probe_reader.seekable
+            finally:
+                probe_reader.close()
+            self._lazy.seekable_probed = seekable
+
+        reader = PyAVReader(source, gpu=gpu)
         if seekable is None:
             # First reader for this video: let it auto-probe (seek + decode
             # one frame) and cache the verdict so later readers skip it.
@@ -1236,7 +1256,7 @@ class VideoFrames:
         indexing and iteration agree even when some packets are undecodable.
         """
         pts_list: list[Fraction | None] = []
-        reader = self._create_reader()
+        reader = self._create_reader(bookkeeping=True)
         try:
             # Start decoding exactly like sequential iteration does (reopens
             # non-seekable containers), so the rebuilt index reflects it

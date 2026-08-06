@@ -42,6 +42,9 @@ Reading Video Frames
         # frame is a numpy array of shape (height, width, 3)
         pass
 
+    # Grab a single frame by index (decoded via a direct seek)
+    frame_42 = frames[42]
+
     # Slice the video (lazy)
     subset = frames[:100:2]  # Every second frame of first 100
 

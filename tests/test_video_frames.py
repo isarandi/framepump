@@ -352,3 +352,54 @@ class TestInterlacedChroma:
 
         got = next(iter(VideoFrames(interlaced_video)))
         assert np.array_equal(got, reference)
+
+
+class TestArrayProtocol:
+    """np.asarray materializes a view in one sequential decode pass."""
+
+    def test_asarray_matches_iteration(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        arr = np.asarray(v[3:8])
+        assert arr.shape[0] == 5
+        assert np.array_equal(arr, np.stack(list(v[3:8])))
+
+    def test_empty_selection(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        h, w = v.imshape
+        assert np.asarray(v[5:5]).shape == (0, h, w, 3)
+
+    def test_dtype_argument(self, sample_video):
+        path, *_ = sample_video
+        arr = np.asarray(VideoFrames(path)[:2], dtype=np.float32)
+        assert arr.dtype == np.float32
+
+
+class TestFancyIndexing:
+    """Integer-list indexing decodes the listed frames into a stacked array."""
+
+    def test_list_matches_singles(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        picked = v[[0, 2, 5, 2, -1]]
+        expected = [0, 2, 5, 2, len(v) - 1]
+        assert picked.shape == (5, *v.imshape, 3)
+        for i, j in enumerate(expected):
+            assert np.array_equal(picked[i], v[j])
+
+    def test_numpy_index_array_and_scalar(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        assert v[np.array([1, 3])].shape == (2, *v.imshape, 3)
+        assert v[np.int64(3)].shape == (*v.imshape, 3)  # scalar stays a single frame
+
+    def test_invalid_indices_rejected(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        with pytest.raises(TypeError):
+            v[[True, False]]
+        with pytest.raises(TypeError):
+            v[[0.5, 1.5]]
+        with pytest.raises(IndexError):
+            v[[0, 10_000]]

@@ -163,6 +163,7 @@ class VideoFrames:
 
     Example:
         >>> frames = VideoFrames('video.mp4')
+        >>> frame = frames[42]  # a single frame, decoded via a direct seek
         >>> for frame in frames[::2][:100].resized((128, 128)):
         ...     process(frame)
 
@@ -491,15 +492,27 @@ class VideoFrames:
     def __getitem__(self, item: slice) -> VideoFrames: ...
 
     def __getitem__(self, item: int | slice) -> NDArray | VideoFrames:
-        """Access a single frame by index or create a sliced lazy view.
+        """Access frames by index, index list, or create a sliced lazy view.
 
         Args:
-            item: Frame index (negative indices count from the end) or slice.
+            item: Frame index (negative indices count from the end), a slice,
+                or a list/array of integer indices (numpy-style fancy
+                indexing — eager, returns a stacked array).
 
         Returns:
-            The decoded frame as a numpy array for an integer index, or a
+            The decoded frame as a numpy array for an integer index, a
+            stacked (n, height, width, 3) array for an index list, or a
             new lazy VideoFrames view for a slice (no decoding happens).
         """
+        if isinstance(item, (list, np.ndarray)) and getattr(item, 'ndim', 1) != 0:
+            return self._gather_indices(item)
+        if not isinstance(item, slice):
+            try:
+                item = operator.index(item)
+            except TypeError:
+                raise TypeError(
+                    'VideoFrames indices must be integers, integer arrays or slices.'
+                ) from None
         if isinstance(item, int):
             # Handle negative indices
             length = len(self)
@@ -534,7 +547,7 @@ class VideoFrames:
             result._selection = self._selection.sliced(item)
             return result
         else:
-            raise TypeError('VideoFrames indices must be integers or slices.')
+            raise TypeError('VideoFrames indices must be integers, integer arrays or slices.')
 
     def __len__(self) -> int:
         """Exact number of frames in this view.
@@ -542,6 +555,69 @@ class VideoFrames:
         Builds the frame index on first use, which scans the file's packets.
         """
         return len(self._resolved_range()) * self.repeat_count
+
+    def __array__(self, dtype: DTypeLike = None, copy: bool | None = None) -> NDArray:
+        """Materialize the selected frames as one stacked numpy array.
+
+        Makes ``np.asarray(frames)`` / ``np.array(frames[5:10])`` decode the
+        selection in a single sequential pass. Without this, numpy would fall
+        back to the sequence protocol and seek-decode every frame separately.
+        Shape: (n_frames, height, width, 3), or (n_frames, height, width)
+        with ``gray=True``.
+
+        The output is preallocated from the reported length and filled while
+        decoding, so peak memory is one output array — no intermediate frame
+        list. A decoder delivering a different count than the index promised
+        (possible on corrupt files) falls back to reallocating once.
+        """
+        n = len(self)
+        out = np.empty((n, *self._frame_shape()), dtype=self.dtype)
+        count = 0
+        overflow: list[NDArray] = []
+        for frame in self:
+            if count < n:
+                out[count] = frame
+            else:
+                overflow.append(frame)
+            count += 1
+        if count < n:
+            out = out[:count].copy()
+        elif overflow:
+            out = np.concatenate([out, np.stack(overflow)])
+        if dtype is not None and out.dtype != np.dtype(dtype):
+            out = out.astype(dtype)
+        return out
+
+    def _frame_shape(self) -> tuple[int, ...]:
+        return self.imshape if self.gray else (*self.imshape, 3)
+
+    def _gather_indices(self, item) -> NDArray:
+        """Numpy-style integer-array indexing: decode the listed frames.
+
+        Returns a stacked array (like numpy's fancy indexing, this is eager).
+        Indices may repeat and may be negative; frames are decoded in sorted
+        order so nearby indices share seek locality, each unique frame once.
+        """
+        indices = np.asarray(item)
+        if indices.dtype == bool:
+            raise TypeError('Boolean mask indexing is not supported; use integer indices.')
+        if indices.size and not np.issubdtype(indices.dtype, np.integer):
+            raise TypeError(f'Index arrays must be integers, got dtype {indices.dtype}.')
+        if indices.ndim != 1:
+            raise TypeError(f'Index arrays must be one-dimensional, got shape {indices.shape}.')
+        length = len(self)
+        normalized = np.where(indices < 0, indices + length, indices).astype(np.int64)
+
+        out = np.empty((len(normalized), *self._frame_shape()), dtype=self.dtype)
+        last_src: int | None = None
+        last_frame: NDArray | None = None
+        for out_pos in np.argsort(normalized, kind='stable'):
+            src = int(normalized[out_pos])
+            if src != last_src:
+                last_frame = self[src]  # bounds-checked, seek-based
+                last_src = src
+            out[out_pos] = last_frame
+        return out
 
     def __repr__(self) -> str:
         h, w = self.imshape

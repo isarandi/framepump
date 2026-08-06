@@ -378,10 +378,10 @@ class VideoFramesCuda:
     with ``gpu=True`` is bit-identical to CPU decoding instead.
 
     ``resized()`` (GPU-side NPP resize), ``repeat_each_frame()``, and float
-    output dtypes are supported like on the CPU class. Remaining API gaps vs
-    ``VideoFrames`` (intentional): ``constant_framerate``, file-like sources,
-    ``float64``, and the seek-reliability content probe. Use the CPU class
-    when those are needed.
+    output dtypes, ``constant_framerate`` and file-like sources are supported
+    like on the CPU class. Remaining API gaps vs ``VideoFrames``
+    (intentional): ``float64`` and the seek-reliability content probe. Use
+    the CPU class when those are needed.
 
     Decode sessions are bound to the device's primary CUDA context, so
     iteration and DLPack export work from any thread (e.g. prefetch
@@ -389,7 +389,12 @@ class VideoFramesCuda:
     state.
 
     Args:
-        video_path: Path to video file.
+        video_path: Path to video file (str or Path), or a seekable file-like
+            object (must support read, seek, tell). ``BytesIO`` sources
+            support any number of concurrently active iterators (each decode
+            session gets an independent view); other file-like objects allow
+            only one active iterator at a time, since sessions share the
+            object's read position.
         gpu: GPU device ordinal (default 0).
         dtype: Output dtype — ``np.uint8`` (default), ``np.uint16``,
             ``np.float16``, or ``np.float32``. For 10-bit sources, ``uint16``
@@ -419,7 +424,8 @@ class VideoFramesCuda:
         color_space: str = 'auto',
         constant_framerate: bool | float = False,
     ) -> None:
-        self.path = str(video_path)
+        self._is_fileobj = hasattr(video_path, 'read')
+        self.path = video_path if self._is_fileobj else str(video_path)
         self._gpu = gpu
         self._npp_init_lock = threading.Lock()
 
@@ -441,7 +447,7 @@ class VideoFramesCuda:
         # Read container metadata via PyAV (no packet scan); this also gives
         # the same clean errors as the CPU class for audio-only files and
         # codecs without a decoder
-        reader = PyAVReader(self.path)
+        reader = PyAVReader(resolve_source_view(self.path))
         try:
             width, height = reader.resolution
             self.original_imshape: tuple[int, int] = (height, width)
@@ -756,9 +762,8 @@ class VideoFramesCuda:
         h, w = self.imshape
         # Never trigger the index scan just for a repr
         length = f'{len(self)} frames' if self._selection.is_resolved else 'lazy'
-        return (
-            f"VideoFramesCuda('{self.path}', {w}x{h}, {self.fps:.4g} fps, {length}, {self.dtype})"
-        )
+        name = self.path if isinstance(self.path, str) else '<file-like>'
+        return f"VideoFramesCuda('{name}', {w}x{h}, {self.fps:.4g} fps, {length}, {self.dtype})"
 
     @property
     def imshape(self) -> tuple[int, int]:
@@ -830,6 +835,7 @@ class VideoFramesCuda:
     def _clone(self) -> VideoFramesCuda:
         result = VideoFramesCuda.__new__(VideoFramesCuda)
         result.path = self.path
+        result._is_fileobj = self._is_fileobj
         result._gpu = self._gpu
         result._npp_init_lock = threading.Lock()
         result.dtype = self.dtype
@@ -875,9 +881,14 @@ class VideoFramesCuda:
     # ── Internal: session creation ───────────────────────────────────
 
     def _make_session(self) -> _NvDecSession:
-        """Create a new decode session with the configured color type."""
+        """Create a new decode session with the configured color type.
+
+        Each session opens its own view of the source (for ``BytesIO``
+        sources this costs one in-memory copy per session; per-frame random
+        access creates a session per seek).
+        """
         return _NvDecSession(
-            self.path,
+            resolve_source_view(self.path),
             self._gpu,
             self._codec,
             self._codec_name,

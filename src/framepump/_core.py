@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import itertools
 import operator
 import threading
@@ -16,7 +15,13 @@ import numpy as np
 import simplepyutils as spu
 from numpy.typing import DTypeLike, NDArray
 
-from ._pyav import FrameIndexPyAV, FramePumpError, PyAVReader, VideoDecodeError
+from ._pyav import (
+    FrameIndexPyAV,
+    FramePumpError,
+    PyAVReader,
+    VideoDecodeError,
+    resolve_source_view,
+)
 from ._selection import FrameSelection
 
 PathLike = Union[str, Path]
@@ -643,19 +648,7 @@ class VideoFrames:
         runs on a throwaway CPU reader for gpu instances, so the GPU decoder
         is created exactly once, after the verdict is known.
         """
-        if self._is_fileobj:
-            if hasattr(self.path, 'getbuffer'):
-                # BytesIO: give each reader an independent view so concurrently
-                # active iterators can't disturb each other's read position
-                # (costs one in-memory copy per reader).
-                source = io.BytesIO(self.path.getbuffer())
-            else:
-                # Generic file-like object: all readers share its read position,
-                # so only one iterator may be active at a time (see __init__).
-                self.path.seek(0)
-                source = self.path
-        else:
-            source = self.path
+        source = resolve_source_view(self.path)
         gpu = False if bookkeeping else self.gpu
 
         seekable = self._seekable if self._seekable is not None else self._lazy.seekable_probed

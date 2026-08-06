@@ -278,6 +278,46 @@ class TestConstantFramerate:
         assert all(torch.equal(frames[2 * i], frames[2 * i + 1]) for i in range(3))
 
 
+class TestFileLikeSources:
+    SHORT = str(Path(__file__).parent / 'data' / 'short.mp4')
+
+    def test_bytesio_matches_path_based(self):
+        import io
+
+        torch = _require_cuda()
+        v = _cuda_frames(io.BytesIO(Path(self.SHORT).read_bytes()))
+        ref = _cuda_frames(self.SHORT)
+        assert len(v) == len(ref)
+        assert '<file-like>' in repr(v)
+        assert torch.equal(torch.from_dlpack(v[5]), torch.from_dlpack(ref[5]))
+        for a, b in zip(v[:4], ref[:4]):
+            assert torch.equal(torch.from_dlpack(a).clone(), torch.from_dlpack(b).clone())
+
+    def test_bytesio_concurrent_iterators(self):
+        import io
+
+        torch = _require_cuda()
+        v = _cuda_frames(io.BytesIO(Path(self.SHORT).read_bytes()))
+        for a, b in zip(v[:4], v[:4]):
+            assert torch.equal(torch.from_dlpack(a).clone(), torch.from_dlpack(b).clone())
+
+    def test_generic_file_object_sequential(self):
+        _require_cuda()
+        with open(self.SHORT, 'rb') as fobj:
+            v = _cuda_frames(fobj)
+            assert sum(1 for _ in v) == 24
+            # A second full pass rewinds and works (sessions share the object)
+            assert sum(1 for _ in v) == 24
+
+    def test_bytesio_with_features(self):
+        import io
+
+        _require_cuda()
+        v = _cuda_frames(io.BytesIO(Path(self.SHORT).read_bytes()), dtype=np.float32)
+        frame = _np(v.resized((180, 320))[2])
+        assert frame.shape == (180, 320, 3) and frame.dtype == np.float32
+
+
 class TestIndexParityWithCpuClass:
     @pytest.mark.parametrize('name', ['short.mp4', 'exact_30fps.mp4', 'variable_fps.mp4'])
     def test_len_matches(self, name):

@@ -1299,92 +1299,6 @@ class VideoFrames:
         self._index.safe_seek_pts = [Fraction(0)] * n
         self._index.frame_count = n
 
-    def _build_cfr_source_map(self) -> list[int]:
-        """Build the mapping from CFR output frame index to source frame index.
-
-        Simulates FFmpeg's vsync=1 algorithm to determine which source frame is
-        displayed at each output position. This map is the single source of truth
-        for CFR mode: frame count is its length, and indexing, iteration, and
-        seeking all read from it, so they cannot disagree with each other.
-
-        The arithmetic deliberately uses floats: FFmpeg computes vsync in doubles,
-        so float — not exact rational — arithmetic reproduces its output. Like
-        ffmpeg, sync values stay unrounded (only the frame counts are rounded)
-        and each source frame carries its real duration rescaled to the output
-        timebase — both matter when the target fps differs from the source fps.
-        PTS are taken relative to the first frame (as ffmpeg does via the stream
-        start time), so streams that start late (e.g. MPEG-TS) produce no
-        phantom leading frames.
-        """
-        fps = self.target_fps
-        frame_pts = self._index.frame_pts
-        start_pts = frame_pts[0] if frame_pts else Fraction(0)
-
-        # Convert PTS to output timebase (frame units), mirroring ffmpeg's
-        # adjust_frame_pts_to_encoder_tb: rescale the exact rational PTS into
-        # the output timebase with 16 extra precision bits (round half away
-        # from zero, like av_rescale_q's AV_ROUND_NEAR_INF for non-negative
-        # values); non-integer results are then biased by 2^-17 away from zero
-        # to avoid exact midpoints in the frame-count rounding below (integers
-        # are left exact so on-boundary frames round half-to-even like ffmpeg).
-        fps_frac = Fraction(fps)
-        raw_ipts = [(pts - start_pts) * fps_frac for pts in frame_pts]
-        scale = 1 << 16
-        eps = 1.0 / (1 << 17)
-        sync_ipts_list = []
-        for v in raw_ipts:
-            q = int(v * scale + Fraction(1, 2)) / scale
-            sync_ipts_list.append(q if q == int(q) else q + eps)
-
-        # Per-frame duration in output timebase: delta to the next PTS; the last
-        # frame reuses the previous delta (single frame: one output slot).
-        durations = [float(b - a) for a, b in zip(raw_ipts, raw_ipts[1:])]
-        durations.append(durations[-1] if durations else 1.0)
-
-        next_pts = 0
-        source_map = []  # source_map[output_idx] = source_idx
-        frames_prev_hist = deque([0, 0, 0], maxlen=3)  # History for EOF median
-
-        for source_idx, sync_ipts in enumerate(sync_ipts_list):
-            delta0 = sync_ipts - next_pts
-            delta = delta0 + durations[source_idx]
-
-            # ffmpeg clips frames that arrive slightly early but still within
-            # their duration ("Clipping frame in rate conversion"): the drift
-            # is zeroed while delta keeps its value.
-            if delta0 < 0 < delta:
-                delta0 = 0
-
-            nb_frames = 1
-            nb_frames_prev = 0
-
-            if delta < -1.1:
-                nb_frames = 0
-            elif delta > 1.1:
-                nb_frames = round(delta)
-                if delta0 > 1.1:
-                    nb_frames_prev = round(delta0 - 0.6)
-
-            # Output nb_frames_prev copies of PREVIOUS source frame
-            for _ in range(nb_frames_prev):
-                if source_idx > 0:
-                    source_map.append(source_idx - 1)
-                next_pts += 1
-
-            # Output (nb_frames - nb_frames_prev) copies of CURRENT source frame
-            for _ in range(nb_frames - nb_frames_prev):
-                source_map.append(source_idx)
-                next_pts += 1
-
-            frames_prev_hist.appendleft(nb_frames_prev)
-
-        # EOF handling: output median of last 3 nb_frames_prev values
-        eof_frames = sorted(frames_prev_hist)[1]
-        for _ in range(eof_frames):
-            source_map.append(len(frame_pts) - 1)
-
-        return source_map
-
     def _maybe_to_float(self, value: NDArray) -> NDArray:
         if self.dtype == np.uint8 or self.dtype == np.uint16:
             return value
@@ -1396,6 +1310,99 @@ class VideoFrames:
             return (value.astype(np.float32) / maxval).astype(np.float16)
         return value.astype(self.dtype) / maxval
 
+    def _build_cfr_source_map(self) -> list[int]:
+        return build_cfr_source_map(self._index.frame_pts, self.target_fps)
+
+
+def build_cfr_source_map(frame_pts: list[Fraction], target_fps: float) -> list[int]:
+    """Build the mapping from CFR output frame index to source frame index.
+
+    Simulates FFmpeg's vsync=1 algorithm to determine which source frame is
+    displayed at each output position. This map is the single source of truth
+    for CFR mode: frame count is its length, and indexing, iteration, and
+    seeking all read from it, so they cannot disagree with each other.
+    Shared by ``VideoFrames`` and ``VideoFramesCuda``.
+
+    The arithmetic deliberately uses floats: FFmpeg computes vsync in doubles,
+    so float — not exact rational — arithmetic reproduces its output. Like
+    ffmpeg, sync values stay unrounded (only the frame counts are rounded)
+    and each source frame carries its real duration rescaled to the output
+    timebase — both matter when the target fps differs from the source fps.
+    PTS are taken relative to the first frame (as ffmpeg does via the stream
+    start time), so streams that start late (e.g. MPEG-TS) produce no
+    phantom leading frames.
+
+    Args:
+        frame_pts: Display-order frame PTS as Fractions in seconds.
+        target_fps: The constant output frame rate.
+    """
+    fps = target_fps
+    start_pts = frame_pts[0] if frame_pts else Fraction(0)
+
+    # Convert PTS to output timebase (frame units), mirroring ffmpeg's
+    # adjust_frame_pts_to_encoder_tb: rescale the exact rational PTS into
+    # the output timebase with 16 extra precision bits (round half away
+    # from zero, like av_rescale_q's AV_ROUND_NEAR_INF for non-negative
+    # values); non-integer results are then biased by 2^-17 away from zero
+    # to avoid exact midpoints in the frame-count rounding below (integers
+    # are left exact so on-boundary frames round half-to-even like ffmpeg).
+    fps_frac = Fraction(fps)
+    raw_ipts = [(pts - start_pts) * fps_frac for pts in frame_pts]
+    scale = 1 << 16
+    eps = 1.0 / (1 << 17)
+    sync_ipts_list = []
+    for v in raw_ipts:
+        q = int(v * scale + Fraction(1, 2)) / scale
+        sync_ipts_list.append(q if q == int(q) else q + eps)
+
+    # Per-frame duration in output timebase: delta to the next PTS; the last
+    # frame reuses the previous delta (single frame: one output slot).
+    durations = [float(b - a) for a, b in zip(raw_ipts, raw_ipts[1:])]
+    durations.append(durations[-1] if durations else 1.0)
+
+    next_pts = 0
+    source_map = []  # source_map[output_idx] = source_idx
+    frames_prev_hist = deque([0, 0, 0], maxlen=3)  # History for EOF median
+
+    for source_idx, sync_ipts in enumerate(sync_ipts_list):
+        delta0 = sync_ipts - next_pts
+        delta = delta0 + durations[source_idx]
+
+        # ffmpeg clips frames that arrive slightly early but still within
+        # their duration ("Clipping frame in rate conversion"): the drift
+        # is zeroed while delta keeps its value.
+        if delta0 < 0 < delta:
+            delta0 = 0
+
+        nb_frames = 1
+        nb_frames_prev = 0
+
+        if delta < -1.1:
+            nb_frames = 0
+        elif delta > 1.1:
+            nb_frames = round(delta)
+            if delta0 > 1.1:
+                nb_frames_prev = round(delta0 - 0.6)
+
+        # Output nb_frames_prev copies of PREVIOUS source frame
+        for _ in range(nb_frames_prev):
+            if source_idx > 0:
+                source_map.append(source_idx - 1)
+            next_pts += 1
+
+        # Output (nb_frames - nb_frames_prev) copies of CURRENT source frame
+        for _ in range(nb_frames - nb_frames_prev):
+            source_map.append(source_idx)
+            next_pts += 1
+
+        frames_prev_hist.appendleft(nb_frames_prev)
+
+    # EOF handling: output median of last 3 nb_frames_prev values
+    eof_frames = sorted(frames_prev_hist)[1]
+    for _ in range(eof_frames):
+        source_map.append(len(frame_pts) - 1)
+
+    return source_map
 
 def num_frames(path: PathLike, exact: bool = False, absolutely_exact: bool = False) -> int:
     """Count frames in a video.

@@ -5,6 +5,8 @@ value comparisons against the CPU class use smooth content and tolerances;
 structural invariants (shapes, lengths, fps, index mapping) are exact.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -230,6 +232,58 @@ class TestGammaCorrectResize:
                 w.append_data(frame)
         correct = _np(_cuda_frames(str(path)).resized((120, 160), gamma_correct=True)[1]).mean()
         assert 3.5 < correct < 6.3, f'toe-region mean {correct:.2f} (power law would give ~7.3)'
+
+
+class TestConstantFramerate:
+    VFR = str(Path(__file__).parent / 'data' / 'variable_fps.mp4')
+
+    def test_matches_cpu_class_map(self):
+        """CFR must select exactly the source frames the CPU class selects."""
+        torch = _require_cuda()
+        cpu = VideoFrames(self.VFR, constant_framerate=True)
+        gpu_cfr = _cuda_frames(self.VFR, constant_framerate=True)
+        plain = _cuda_frames(self.VFR)
+        assert len(gpu_cfr) == len(cpu)
+        assert gpu_cfr.fps == pytest.approx(cpu.fps)
+        smap = cpu._cfr_source_map
+        iterated = [torch.from_dlpack(f).clone() for f in gpu_cfr[:10]]
+        for i, frame in enumerate(iterated):
+            assert torch.equal(frame, torch.from_dlpack(plain[smap[i]])), f'frame {i}'
+            assert torch.equal(frame, torch.from_dlpack(gpu_cfr[i])), f'getitem {i}'
+
+    def test_numeric_target_fps(self):
+        _require_cuda()
+        cpu = VideoFrames(self.VFR, constant_framerate=12)
+        gpu = _cuda_frames(self.VFR, constant_framerate=12)
+        assert len(gpu) == len(cpu)
+        assert gpu.fps == pytest.approx(12.0)
+
+    def test_slicing_and_reverse(self):
+        torch = _require_cuda()
+        gpu = _cuda_frames(self.VFR, constant_framerate=True)
+        full = [torch.from_dlpack(f).clone() for f in gpu[:12]]
+        sliced = [torch.from_dlpack(f).clone() for f in gpu[2:12:3]]
+        assert all(torch.equal(s, full[2 + 3 * i]) for i, s in enumerate(sliced))
+        rev = [torch.from_dlpack(f).clone() for f in gpu[:6][::-1]]
+        assert all(torch.equal(rev[i], full[5 - i]) for i in range(6))
+
+    def test_composes_with_resize_and_repeat(self):
+        torch = _require_cuda()
+        v = _cuda_frames(self.VFR, constant_framerate=True).resized((120, 160))
+        frame = torch.from_dlpack(v[0])
+        assert tuple(frame.shape) == (120, 160, 3)
+        rep = _cuda_frames(self.VFR, constant_framerate=True)[:3].repeat_each_frame(2)
+        assert len(rep) == 6
+        frames = [torch.from_dlpack(f).clone() for f in rep]
+        assert all(torch.equal(frames[2 * i], frames[2 * i + 1]) for i in range(3))
+
+
+class TestIndexParityWithCpuClass:
+    @pytest.mark.parametrize('name', ['short.mp4', 'exact_30fps.mp4', 'variable_fps.mp4'])
+    def test_len_matches(self, name):
+        _require_cuda()
+        path = str(Path(__file__).parent / 'data' / name)
+        assert len(_cuda_frames(path)) == len(VideoFrames(path))
 
 
 class TestFloatDtypes:

@@ -51,6 +51,7 @@ import itertools
 import operator
 import threading
 import warnings
+from fractions import Fraction
 from pathlib import Path
 from typing import Union
 
@@ -60,12 +61,15 @@ from av.bitstream import BitStreamFilterContext
 from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
+from ._core import build_cfr_source_map
 from ._cuda_compat import cuda_ctx_pushed, retain_primary_context
 from ._pyav import (
+    FrameIndexPyAV,
     PyAVReader,
     UnsupportedCodecError,
     VideoDecodeError,
     _discard_other_streams,
+    resolve_source_view,
 )
 from ._selection import FrameSelection
 
@@ -107,11 +111,12 @@ _SUPPORTED_COLOR_SPACES = frozenset(_AVCOL_SPC_TO_MATRIX.values())
 class _CudaLazyIndexState:
     """Frame-index state shared between a VideoFramesCuda and all its views."""
 
-    __slots__ = ('lock', 'index')
+    __slots__ = ('lock', 'index', 'cfr_source_map')
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.index: _FrameIndexNvDec | None = None
+        self.index: _CudaFrameIndex | None = None
+        self.cfr_source_map: list[int] | None = None
 
 
 # PyAV codec names -> NVDEC codec ids. Only these have NVDEC hardware
@@ -198,58 +203,39 @@ class _PyAVPacketSource:
 # ── Frame index ──────────────────────────────────────────────────────
 
 
-class _FrameIndexNvDec:
-    """Packet-based frame index built from PyAV demuxing.
+class _CudaFrameIndex:
+    """Frame index for NVDEC access, derived from the shared CPU packet index.
 
-    Same algorithm as FrameIndexPyAV._build_from_packets() — collects
-    file-order PTS, builds running_max_at array, computes safe seek points
-    via bisect.  PTS values are raw integers in the stream's time_base,
-    matching the values fed to the NVDEC decoder through PacketData.
+    ``FrameIndexPyAV`` stores display-order PTS as exact Fractions in
+    seconds; NVDEC packet feeding and seeking work in raw integer stream
+    PTS, so the values are converted back through the stream time base
+    (exact — they were produced as integer PTS × time base). The Fraction
+    PTS are kept for the CFR source map.
     """
 
     def __init__(self, video_path: str) -> None:
-        # Collect PTS in file (packet) order via PyAV.
-        file_order_pts: list[int] = []
-        running_max_at: list[int] = []
-        running_max = -1
-
-        with av.open(video_path) as container:
-            stream = container.streams.video[0]
-            for pkt in container.demux(stream):
-                pts = pkt.pts if pkt.pts is not None else pkt.dts
-                if pts is None or pts < 0:
-                    continue
-
-                file_order_pts.append(pts)
-                running_max = max(running_max, pts)
-                running_max_at.append(running_max)
-
-        if not file_order_pts:
-            raise RuntimeError(f'No valid packets found in {video_path}')
-
-        # Display-order PTS: sorted, deduplicated.
-        self.frame_pts: list[int] = sorted(set(file_order_pts))
-        self.frame_count: int = len(self.frame_pts)
-
-        # Safe seek points: for each target PTS, find the last packet in file
-        # order whose running_max <= target.  This ensures all reference frames
-        # needed to decode the target have been seen.
-        self.safe_seek_pts: list[int] = []
-        for target in self.frame_pts:
-            idx = bisect.bisect_right(running_max_at, target) - 1
-            if idx >= 0:
-                self.safe_seek_pts.append(file_order_pts[idx])
-            else:
-                self.safe_seek_pts.append(min(file_order_pts[0], 0))
-
-        # Whether the container supports reliable seeking (raw bitstreams and
-        # image-pipe formats do not); reuses the CPU reader's detection and
-        # probe. Non-seekable sources decode from the start instead.
         reader = PyAVReader(video_path)
         try:
+            time_base = reader.time_base
+            base = FrameIndexPyAV(video_path, reader=reader)
+            # Whether the container supports reliable seeking (raw bitstreams
+            # and image-pipe formats do not); reuses the CPU reader's
+            # detection and probe. Non-seekable sources decode from the start.
             self.seekable: bool = reader.seekable
         finally:
             reader.close()
+
+        if base.pts_synthesized:
+            # Timestampless streams (raw bitstreams): the synthesized PTS
+            # never match decoder output, so PTS-based frame location would
+            # silently return wrong frames.
+            name = video_path if isinstance(video_path, str) else '<file-like>'
+            raise RuntimeError(f'No valid packets found in {name}')
+
+        self.frame_pts_frac: list[Fraction] = base.frame_pts
+        self.frame_pts: list[int] = [int(p / time_base) for p in base.frame_pts]
+        self.safe_seek_pts: list[int] = [int(p / time_base) for p in base.safe_seek_pts]
+        self.frame_count: int = base.frame_count
 
 
 # ── Decode session ───────────────────────────────────────────────────
@@ -411,6 +397,10 @@ class VideoFramesCuda:
             pipeline. For 8-bit sources, ``uint16`` scales values to the full
             0–65535 range. Float outputs are scaled to [0, 1] on the GPU
             (uint16 pipeline internally, like the CPU class).
+        constant_framerate: False for VFR (native timestamps), True for CFR
+            at the original fps, or a number for CFR at that specific fps.
+            Uses the same ffmpeg-parity source map as the CPU class, so the
+            two classes select identical source frames.
         color_space: ``'auto'`` (default), ``'bt601'``, ``'bt709'``,
             ``'bt2020'``, ``'fcc'``, or ``'smpte240m'``. Only used when NPP
             conversion is active (10-bit + uint16). ``'auto'`` follows the
@@ -427,6 +417,7 @@ class VideoFramesCuda:
         gpu: int = 0,
         dtype: DTypeLike = np.uint8,
         color_space: str = 'auto',
+        constant_framerate: bool | float = False,
     ) -> None:
         self.path = str(video_path)
         self._gpu = gpu
@@ -507,6 +498,17 @@ class VideoFramesCuda:
         self._gamma_resize: bool = False
         self._repeat_count: int = 1
 
+        # Parse constant_framerate: False, True, or a number (target fps)
+        if constant_framerate is False:
+            self.constant_framerate = False
+            self.target_fps = self.original_fps
+        elif constant_framerate is True:
+            self.constant_framerate = True
+            self.target_fps = self.original_fps
+        else:
+            self.constant_framerate = True
+            self.target_fps = float(constant_framerate)
+
         # Color space (only matters for yuv_to_rgb16 path).
         if color_space == 'auto':
             mapped = _AVCOL_SPC_TO_MATRIX.get(self._colorspace_id)
@@ -547,8 +549,9 @@ class VideoFramesCuda:
         """Decode and yield each selected frame exactly once."""
         # Stream without the index when the selection is a plain forward
         # slice with a small start. If the index already exists, the
-        # seek-based paths are at least as good — use them.
-        if not self._selection.is_resolved:
+        # seek-based paths are at least as good — use them. CFR always needs
+        # the index (the source map derives from it).
+        if not self._selection.is_resolved and not self.constant_framerate:
             streamable = self._selection.streamable_slice
             if (
                 streamable is not None
@@ -564,6 +567,15 @@ class VideoFramesCuda:
 
         if self._needs_stages:
             self._init_npp_pipeline()
+
+        if self.constant_framerate:
+            sources = [self._cfr_source_map[i] for i in frame_range]
+            if frame_range.step > 0:
+                # Nondecreasing source sequence: one forward decode pass.
+                yield from self._iter_sources_forward(sources)
+            else:
+                yield from self._iter_by_index(sources)
+            return
 
         # Large step (either direction): per-frame seeks; range() iterates
         # backward natively for negative steps, and each frame gets its own
@@ -650,14 +662,14 @@ class VideoFramesCuda:
             if item < 0:
                 item = length + item
             if item < 0 or item >= length:
-                total = self._index.frame_count
+                total = self._n_frames_total()
                 if len(self._resolved_range()) != total or self._repeat_count != 1:
                     detail = f'view with {length} frames (source video has {total})'
                 else:
                     detail = f'video with {length} frames'
                 raise IndexError(f'Frame index {item} out of range for {detail}')
             abs_idx = self._resolved_range()[item // self._repeat_count]
-            return self._get_frame_by_abs_idx(abs_idx, owns_memory=True)
+            return self._get_frame_by_abs_idx(self._source_index(abs_idx), owns_memory=True)
 
         if isinstance(item, slice):
             if item.step == 0:
@@ -760,20 +772,40 @@ class VideoFramesCuda:
         Uses the selection's effective stride, which is known even before
         the frame count is — reading fps never triggers the index scan.
         """
-        return self.original_fps / abs(self._selection.step_product) * self._repeat_count
+        return self.target_fps / abs(self._selection.step_product) * self._repeat_count
+
+    def _n_frames_total(self) -> int:
+        if self.constant_framerate:
+            return len(self._cfr_source_map)
+        return self._index.frame_count
+
+    def _source_index(self, abs_idx: int) -> int:
+        """Map an absolute output index to a source frame index (CFR-aware)."""
+        return self._cfr_source_map[abs_idx] if self.constant_framerate else abs_idx
 
     @property
-    def _index(self) -> _FrameIndexNvDec:
+    def _cfr_source_map(self) -> list[int]:
+        index = self._index  # resolve first: builds under the same lock
+        if self._lazy.cfr_source_map is None:
+            with self._lazy.lock:
+                if self._lazy.cfr_source_map is None:
+                    self._lazy.cfr_source_map = build_cfr_source_map(
+                        index.frame_pts_frac, self.target_fps
+                    )
+        return self._lazy.cfr_source_map
+
+    @property
+    def _index(self) -> _CudaFrameIndex:
         if self._lazy.index is None:
             with self._lazy.lock:
                 if self._lazy.index is None:
-                    self._lazy.index = _FrameIndexNvDec(self.path)
+                    self._lazy.index = _CudaFrameIndex(resolve_source_view(self.path))
         return self._lazy.index
 
     def _resolved_range(self) -> range:
         """The concrete frame-index range, resolving the selection if needed."""
         if not self._selection.is_resolved:
-            self._selection = self._selection.resolve(self._index.frame_count)
+            self._selection = self._selection.resolve(self._n_frames_total())
         return self._selection.range
 
     def close(self) -> None:
@@ -818,6 +850,8 @@ class VideoFramesCuda:
         result._gamma_resize = self._gamma_resize
         result._trc_id = self._trc_id
         result._repeat_count = self._repeat_count
+        result.constant_framerate = self.constant_framerate
+        result.target_fps = self.target_fps
         result._selection = self._selection
         result._dims_checked = self._dims_checked
         # Index state is shared: whichever view builds it, all views see it
@@ -961,13 +995,54 @@ class VideoFramesCuda:
                 yield self._emit(frame, owned, session)
             frame_count += 1
 
-    def _iter_by_index(self, frame_range: range):
-        """Path A: individual seeks for each frame (large step)."""
+    def _iter_sources_forward(self, sources: list[int]):
+        """Decode a nondecreasing source-index sequence in one forward pass.
+
+        Used for forward CFR iteration: the source map may repeat a source
+        frame (frame doubling) or skip some (frame dropping). Duplicates are
+        yielded as views of the frame emitted for their first occurrence,
+        without re-decoding.
+        """
+        if not sources:
+            return
+        safe_pts = self._index.safe_seek_pts[sources[0]]
+        session = self._make_session()
+        if self._index.seekable and safe_pts > 0:
+            frame_iter = session.iter_from_pts(safe_pts)
+        else:
+            frame_iter = session.iter_from_start()
+
+        pos = 0
+        cur_src = None
+        for pts, frame in frame_iter:
+            if cur_src is None:
+                cur_src = bisect.bisect_left(self._index.frame_pts, pts)
+            else:
+                cur_src += 1
+            emitted = None
+            while pos < len(sources) and sources[pos] == cur_src:
+                if emitted is None:
+                    self._check_decoded_dims(frame, session)
+                    emitted = self._emit(frame, False, session)
+                    yield emitted
+                else:
+                    yield emitted.view() if isinstance(emitted, _GpuRgbBuffer) else emitted
+                pos += 1
+            if pos >= len(sources):
+                return
+        raise VideoDecodeError(
+            self.path,
+            pos,
+            RuntimeError('NVDEC decoder ended before delivering the selected frames'),
+        )
+
+    def _iter_by_index(self, indices):
+        """Path A: individual seeks per source index (large step / CFR reverse)."""
         convert = self._needs_stages
         # Keep the previous session alive between yields — its decoder owns
         # the GPU surface pool that the frame points to.
         prev_session = None
-        for abs_idx in frame_range:
+        for abs_idx in indices:
             target_pts = self._index.frame_pts[abs_idx]
             safe_pts = self._index.safe_seek_pts[abs_idx]
             frame, session = self._seek_decode_to(safe_pts, target_pts)

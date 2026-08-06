@@ -10,6 +10,7 @@ avoiding floating-point precision loss in PTS/timestamp handling.
 from __future__ import annotations
 
 import bisect
+import io
 from collections.abc import Generator
 from dataclasses import dataclass
 from fractions import Fraction
@@ -174,6 +175,23 @@ def _repack_semiplanar(frame: av.VideoFrame) -> av.VideoFrame:
     out.color_primaries = frame.color_primaries
     out.color_trc = frame.color_trc
     return out
+
+
+def resolve_source_view(source):
+    """A fresh read view of ``source`` for opening one more reader on it.
+
+    ``BytesIO`` sources get an independent view so concurrently active
+    readers cannot disturb each other's read position (costs one in-memory
+    copy per reader). Other file-like objects are rewound and shared, so
+    only one reader may be actively consuming them at a time. Filesystem
+    paths pass through unchanged.
+    """
+    if not hasattr(source, 'read'):
+        return source
+    if hasattr(source, 'getbuffer'):
+        return io.BytesIO(source.getbuffer())
+    source.seek(0)
+    return source
 
 
 def _discard_other_streams(container, keep) -> None:
@@ -971,12 +989,15 @@ class FrameIndexPyAV:
         try:
             if not reader.seekable:
                 # Non-seekable: trivial index (count only, always seek to 0)
-                self.frame_pts, self.safe_seek_pts = self._build_sequential_index(reader)
+                self.frame_pts, self.safe_seek_pts, self.pts_synthesized = (
+                    self._build_sequential_index(reader)
+                )
                 self.had_duplicate_pts = False
             else:
                 self.frame_pts, self.safe_seek_pts, self.had_duplicate_pts = (
                     self._build_from_packets(reader)
                 )
+                self.pts_synthesized = False
         finally:
             if own_reader:
                 reader.close()
@@ -1029,14 +1050,18 @@ class FrameIndexPyAV:
         return frame_pts, safe_seek_pts, had_duplicates
 
     @staticmethod
-    def _build_sequential_index(reader: PyAVReader) -> tuple[list[Fraction], list[Fraction]]:
+    def _build_sequential_index(
+        reader: PyAVReader,
+    ) -> tuple[list[Fraction], list[Fraction], bool]:
         """Build index for non-seekable streams.
 
         Same as _build_from_packets but all safe_seek_pts are 0
         (always reopen and decode from start).
 
         For timestampless streams (raw h264, etc.), falls back to decoding
-        to count frames and generates synthetic PTS based on fps.
+        to count frames and generates synthetic PTS based on fps; the third
+        return value reports whether that synthesis happened (such PTS never
+        match decoder output, so PTS-based frame location must not use them).
         """
         file_order_pts: list[Fraction] = []
 
@@ -1053,7 +1078,7 @@ class FrameIndexPyAV:
             # Normal case: have PTS values
             frame_pts = sorted(set(file_order_pts))
             safe_seek_pts = [Fraction(0)] * len(frame_pts)
-            return frame_pts, safe_seek_pts
+            return frame_pts, safe_seek_pts, False
 
         # No PTS values (raw bitstreams) - must decode to count frames
         # This is slower but necessary for timestampless streams
@@ -1073,14 +1098,14 @@ class FrameIndexPyAV:
                 raise
 
         if frame_count == 0:
-            return [], []
+            return [], [], True
 
         # Generate synthetic PTS based on fps (frames are in display order)
         fps = reader.fps_fraction
         frame_pts = [Fraction(i, 1) / fps for i in range(frame_count)]
         safe_seek_pts = [Fraction(0)] * frame_count
 
-        return frame_pts, safe_seek_pts
+        return frame_pts, safe_seek_pts, True
 
     def get_seek_params(self, frame_idx: int) -> tuple[float, float]:
         """Get seek parameters for a frame.

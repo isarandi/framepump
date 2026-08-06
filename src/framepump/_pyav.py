@@ -133,6 +133,49 @@ _SEMIPLANAR_TO_PLANAR = {
 }
 
 
+def _repack_semiplanar(frame: av.VideoFrame) -> av.VideoFrame:
+    """Losslessly repack a semi-planar (NVDEC download) frame to planar.
+
+    Deliberately done in numpy, not swscale: FFmpeg 8's swscale runs
+    semi-planar input through kernels that do not match the planar path —
+    BT.709 and full-range content come out visibly wrong (up to ~50/255 on
+    saturated colors) — and even a nominal nv12→yuv420p "repack" through
+    swscale alters pixel values.
+    The plane shuffle below is exact; NVDEC plane bytes are bit-identical
+    to CPU decoding, so downstream RGB conversion is too.
+
+    The interlaced flag cannot be carried over (read-only in PyAV 17), so
+    interlaced streams must keep the swscale repack path instead — the
+    converter latches that choice on the first frame.
+    """
+    planar_name = _SEMIPLANAR_TO_PLANAR.get(frame.format.name)
+    if planar_name is None:
+        return frame
+    dtype = np.uint16 if frame.format.name in ('p010le', 'p016le') else np.uint8
+
+    def plane_view(plane):
+        arr = np.frombuffer(plane, dtype)
+        return arr.reshape(-1, plane.line_size // arr.itemsize)
+
+    out = av.VideoFrame(frame.width, frame.height, planar_name)
+    src_y, src_uv = (plane_view(p) for p in frame.planes)
+    dst_y, dst_u, dst_v = (plane_view(p) for p in out.planes)
+    y_h, y_w = out.planes[0].height, out.planes[0].width
+    dst_y[:y_h, :y_w] = src_y[:y_h, :y_w]
+    c_h, c_w = out.planes[1].height, out.planes[1].width
+    uv = src_uv[:c_h, : 2 * c_w]
+    dst_u[:c_h, :c_w] = uv[:, 0::2]
+    dst_v[:c_h, :c_w] = uv[:, 1::2]
+
+    out.pts = frame.pts
+    out.time_base = frame.time_base
+    out.colorspace = frame.colorspace
+    out.color_range = frame.color_range
+    out.color_primaries = frame.color_primaries
+    out.color_trc = frame.color_trc
+    return out
+
+
 def _discard_other_streams(container, keep) -> None:
     """Discard all streams except ``keep`` at the demuxer level.
 
@@ -515,6 +558,21 @@ class PyAVReader:
                 )
         self.seek(time_seconds)
 
+    def _stamp_color_metadata(self, frame: av.VideoFrame) -> None:
+        """Fill in unspecified frame color metadata from the stream.
+
+        Hwaccel-downloaded frames arrive with colorspace/color_range
+        UNSPECIFIED even when the bitstream declares them; swscale then
+        defaults to BT.601 limited, mis-coloring BT.709 and full-range
+        content. The stream-level codec context still carries the declared
+        values, so copy them onto the frame (only where unspecified).
+        """
+        cc = self._stream.codec_context
+        if frame.colorspace == 2 and cc.colorspace != 2:  # AVCOL_SPC_UNSPECIFIED
+            frame.colorspace = cc.colorspace
+        if frame.color_range == 0 and cc.color_range != 0:  # AVCOL_RANGE_UNSPECIFIED
+            frame.color_range = cc.color_range
+
     def decode_raw(self) -> Generator[av.VideoFrame, None, None]:
         """Decode raw frames from current position, mapping decoder errors.
 
@@ -535,6 +593,7 @@ class PyAVReader:
                         # frame location. Callers consult this flag.
                         self.pts_regression_seen = True
                     prev_pts = frame.pts
+                self._stamp_color_metadata(frame)
                 yield frame
                 count += 1
         except av.error.EOFError:
@@ -626,26 +685,19 @@ class PyAVReader:
 
         last_filter = buffer_in
 
-        # NVDEC downloads arrive semi-planar (nv12/p010le). Repack losslessly
-        # to the planar equivalent first, so RGB conversion runs through the
-        # exact same swscale path as CPU decoding: direct nv12->rgb uses a
-        # different chroma interpolation and differs on most pixels.
+        # Interlaced streams reach the graph still semi-planar (the numpy
+        # repack cannot carry the interlaced flag): repack in-graph so chroma
+        # conversion stays field-aware via interl=-1 below.
         planar = _SEMIPLANAR_TO_PLANAR.get(frame.format.name)
         if planar is not None:
             repack = graph.add('format', f'pix_fmts={planar}')
             last_filter.link_to(repack)
             last_filter = repack
 
-        # Work around libswscale's SSSE3 pmulhw truncation bug: the fused
-        # chroma-upsample + color-convert path truncates instead of rounding,
-        # causing ~2% darkening on full-range subsampled content.
-        # accurate_rnd bypasses the SSSE3 path; full_chroma_int fixes chroma
-        # interpolation. Needed for subsampled full-range content: yuvj
-        # formats from CPU decoding, or full-range nv12 from NVDEC (mjpeg).
-        pix_fmt = frame.format.name
-        needs_sws_fix = pix_fmt in ('yuvj420p', 'yuvj422p') or (
-            pix_fmt in ('nv12', 'nv16') and frame.color_range == 2  # JPEG/full range
-        )
+        # No accurate_rnd/full_chroma_int sws flags here: with the rewritten
+        # swscale in FFmpeg 8 (the pinned PyAV >= 17.1) they select a broken
+        # full-range chroma path (saturated colors off by up to ~136/255),
+        # while the SSSE3 truncation bug they used to work around is gone.
 
         # Interlaced 4:2:0 chroma is sited per-field; the scale filter's
         # default interl=0 upsamples it as progressive, smearing chroma
@@ -655,16 +707,14 @@ class PyAVReader:
         # also keeps mixed progressive/interlaced streams correct per frame.
         interl = ':interl=-1' if frame.interlaced_frame else ''
 
-        # Add scale filter if resize needed or if we need SWS flags
+        # Add scale filter if resize needed or for interlaced-aware chroma
         if output_shape is not None:
             height, width = output_shape
-            flags = ':flags=accurate_rnd+full_chroma_int' if needs_sws_fix else ''
-            scale_filter = graph.add('scale', f'{width}:{height}{flags}{interl}')
+            scale_filter = graph.add('scale', f'{width}:{height}{interl}')
             last_filter.link_to(scale_filter)
             last_filter = scale_filter
-        elif needs_sws_fix or interl:
-            flags = ':flags=accurate_rnd+full_chroma_int' if needs_sws_fix else ''
-            scale_filter = graph.add('scale', f'w=iw:h=ih{flags}{interl}')
+        elif interl:
+            scale_filter = graph.add('scale', f'w=iw:h=ih{interl}')
             last_filter.link_to(scale_filter)
             last_filter = scale_filter
 
@@ -853,9 +903,21 @@ class _FrameConverter:
         self._target_format = target_format
         self._graph: av.filter.Graph | None = None
         self._count = 0
+        self._numpy_repack: bool | None = None
 
     def convert(self, frame: av.VideoFrame) -> av.VideoFrame:
         """Convert one decoded frame, building the graph on first use."""
+        # Semi-planar NVDEC downloads must reach swscale in planar form
+        # (numpy shuffle, see _repack_semiplanar) for CPU-identical output.
+        # Interlaced streams keep the in-graph repack instead; the choice is
+        # latched on the first frame so the graph's input layout is stable.
+        if self._numpy_repack is None:
+            self._numpy_repack = (
+                frame.format.name in _SEMIPLANAR_TO_PLANAR and not frame.interlaced_frame
+            )
+        if self._numpy_repack:
+            frame = _repack_semiplanar(frame)
+
         # Decoders can emit the illegal 'reserved' (0) value for color
         # metadata, which FFmpeg >= 8 swscale rejects (ENOTSUP) instead of
         # assuming defaults; both 0 and 2 mean 'unknown' in practice.

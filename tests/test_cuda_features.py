@@ -378,3 +378,49 @@ class TestSuspectCodecVerification:
         assert len(seq) == len(v)
         for k in (0, 5, 9, len(v) - 1):
             assert torch.equal(torch.from_dlpack(v[k]), seq[k]), f'frame {k}'
+
+
+class TestBatchGatherAndFramesAt:
+    """GPU fancy indexing yields one stacked batch buffer; frames_at is lazy."""
+
+    def test_batch_matches_singles(self, smooth_video):
+        torch = _require_cuda()
+        v = _cuda_frames(smooth_video)
+        wanted = [2, 5, 9, 5, -1]
+        resolved = [2, 5, 9, 5, 11]
+        batch = torch.from_dlpack(v[wanted])
+        assert tuple(batch.shape) == (5, 240, 320, 3) and batch.is_cuda
+        for i, j in enumerate(resolved):
+            assert torch.equal(batch[i], torch.from_dlpack(v[j])), f'slot {i}'
+
+    def test_batch_with_float_and_resize(self, smooth_video):
+        torch = _require_cuda()
+        v = _cuda_frames(smooth_video, dtype=np.float32).resized((120, 160))
+        batch = torch.from_dlpack(v[[0, 3]])
+        assert tuple(batch.shape) == (2, 120, 160, 3) and batch.dtype == torch.float32
+        assert 0.0 <= float(batch.min()) and float(batch.max()) <= 1.0
+
+    def test_invalid_indices_rejected(self, smooth_video):
+        _require_cuda()
+        v = _cuda_frames(smooth_video)
+        with pytest.raises(TypeError):
+            v[[True, False]]
+        with pytest.raises(IndexError):
+            v[[0, 10_000]]
+
+    def test_frames_at_order_and_laziness(self, smooth_video):
+        torch = _require_cuda()
+        v = _cuda_frames(smooth_video)
+        wanted = [2, 5, 11, 3, 3]
+        got = [torch.from_dlpack(f).clone() for f in v.frames_at(wanted)]
+        for g, j in zip(got, wanted):
+            assert torch.equal(g, torch.from_dlpack(v[j]))
+        gen = v.frames_at([0, 10_000])
+        assert torch.from_dlpack(next(gen)) is not None
+        with pytest.raises(IndexError):
+            next(gen)
+
+    def test_frames_at_repeat_rejected(self, smooth_video):
+        _require_cuda()
+        with pytest.raises(NotImplementedError):
+            next(_cuda_frames(smooth_video).repeat_each_frame(2).frames_at([0]))

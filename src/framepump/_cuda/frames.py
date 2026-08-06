@@ -55,8 +55,8 @@ import numpy as np
 from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
-from .._core import build_cfr_source_map
-from .compat import cuda_ctx_pushed
+from .._core import _SEEK_VS_DECODE_MAX_SKIP, build_cfr_source_map
+from .compat import cuda_ctx_pushed, retain_primary_context
 from .._pyav import (
     PyAVReader,
     UnsupportedCodecError,
@@ -426,15 +426,28 @@ class VideoFramesCuda:
             )
 
     def __getitem__(self, item):
-        """Access a single frame by index or create a sliced lazy view.
+        """Access frames by index, index list, or create a sliced lazy view.
 
         Args:
-            item: Frame index (negative indices count from the end) or slice.
+            item: Frame index (negative indices count from the end), a slice,
+                or a list/array of integer indices (numpy-style fancy
+                indexing — eager, returns one stacked GPU buffer).
 
         Returns:
             A GPU-resident frame supporting ``__dlpack__`` for an integer
-            index, or a new lazy VideoFramesCuda view for a slice.
+            index, a stacked (n, height, width, 3) GPU buffer for an index
+            list (``torch.from_dlpack`` gives a ready batch tensor), or a
+            new lazy VideoFramesCuda view for a slice.
         """
+        if isinstance(item, (list, np.ndarray)) and getattr(item, 'ndim', 1) != 0:
+            return self._gather_indices(item)
+        if not isinstance(item, slice):
+            try:
+                item = operator.index(item)
+            except TypeError:
+                raise TypeError(
+                    'Indices must be integers, integer arrays or slices.'
+                ) from None
         if isinstance(item, int):
             length = len(self)
             if item < 0:
@@ -462,6 +475,173 @@ class VideoFramesCuda:
             return result
 
         raise TypeError('Indices must be integers or slices.')
+
+    def frames_at(self, indices):
+        """Yield the frames at the given indices, in the given order (lazy).
+
+        One walk through the file, deciding per step whether to seek (a new
+        decode session) or to decode through the gap, using the same measured
+        crossover as strided iteration. Yields follow the iteration contract
+        (shared frames, valid until the next step); a repeated index
+        re-yields a view without decoding again; backward jumps cost a seek.
+        """
+        if self._repeat_count != 1:
+            raise NotImplementedError(
+                'frames_at() after repeat_each_frame() is not supported; '
+                'apply repeat_each_frame() afterwards or map indices yourself.'
+            )
+        if self._needs_stages:
+            self._post_processor()
+        length: int | None = None
+        session = None
+        frame_iter = None
+        next_src: int | None = None  # source index the iterator yields next
+        last_src: int | None = None
+        last_emitted = None
+        for raw in indices:
+            idx = operator.index(raw)
+            if length is None:
+                length = len(self)
+            if idx < 0:
+                idx += length
+            if idx < 0 or idx >= length:
+                raise IndexError(f'Frame index {raw} out of range')
+            src = self._source_index(self._resolved_range()[idx])
+            if src == last_src:
+                yield (
+                    last_emitted.view()
+                    if isinstance(last_emitted, _GpuRgbBuffer)
+                    else last_emitted
+                )
+                continue
+            if (
+                frame_iter is None
+                or next_src is None
+                or not next_src <= src <= next_src + _SEEK_VS_DECODE_MAX_SKIP
+            ):
+                session = self._make_session()
+                safe_pts = self._index.safe_seek_pts[src]
+                if self._index.seekable and safe_pts > 0:
+                    frame_iter = session.iter_from_pts(safe_pts)
+                else:
+                    frame_iter = session.iter_from_start()
+                next_src = None
+            while True:
+                try:
+                    pts, frame = next(frame_iter)
+                except StopIteration:
+                    raise VideoDecodeError(
+                        self.path,
+                        src,
+                        RuntimeError('NVDEC decoder ended before the requested frame'),
+                    ) from None
+                this_src = (
+                    bisect.bisect_left(self._index.frame_pts, pts)
+                    if next_src is None
+                    else next_src
+                )
+                next_src = this_src + 1
+                if this_src == src:
+                    break
+            self._check_decoded_dims(frame, session)
+            last_emitted = self._emit(frame, False, session)
+            last_src = src
+            yield last_emitted
+
+    def _gather_indices(self, item) -> _GpuRgbBuffer:
+        """Numpy-style integer-array indexing: one stacked GPU batch buffer.
+
+        Decodes the listed frames (sorted walk, gap-aware) and copies each
+        into its requested slot of a single owning (n, height, width, 3)
+        allocation — ``torch.from_dlpack`` on the result is a ready batch
+        tensor with no further copies.
+        """
+        from cuda.bindings import driver
+
+        indices = np.asarray(item)
+        if indices.dtype == bool:
+            raise TypeError('Boolean mask indexing is not supported; use integer indices.')
+        if indices.size and not np.issubdtype(indices.dtype, np.integer):
+            raise TypeError(f'Index arrays must be integers, got dtype {indices.dtype}.')
+        if indices.ndim != 1:
+            raise TypeError(f'Index arrays must be one-dimensional, got shape {indices.shape}.')
+        length = len(self)
+        normalized = np.where(indices < 0, indices + length, indices).astype(np.int64)
+        if normalized.size and (normalized.min() < 0 or normalized.max() >= length):
+            bad = indices[(normalized < 0) | (normalized >= length)][0]
+            raise IndexError(f'Frame index {bad} out of range for video with {length} frames')
+
+        th, tw = self.imshape
+        if self._needs_stages:
+            fbits, fcode = self._post_processor()._final_format
+        else:
+            fbits, fcode = 8, 1
+        elem = fbits // 8
+        row_bytes = tw * 3 * elem
+        frame_bytes = th * row_bytes
+        n = len(normalized)
+
+        device, ctx = retain_primary_context(self._gpu)
+        try:
+            with cuda_ctx_pushed(ctx):
+                err, devptr = driver.cuMemAlloc(max(n * frame_bytes, 1))
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f'Failed to allocate batch buffer: {err}')
+                devptr = int(devptr)
+            try:
+                order = np.argsort(normalized, kind='stable')
+                frames = self.frames_at(int(normalized[k]) for k in order)
+                with cuda_ctx_pushed(ctx):
+                    for k, obj in zip(order, frames):
+                        self._copy_into(obj, devptr + int(k) * frame_bytes, row_bytes, th)
+            except BaseException:
+                with cuda_ctx_pushed(ctx):
+                    driver.cuMemFree(devptr)
+                raise
+        finally:
+            driver.cuDevicePrimaryCtxRelease(device)
+
+        return _GpuRgbBuffer(
+            devptr,
+            th,
+            tw,
+            row_bytes,
+            self._gpu,
+            owns_memory=True,
+            bits=fbits,
+            code=fcode,
+            batch=n,
+        )
+
+    def _copy_into(self, obj, dst_ptr: int, row_bytes: int, rows: int) -> None:
+        """Synchronously copy an emitted frame into a tight destination slot.
+
+        Synchronous on purpose: the source is a shared buffer or decoder
+        surface that the very next decode step may overwrite.
+        """
+        from cuda.bindings import driver
+
+        if isinstance(obj, _GpuRgbBuffer):
+            src_ptr, src_pitch = obj._devptr, obj._pitch
+        else:
+            views = obj.cuda()  # _CtxFrame: export runs under the session ctx
+            view = views[0] if isinstance(views, (list, tuple)) else views
+            cai = view.__cuda_array_interface__
+            src_ptr = cai['data'][0]
+            strides = cai.get('strides')
+            src_pitch = strides[0] if strides else row_bytes
+        copy = driver.CUDA_MEMCPY2D()
+        copy.srcMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+        copy.srcDevice = src_ptr
+        copy.srcPitch = src_pitch
+        copy.dstMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+        copy.dstDevice = dst_ptr
+        copy.dstPitch = row_bytes
+        copy.WidthInBytes = row_bytes
+        copy.Height = rows
+        (err,) = driver.cuMemcpy2D(copy)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'Failed to copy frame into batch buffer: {err}')
 
     def resized(self, shape: tuple[int, int], *, gamma_correct: bool = False) -> VideoFramesCuda:
         """Return a new VideoFramesCuda that outputs frames at the given size.

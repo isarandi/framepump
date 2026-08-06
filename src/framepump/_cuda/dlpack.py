@@ -42,6 +42,7 @@ class _GpuRgbBuffer:
         '_strides_arr',
         '_bits',
         '_code',
+        '_batch',
     )
 
     def __init__(
@@ -55,6 +56,7 @@ class _GpuRgbBuffer:
         owns_memory: bool,
         bits: int = 16,
         code: int = 1,
+        batch: int | None = None,
     ) -> None:
         self._devptr = devptr
         self._height = height
@@ -64,6 +66,7 @@ class _GpuRgbBuffer:
         self._owns_memory = owns_memory
         self._bits = bits
         self._code = code  # DLPack type code: 1 = kDLUInt, 2 = kDLFloat
+        self._batch = batch  # leading dimension for stacked (batch, h, w, 3) buffers
         self._own_device = None
         self._own_ctx = None
         if owns_memory:
@@ -78,8 +81,12 @@ class _GpuRgbBuffer:
             self._own_device = device
             self._own_ctx = ctx
         # Must outlive any DLPack capsule (DLTensor holds raw pointers).
-        self._shape_arr = (ctypes.c_int64 * 3)(height, width, 3)
-        self._strides_arr = (ctypes.c_int64 * 3)(width * 3, 3, 1)
+        if batch is None:
+            self._shape_arr = (ctypes.c_int64 * 3)(height, width, 3)
+            self._strides_arr = (ctypes.c_int64 * 3)(width * 3, 3, 1)
+        else:
+            self._shape_arr = (ctypes.c_int64 * 4)(batch, height, width, 3)
+            self._strides_arr = (ctypes.c_int64 * 4)(height * width * 3, width * 3, 3, 1)
 
     def __dlpack__(self, *args, **kwargs):
         if self._owns_memory is False and self._devptr == 0:
@@ -90,7 +97,7 @@ class _GpuRgbBuffer:
         mt = _DLManagedTensor()
         mt.dl_tensor.data = self._devptr
         mt.dl_tensor.device = _DLDevice(2, self._gpu_id)  # kDLCUDA
-        mt.dl_tensor.ndim = 3
+        mt.dl_tensor.ndim = 3 if self._batch is None else 4
         mt.dl_tensor.dtype = _DLDataType(self._code, self._bits, 1)
         mt.dl_tensor.shape = ctypes.cast(self._shape_arr, ctypes.POINTER(ctypes.c_int64))
         mt.dl_tensor.strides = ctypes.cast(self._strides_arr, ctypes.POINTER(ctypes.c_int64))
@@ -143,6 +150,7 @@ class _GpuRgbBuffer:
             owns_memory=False,
             bits=self._bits,
             code=self._code,
+            batch=self._batch,
         )
 
     def __del__(self):

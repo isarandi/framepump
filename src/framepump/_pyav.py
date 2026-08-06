@@ -249,11 +249,17 @@ class PyAVReader:
 
         # Enable multi-threaded decoding (~5x speedup).
         # Some formats/codecs don't support threading safely.
+        # Never for hwaccel containers: NVDEC does the decoding, so FFmpeg
+        # threads only add overhead (measured slightly slower) — and freeing
+        # a threaded hwaccel decoder that has decoded a frame livelocks in
+        # the NVIDIA driver when torchvision's C++ extension is loaded in
+        # the process, wedging it at reader teardown or interpreter exit.
         _THREADING_UNSAFE_CODECS = {'vp4'}
         codec_name = self._stream.codec_context.codec.name
         self.codec_name = codec_name
         self._use_threading = (
-            self._container.format.name not in ('pmp',)
+            not gpu
+            and self._container.format.name not in ('pmp',)
             and codec_name not in _THREADING_UNSAFE_CODECS
         )
         if self._use_threading:

@@ -175,6 +175,7 @@ class VideoFrames:
     Args:
         video_path: Path to video file.
         dtype: Output dtype (uint8, uint16, float16, float32, float64).
+            Float dtypes yield values scaled to [0, 1].
         gpu: False for CPU decoding, True for NVDEC hardware decoding on the
             default GPU, or an int to select a specific GPU device ordinal.
             Frames are decoded on the GPU and downloaded to numpy arrays;
@@ -595,6 +596,41 @@ class VideoFrames:
 
     def _frame_shape(self) -> tuple[int, ...]:
         return self.imshape if self.gray else (*self.imshape, 3)
+
+    def batched(self, batch_size: int) -> Generator[NDArray, None, None]:
+        """Yield the selected frames as stacked (n, height, width, 3) batches.
+
+        One sequential decode pass; each yielded array is freshly allocated
+        (safe to keep). The last batch may be smaller. This is the natural
+        input pipeline for batched model inference:
+
+            for batch in frames.batched(32):
+                predictions.extend(model(batch))
+
+        Args:
+            batch_size: Number of frames per batch, at least 1.
+        """
+        try:
+            batch_size = operator.index(batch_size)
+        except TypeError:
+            raise TypeError(
+                f'batch_size must be an integer, got {type(batch_size).__name__}'
+            ) from None
+        if batch_size < 1:
+            raise ValueError('batch_size must be at least 1')
+        out = None
+        count = 0
+        for frame in self:
+            if out is None:
+                out = np.empty((batch_size, *self._frame_shape()), dtype=self.dtype)
+            out[count] = frame
+            count += 1
+            if count == batch_size:
+                yield out
+                out = None
+                count = 0
+        if count:
+            yield out[:count]
 
     def frames_at(self, indices) -> Generator[NDArray, None, None]:
         """Yield the frames at the given indices, in the given order (lazy).

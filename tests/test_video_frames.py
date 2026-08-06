@@ -433,3 +433,23 @@ class TestFramesAt:
         v = VideoFrames(path)[::2]
         for got, j in zip(v.frames_at([1, 4]), [1, 4]):
             assert np.array_equal(got, v[j])
+
+
+class TestBatched:
+    """batched() yields freshly allocated stacked batches from one pass."""
+
+    def test_batches_match_asarray(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path, dtype=np.float32)
+        batches = list(v.batched(8))
+        assert [b.shape[0] for b in batches] == [8, 8, 8, 6]
+        assert all(b.dtype == np.float32 for b in batches)
+        assert np.array_equal(np.concatenate(batches), np.asarray(v))
+
+    def test_validation(self, sample_video):
+        path, *_ = sample_video
+        v = VideoFrames(path)
+        with pytest.raises(ValueError):
+            next(v.batched(0))
+        with pytest.raises(TypeError):
+            next(v.batched('8'))

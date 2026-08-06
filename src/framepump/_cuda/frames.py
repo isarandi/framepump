@@ -476,6 +476,71 @@ class VideoFramesCuda:
 
         raise TypeError('Indices must be integers or slices.')
 
+    def batched(self, batch_size: int):
+        """Yield the selected frames as stacked (n, height, width, 3) GPU batches.
+
+        One sequential decode pass; each yielded batch is an independently
+        owned GPU buffer — ``torch.from_dlpack(batch)`` gives a ready CUDA
+        batch tensor with no cloning or stacking needed, and batches stay
+        valid after iteration advances. The last batch may be smaller.
+
+            for batch in frames.batched(32):
+                tensors = torch.from_dlpack(batch)  # (n, H, W, 3) on CUDA
+
+        Args:
+            batch_size: Number of frames per batch, at least 1.
+        """
+        from cuda.bindings import driver
+
+        try:
+            batch_size = operator.index(batch_size)
+        except TypeError:
+            raise TypeError(
+                f'batch_size must be an integer, got {type(batch_size).__name__}'
+            ) from None
+        if batch_size < 1:
+            raise ValueError('batch_size must be at least 1')
+
+        th, tw = self.imshape
+        if self._needs_stages:
+            fbits, fcode = self._post_processor()._final_format
+        else:
+            fbits, fcode = 8, 1
+        row_bytes = tw * 3 * (fbits // 8)
+        frame_bytes = th * row_bytes
+
+        device, ctx = retain_primary_context(self._gpu)
+        pending: int | None = None  # allocated but not yet handed to a wrapper
+        try:
+            count = 0
+            for obj in self:
+                if pending is None:
+                    with cuda_ctx_pushed(ctx):
+                        err, devptr = driver.cuMemAlloc(batch_size * frame_bytes)
+                        if err != driver.CUresult.CUDA_SUCCESS:
+                            raise RuntimeError(f'Failed to allocate batch buffer: {err}')
+                    pending = int(devptr)
+                with cuda_ctx_pushed(ctx):
+                    self._copy_into(obj, pending + count * frame_bytes, row_bytes, th)
+                count += 1
+                if count == batch_size:
+                    buf, pending, count = pending, None, 0
+                    yield _GpuRgbBuffer(
+                        buf, th, tw, row_bytes, self._gpu,
+                        owns_memory=True, bits=fbits, code=fcode, batch=batch_size,
+                    )  # fmt: skip
+            if count:
+                buf, pending = pending, None
+                yield _GpuRgbBuffer(
+                    buf, th, tw, row_bytes, self._gpu,
+                    owns_memory=True, bits=fbits, code=fcode, batch=count,
+                )  # fmt: skip
+        finally:
+            if pending is not None:
+                with cuda_ctx_pushed(ctx):
+                    driver.cuMemFree(pending)
+            driver.cuDevicePrimaryCtxRelease(device)
+
     def frames_at(self, indices):
         """Yield the frames at the given indices, in the given order (lazy).
 

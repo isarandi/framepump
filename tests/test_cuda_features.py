@@ -424,3 +424,32 @@ class TestBatchGatherAndFramesAt:
         _require_cuda()
         with pytest.raises(NotImplementedError):
             next(_cuda_frames(smooth_video).repeat_each_frame(2).frames_at([0]))
+
+
+class TestBatched:
+    """batched() yields independently owned stacked batches from one pass."""
+
+    def test_gpu_batches_keepable_and_correct(self, smooth_video):
+        torch = _require_cuda()
+        v = _cuda_frames(smooth_video)
+        batches = [torch.from_dlpack(b) for b in v.batched(5)]  # no clone
+        assert [tuple(b.shape) for b in batches] == [(5, 240, 320, 3), (5, 240, 320, 3), (2, 240, 320, 3)]
+        flat = torch.cat(batches)
+        for i in range(12):
+            assert torch.equal(flat[i], torch.from_dlpack(v[i])), f'frame {i}'
+
+    def test_gpu_batched_with_float_resize_cfr(self):
+        torch = _require_cuda()
+        vfr = str(Path(__file__).parent / 'data' / 'variable_fps.mp4')
+        v = _cuda_frames(vfr, dtype=np.float32, constant_framerate=True).resized((90, 160))
+        first = next(iter(v.batched(8)))
+        t = torch.from_dlpack(first)
+        assert tuple(t.shape) == (8, 90, 160, 3) and t.dtype == torch.float32
+
+    def test_validation(self, smooth_video):
+        _require_cuda()
+        v = _cuda_frames(smooth_video)
+        with pytest.raises(ValueError):
+            next(v.batched(0))
+        with pytest.raises(TypeError):
+            next(v.batched(2.5))

@@ -333,8 +333,34 @@ class TestNormalOperation:
 class TestWorkerErrorTypePreserved:
     """Producer calls re-raise the worker's exception with its original type."""
 
-    def test_framepump_error_type_survives(self, tmp_path):
-        from framepump import NoAudioStreamError, VideoFrames
+    def test_error_type_survives_worker_reraise(self, tmp_path):
+        from pathlib import Path
+
+        with_audio = Path(__file__).parent / 'data' / 'with_audio.mp4'
+        writer = VideoWriter()
+        # audio_stream_index out of range raises ValueError inside the
+        # worker's lazy open; the producer must see that exact type.
+        writer.start_sequence(
+            str(tmp_path / 'out.mp4'),
+            fps=30,
+            audio_source_path=str(with_audio),
+            audio_stream_index=7,
+        )
+        writer.append_data(good_frame())
+        wait_for_worker_death(writer)
+        with pytest.raises(ValueError, match='out of range'):
+            call_with_timeout(lambda: writer.end_sequence(block=True))
+        call_with_timeout(writer.close)
+        assert no_temp_files(tmp_path)
+
+
+class TestSilentAudioSource:
+    """audio_source_path pointing at a file without audio yields video-only output."""
+
+    def test_silent_audio_source_writes_video_only(self, tmp_path):
+        import av
+
+        from framepump import VideoFrames
 
         silent = tmp_path / 'silent.mp4'
         with VideoWriter(str(silent), fps=30) as w:
@@ -342,13 +368,17 @@ class TestWorkerErrorTypePreserved:
                 w.append_data(good_frame())
         assert len(VideoFrames(str(silent))) == 3
 
+        out = tmp_path / 'out.mp4'
         writer = VideoWriter()
-        writer.start_sequence(str(tmp_path / 'out.mp4'), fps=30, audio_source_path=str(silent))
+        writer.start_sequence(str(out), fps=30, audio_source_path=str(silent))
         writer.append_data(good_frame())
-        wait_for_worker_death(writer)
-        with pytest.raises(NoAudioStreamError):
-            call_with_timeout(lambda: writer.end_sequence(block=True))
+        call_with_timeout(lambda: writer.end_sequence(block=True))
         call_with_timeout(writer.close)
+
+        assert len(VideoFrames(str(out))) == 1
+        with av.open(str(out)) as container:
+            assert not container.streams.audio
+        assert no_temp_files(tmp_path)
 
 
 class TestSequenceContextAndAbort:

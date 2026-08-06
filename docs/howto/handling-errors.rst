@@ -31,8 +31,10 @@ The subclasses and when they are raised:
 :class:`~framepump.NoVideoStreamError`
     The file contains no video stream (e.g. an audio-only file).
 :class:`~framepump.NoAudioStreamError`
-    An audio source was given (e.g. ``audio_source_path`` or
-    :func:`~framepump.video_audio_mux`) but it has no audio stream.
+    No longer raised (kept exported for compatibility): an audio source
+    without an audio stream (e.g. via ``audio_source_path`` or
+    :func:`~framepump.video_audio_mux`) now simply produces video-only
+    output.
 :class:`~framepump.IndexBuildError`
     Building the frame index failed (no valid frames found in the file).
 :class:`~framepump.FilterConfigError`

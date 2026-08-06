@@ -394,8 +394,8 @@ class TestZeroFrames:
 
 
 class TestMuxerAudioValidation:
-    def test_audio_source_without_audio_stream_raises(self, tmp_path):
-        from framepump import NoAudioStreamError, VideoWriter
+    def test_audio_source_without_audio_stream_is_video_only(self, tmp_path):
+        from framepump import VideoWriter
         from framepump._h264_mux import H264PassthroughMuxer
 
         silent = tmp_path / 'silent.mp4'
@@ -404,15 +404,17 @@ class TestMuxerAudioValidation:
                 writer.append_data(np.zeros((64, 64, 3), np.uint8))
 
         out = tmp_path / 'out.mp4'
-        with pytest.raises(NoAudioStreamError):
-            H264PassthroughMuxer(
-                str(out),
-                fps=Fraction(30),
-                width=64,
-                height=64,
-                bframes=0,
-                audio_source_path=str(silent),
-            )
+        muxer = H264PassthroughMuxer(
+            str(out),
+            fps=Fraction(30),
+            width=64,
+            height=64,
+            bframes=0,
+            audio_source_path=str(silent),
+        )
+        assert muxer._audio_stream is None
+        muxer.close()
+        # Zero frames muxed: nothing is promoted to the final path
         assert not out.exists()
         assert not list(tmp_path.glob('*.tmp_*'))
 
@@ -497,8 +499,10 @@ class TestTrimVideo:
 
 
 class TestVideoAudioMuxErrors:
-    def test_mux_error_leaves_no_output_file(self, tmp_path):
-        from framepump import NoAudioStreamError, VideoWriter, video_audio_mux
+    def test_silent_audio_source_produces_video_only(self, tmp_path):
+        import av
+
+        from framepump import VideoWriter, num_frames, video_audio_mux
 
         silent = tmp_path / 'silent.mp4'
         with VideoWriter(str(silent), fps=30) as writer:
@@ -506,9 +510,10 @@ class TestVideoAudioMuxErrors:
                 writer.append_data(np.zeros((64, 64, 3), np.uint8))
 
         out = tmp_path / 'muxed.mp4'
-        with pytest.raises(NoAudioStreamError):
-            video_audio_mux(str(silent), str(silent), str(out))
-        assert not out.exists()
+        video_audio_mux(str(silent), str(silent), str(out))
+        assert num_frames(str(out)) == 3
+        with av.open(str(out)) as container:
+            assert not container.streams.audio
         assert not list(tmp_path.glob('*.tmp_*'))
 
 

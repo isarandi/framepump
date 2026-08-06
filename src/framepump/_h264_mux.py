@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, BinaryIO, Union
 
 import av
 
-from ._pyav import NoAudioStreamError
 from ._temp_file import TempFile
 
 if TYPE_CHECKING:
@@ -78,6 +77,8 @@ class H264PassthroughMuxer:
             bframes: Number of B-frames the encoder was configured with.
             pix_fmt: Pixel format to declare on the video stream.
             audio_source_path: Optional file to copy the first audio stream from.
+                A source without any audio stream is fine: the output is then
+                video-only.
             format: Container format; inferred from the path extension if not
                 given. Required for file-like outputs.
             stream_options: Extra codec-context options for the video stream
@@ -171,9 +172,11 @@ class H264PassthroughMuxer:
     def _open_audio(self, audio_source_path: PathLike) -> None:
         self._audio_input_container = av.open(str(audio_source_path))
         if not self._audio_input_container.streams.audio:
+            # A source without audio simply means there is nothing to carry
+            # over; write a video-only file.
             self._audio_input_container.close()
             self._audio_input_container = None
-            raise NoAudioStreamError(audio_source_path)
+            return
         src_audio = self._audio_input_container.streams.audio[0]
         self._audio_stream = self._output_container.add_stream_from_template(src_audio)
         self._audio_time_base = src_audio.time_base

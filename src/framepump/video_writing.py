@@ -27,7 +27,7 @@ import simplepyutils as spu
 from numpy.typing import NDArray
 
 from ._h264_mux import _FORMAT_ALIASES
-from ._pyav import FrameIndexPyAV, NoAudioStreamError, PyAVReader, VideoEncodeError
+from ._pyav import FrameIndexPyAV, PyAVReader, VideoEncodeError
 from ._temp_file import TempFile
 from .encoder_config import EncoderConfig
 
@@ -65,7 +65,8 @@ class AbstractVideoWriter(ABC, Generic[T]):
         Args:
             video_path: Output path (str/Path) or file-like object (BinaryIO).
             fps: Frame rate for the video.
-            audio_source_path: Optional path to copy audio from.
+            audio_source_path: Optional path to copy audio from. A source
+                without any audio stream is fine: the output is then video-only.
             gpu: False for CPU encoding, True for GPU (NVENC) on default device,
                 or an int to select a specific GPU device ordinal.
             format: Container format (e.g., 'mp4'). Required for file-like objects,
@@ -156,6 +157,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         video_path: Output path for the first video sequence (optional).
         fps: Frame rate for the first video sequence (required if video_path is provided).
         audio_source_path: Path to copy audio from, for the first video sequence.
+            A source without any audio stream results in video-only output.
         queue_size: Max frames to buffer before blocking on `append_data`.
         gpu: False for CPU encoding (libx264/libx265), True for GPU (NVENC)
             on the default device, or an int GPU device ordinal. NVENC is
@@ -232,7 +234,8 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         Args:
             video_output: Output path (str/Path) or file-like object (BinaryIO).
             fps: Frame rate for the video.
-            audio_source_path: Optional path to copy audio from.
+            audio_source_path: Optional path to copy audio from. A source
+                without any audio stream is fine: the output is then video-only.
             audio_stream_index: Which audio stream to use (default 0).
             gpu: False for CPU encoding, True for GPU (NVENC) on default device,
                 or an int to select a specific GPU device ordinal.
@@ -792,18 +795,24 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
         if self._audio_source_path is not None:
             self._audio_input_container = av.open(str(self._audio_source_path))
             if not self._audio_input_container.streams.audio:
-                raise NoAudioStreamError(self._audio_source_path)
-            if self._audio_stream_index >= len(self._audio_input_container.streams.audio):
-                raise ValueError(
-                    f'Audio stream index {self._audio_stream_index} out of range, '
-                    f'file has {len(self._audio_input_container.streams.audio)} audio streams'
+                # A source without audio simply means there is nothing to carry
+                # over; write a video-only file.
+                self._audio_input_container.close()
+                self._audio_input_container = None
+            else:
+                if self._audio_stream_index >= len(self._audio_input_container.streams.audio):
+                    raise ValueError(
+                        f'Audio stream index {self._audio_stream_index} out of range, '
+                        f'file has {len(self._audio_input_container.streams.audio)} audio streams'
+                    )
+                src_audio = self._audio_input_container.streams.audio[self._audio_stream_index]
+                self._audio_stream = self._output_container.add_stream_from_template(src_audio)
+                self._audio_time_base = src_audio.time_base
+                self._audio_pkts = (
+                    pkt
+                    for pkt in self._audio_input_container.demux(src_audio)
+                    if pkt.dts is not None
                 )
-            src_audio = self._audio_input_container.streams.audio[self._audio_stream_index]
-            self._audio_stream = self._output_container.add_stream_from_template(src_audio)
-            self._audio_time_base = src_audio.time_base
-            self._audio_pkts = (
-                pkt for pkt in self._audio_input_container.demux(src_audio) if pkt.dts is not None
-            )
 
     def close(self) -> None:
         """Flush encoder and close containers, then rename temp to final.
@@ -961,7 +970,8 @@ def video_audio_mux(
     """Mux video from one file with audio from another using PyAV.
 
     Args:
-        vidpath_audiosource: Path to file containing audio.
+        vidpath_audiosource: Path to file containing audio. A source without
+            any audio stream is fine: the output is then video-only.
         vidpath_imagesource: Path to file containing video.
         out_video_path: Output path.
     """
@@ -993,26 +1003,32 @@ def _video_audio_mux_to_path(
         av.open(str(out_video_path), 'w', format=out_format) as output,
     ):
         src_video = video_src.streams.video[0]
-        if not audio_src.streams.audio:
-            raise NoAudioStreamError(vidpath_audiosource)
-        src_audio = audio_src.streams.audio[0]
         out_video = output.add_stream_from_template(src_video)
-        out_audio = output.add_stream_from_template(src_audio)
+        if audio_src.streams.audio:
+            src_audio = audio_src.streams.audio[0]
+            out_audio = output.add_stream_from_template(src_audio)
+            audio_pkts = (p for p in audio_src.demux(src_audio) if p.dts is not None)
+        else:
+            # A source without audio simply means there is nothing to mux in;
+            # produce a video-only file.
+            src_audio = None
+            out_audio = None
+            audio_pkts = iter(())
 
-        audio_pkts = (p for p in audio_src.demux(src_audio) if p.dts is not None)
         video_pkts = (p for p in video_src.demux(src_video) if p.dts is not None)
 
         for video_pkt in video_pkts:
-            video_time = video_pkt.dts * src_video.time_base
+            if out_audio is not None:
+                video_time = video_pkt.dts * src_video.time_base
 
-            # Write audio packets up to current video time
-            for audio_pkt in audio_pkts:
-                if audio_pkt.dts * src_audio.time_base > video_time:
-                    # Put back the packet for next round
-                    audio_pkts = itertools.chain([audio_pkt], audio_pkts)
-                    break
-                audio_pkt.stream = out_audio
-                output.mux(audio_pkt)
+                # Write audio packets up to current video time
+                for audio_pkt in audio_pkts:
+                    if audio_pkt.dts * src_audio.time_base > video_time:
+                        # Put back the packet for next round
+                        audio_pkts = itertools.chain([audio_pkt], audio_pkts)
+                        break
+                    audio_pkt.stream = out_audio
+                    output.mux(audio_pkt)
 
             # Write video packet
             video_pkt.stream = out_video

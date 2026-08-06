@@ -95,7 +95,7 @@ exported via DLPack for zero-copy access from PyTorch, CuPy, etc.
         tensor = torch.from_dlpack(decoded_frame)  # no copy, shares GPU memory
         # tensor is (H, W, 3) uint8 on CUDA
 
-``VideoFramesCuda`` supports slicing and indexing:
+``VideoFramesCuda`` supports slicing, indexing, and batch gathering:
 
 .. code-block:: python
 
@@ -103,8 +103,28 @@ exported via DLPack for zero-copy access from PyTorch, CuPy, etc.
     subset = frames[::2][:100]
     single = frames[42]
 
+    # numpy-style index lists produce ONE stacked (n, H, W, 3) GPU buffer:
+    # a ready batch tensor straight from NVDEC, no further copies
+    batch = torch.from_dlpack(frames[[10, 50, 51, 300]])
+
+    # lazy counterpart, yielding frames in the given order
+    for f in frames.frames_at(kept_indices):
+        ...
+
+GPU-side processing options mirror the CPU class: ``resized()`` (NPP resize,
+with an optional ``gamma_correct=True`` mode that resamples in linear light
+using the exact sRGB transfer), ``repeat_each_frame()``,
+``constant_framerate`` (the same ffmpeg-parity source map as the CPU class,
+so both select identical source frames), float16/float32 outputs scaled to
+[0, 1], and file-like sources (BytesIO, archive members — GPU decoding of
+video that never touches the filesystem). Iteration and DLPack export work
+from any thread, including prefetch threads in processes where torch owns
+the CUDA state.
+
 For 10-bit video sources, use ``dtype=np.uint16`` to preserve the full
-precision through an NPP (NVIDIA Performance Primitives) conversion pipeline.
+precision through an NPP (NVIDIA Performance Primitives) conversion
+pipeline; the conversion matrix and range follow the stream's colorspace
+flags (BT.601/709/2020 and friends).
 
 Unlike ``VideoFrames(gpu=True)``, the output of ``VideoFramesCuda`` is **not
 bit-identical** to CPU decoding: its YUV→RGB conversion runs in CUDA kernels

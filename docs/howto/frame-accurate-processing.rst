@@ -55,6 +55,27 @@ This works correctly even for H.264 and HEVC videos with B-frames. FramePump
 knows which keyframe to seek to and how many frames to decode forward to reach
 the target.
 
+Several frames at once — numpy-style index lists (eager, one stacked array)
+or the lazy ``frames_at`` walker:
+
+.. code-block:: python
+
+    batch = frames[[10, 50, 51, 300]]     # (4, height, width, 3) array
+    for frame in frames.frames_at(kept_indices):  # lazy, in the given order
+        process(frame)
+
+Both walk the file once: gaps of up to ~30 frames are decoded through,
+larger ones are seeked over — so sorted or mostly-forward index sequences
+are far faster than indexing frames one by one. Negative indices and
+repeats follow numpy semantics.
+
+A whole selection can be materialized as one array; the decode happens in a
+single sequential pass into a preallocated output:
+
+.. code-block:: python
+
+    clip = np.asarray(frames[120:180])    # (60, height, width, 3)
+
 Out-of-range indices raise ``IndexError``:
 
 .. code-block:: python

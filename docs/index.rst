@@ -32,6 +32,7 @@ Reading Video Frames
 
 .. code-block:: python
 
+    import numpy as np
     from framepump import VideoFrames
 
     # Lazy loading - only reads metadata
@@ -44,6 +45,10 @@ Reading Video Frames
 
     # Grab a single frame by index (decoded via a direct seek)
     frame_42 = frames[42]
+
+    # Several frames at once (numpy-style), or a whole selection as an array
+    picked = frames[[10, 50, 300]]        # (3, height, width, 3)
+    clip = np.asarray(frames[120:180])    # one sequential decode pass
 
     # Slice the video (lazy)
     subset = frames[:100:2]  # Every second frame of first 100

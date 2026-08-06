@@ -48,6 +48,7 @@ from __future__ import annotations
 import bisect
 import ctypes
 import itertools
+import operator
 import threading
 import warnings
 from pathlib import Path
@@ -59,7 +60,7 @@ from av.bitstream import BitStreamFilterContext
 from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
-from ._cuda_compat import cuda_ctx_pushed
+from ._cuda_compat import cuda_ctx_pushed, retain_primary_context
 from ._pyav import (
     PyAVReader,
     UnsupportedCodecError,
@@ -86,6 +87,21 @@ _STREAM_MAX_SKIP = 256
 # Reverse iteration buffers one chunk of copied/converted GPU frames at a
 # time; the chunk frame count is derived from this budget ([4, 64] frames)
 _REVERSE_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+# AVColorSpace id → twist matrix name (H.273 ids as in FFmpeg's pixfmt.h).
+# Values must be keys of npp_bindings.LUMA_COEFFICIENTS (imported lazily
+# there — importing it here would load the NPP shared libraries eagerly).
+_AVCOL_SPC_TO_MATRIX = {
+    1: 'bt709',
+    4: 'fcc',
+    5: 'bt601',  # BT.470BG
+    6: 'bt601',  # SMPTE 170M
+    7: 'smpte240m',
+    9: 'bt2020',  # non-constant luminance
+}
+_SUPPORTED_COLOR_SPACES = frozenset(_AVCOL_SPC_TO_MATRIX.values())
+
 
 
 class _CudaLazyIndexState:
@@ -244,6 +260,12 @@ class _NvDecSession:
 
     Created per iteration/access — not shared across clones or concurrent
     iterations.
+
+    The decoder is bound to the device's *primary* CUDA context, retained for
+    the session's lifetime. Without an explicit context, PyNvVideoCodec binds
+    to whatever context state the creating thread happens to have, and the
+    DLPack export then dies with CUDA_ERROR_INVALID_CONTEXT when a different
+    thread (e.g. one holding a torch model) owns the process's CUDA state.
     """
 
     def __init__(
@@ -255,39 +277,76 @@ class _NvDecSession:
         output_color_type,
     ) -> None:
         self._path = video_path
+        self._device = None
+        self._ctx = None
+        self._dec = None
+        self._src = None
         self._src = _PyAVPacketSource(video_path, codec_name)
         try:
+            self._device, self._ctx = retain_primary_context(gpu)
             self._dec = nvc.CreateDecoder(
                 gpuid=gpu,
                 codec=codec,
+                cudacontext=int(self._ctx),
+                cudastream=0,
                 usedevicememory=True,
                 outputColorType=output_color_type,
                 latency=nvc.DisplayDecodeLatencyType.LOW,
             )
         except _NVC_ERRORS as e:
+            self.close()
             raise VideoDecodeError(video_path, 0, e) from e
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Drop the decoder and balance the primary-context retain."""
+        if self._dec is not None:
+            with cuda_ctx_pushed(self._ctx):
+                self._dec = None
+        if self._device is not None:
+            from cuda.bindings import driver
+
+            driver.cuDevicePrimaryCtxRelease(self._device)
+            self._device = None
+            self._ctx = None
+        if self._src is not None:
+            self._src.close()
+            self._src = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _decode_all(self):
         """Feed every remaining packet and flush; yield (pts, frame).
 
         NVDEC/driver errors (unsupported profile, mid-stream reconfiguration
         beyond limits, ...) are wrapped so callers never see raw
-        PyNvVideoCodec exceptions.
+        PyNvVideoCodec exceptions. Decode calls run under the session context
+        (pushed per step, never across a yield, so no context state leaks
+        into the consuming thread).
         """
         count = 0
         try:
             for pd in self._src.packets():
-                for f in self._dec.Decode(pd):
+                with cuda_ctx_pushed(self._ctx):
+                    decoded = [(f.getPTS(), f) for f in self._dec.Decode(pd)]
+                for item in decoded:
                     count += 1
-                    yield f.getPTS(), f
+                    yield item
             empty = nvc.PacketData()
             while True:
-                frames = self._dec.Decode(empty)
-                if not frames:
+                with cuda_ctx_pushed(self._ctx):
+                    decoded = [(f.getPTS(), f) for f in self._dec.Decode(empty)]
+                if not decoded:
                     break
-                for f in frames:
+                for item in decoded:
                     count += 1
-                    yield f.getPTS(), f
+                    yield item
         except _NVC_ERRORS as e:
             raise VideoDecodeError(self._path, count, e) from e
 
@@ -332,21 +391,33 @@ class VideoFramesCuda:
     so pixel values typically differ by a few counts. ``VideoFrames``
     with ``gpu=True`` is bit-identical to CPU decoding instead.
 
-    API gaps vs ``VideoFrames`` (intentional): ``resized()``,
-    ``repeat_each_frame()``, and ``constant_framerate`` are not supported on
-    the GPU path. Use the CPU ``VideoFrames`` class when those are needed, or
-    apply resizing/repetition on the returned CUDA tensors.
+    ``resized()`` (GPU-side NPP resize), ``repeat_each_frame()``, and float
+    output dtypes are supported like on the CPU class. Remaining API gaps vs
+    ``VideoFrames`` (intentional): ``constant_framerate``, file-like sources,
+    ``float64``, and the seek-reliability content probe. Use the CPU class
+    when those are needed.
+
+    Decode sessions are bound to the device's primary CUDA context, so
+    iteration and DLPack export work from any thread (e.g. prefetch
+    threads), including processes where another thread owns torch's CUDA
+    state.
 
     Args:
         video_path: Path to video file.
         gpu: GPU device ordinal (default 0).
-        dtype: Output dtype — ``np.uint8`` (default) or ``np.uint16``.
-            For 10-bit sources, ``uint16`` preserves the full precision
-            via an NVDEC → NPP color-conversion pipeline.  For 8-bit
-            sources, ``uint16`` scales values to the full 0–65535 range.
-        color_space: ``'auto'`` (default), ``'bt601'``, or ``'bt709'``.
-            Only used when NPP conversion is active (10-bit + uint16).
-            ``'auto'`` selects BT.709 for height >= 720, else BT.601.
+        dtype: Output dtype — ``np.uint8`` (default), ``np.uint16``,
+            ``np.float16``, or ``np.float32``. For 10-bit sources, ``uint16``
+            preserves the full precision via an NVDEC → NPP color-conversion
+            pipeline. For 8-bit sources, ``uint16`` scales values to the full
+            0–65535 range. Float outputs are scaled to [0, 1] on the GPU
+            (uint16 pipeline internally, like the CPU class).
+        color_space: ``'auto'`` (default), ``'bt601'``, ``'bt709'``,
+            ``'bt2020'``, ``'fcc'``, or ``'smpte240m'``. Only used when NPP
+            conversion is active (10-bit + uint16). ``'auto'`` follows the
+            stream's colorspace flag; if unspecified, BT.709 is assumed for
+            height >= 720, else BT.601. Limited vs full range is always taken
+            from the stream. (BT.2020 constant-luminance, ICtCp and other
+            non-matrix colorspaces are not supported — use ``VideoFrames``.)
     """
 
     def __init__(
@@ -363,13 +434,16 @@ class VideoFramesCuda:
 
         # Validate dtype.
         dtype = np.dtype(dtype)
-        if dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
-            if np.issubdtype(dtype, np.floating):
-                raise NotImplementedError(
-                    f'dtype={dtype} is not yet supported for GPU decoding. '
-                    f'Use np.uint8 or np.uint16, then convert after '
-                    f'torch.from_dlpack().'
-                )
+        if dtype in (np.dtype(np.float16), np.dtype(np.float32)):
+            self._float_dtype: np.dtype | None = dtype
+        elif dtype in (np.dtype(np.uint8), np.dtype(np.uint16)):
+            self._float_dtype = None
+        elif dtype == np.dtype(np.float64):
+            raise NotImplementedError(
+                'dtype=float64 is not supported for GPU decoding (NPP has no '
+                'float64 pipeline). Use float32, or convert after torch.from_dlpack().'
+            )
+        else:
             raise ValueError(f'Unsupported dtype: {dtype}')
         self.dtype: np.dtype = dtype
 
@@ -384,7 +458,10 @@ class VideoFramesCuda:
             self._codec_name: str = reader.codec_name
             pix_fmt = reader._stream.codec_context.format
             fmt_name = pix_fmt.name if pix_fmt is not None else 'yuv420p'
-            self._colorspace_id = int(getattr(reader._stream.codec_context, 'colorspace', 0) or 0)
+            cc = reader._stream.codec_context
+            self._colorspace_id = int(getattr(cc, 'colorspace', 0) or 0)
+            self._range_full = int(getattr(cc, 'color_range', 0) or 0) == 2  # AVCOL_RANGE_JPEG
+            self._trc_id = int(getattr(cc, 'color_trc', 2) or 2)
         finally:
             reader.close()
 
@@ -406,9 +483,11 @@ class VideoFramesCuda:
         # Probe source pixel format (needs one decoded NATIVE frame).
         self._source_format = self._probe_source_format()
 
-        # Decide decode + post-processing strategy.
+        # Decide decode + post-processing strategy. Float outputs use the
+        # uint16 pipeline internally (like the CPU class) and scale to [0, 1]
+        # as a final NPP stage.
         source_is_hbd = self._source_format in _HBD_FORMATS
-        want_16 = dtype == np.uint16
+        want_16 = dtype != np.dtype(np.uint8)
 
         if not want_16:
             # uint8 output: library's RGB conversion handles everything
@@ -424,20 +503,24 @@ class VideoFramesCuda:
             self._npp_mode = 'scale_8u_16u'
             self._color_type = nvc.OutputColorType.RGB
 
+        self._out_shape: tuple[int, int] | None = None
+        self._gamma_resize: bool = False
+        self._repeat_count: int = 1
+
         # Color space (only matters for yuv_to_rgb16 path).
         if color_space == 'auto':
-            if self._colorspace_id == 1:  # AVCOL_SPC_BT709
-                self._color_space = 'bt709'
-            elif self._colorspace_id in (5, 6):  # BT470BG / SMPTE170M (BT.601)
-                self._color_space = 'bt601'
+            mapped = _AVCOL_SPC_TO_MATRIX.get(self._colorspace_id)
+            if mapped is not None:
+                self._color_space = mapped
             else:
                 # Unspecified — fall back to height heuristic.
                 self._color_space = 'bt709' if self.original_imshape[0] >= 720 else 'bt601'
-        elif color_space in ('bt601', 'bt709'):
+        elif color_space in _SUPPORTED_COLOR_SPACES:
             self._color_space = color_space
         else:
             raise ValueError(
-                f"color_space must be 'auto', 'bt601', or 'bt709', " f'got {color_space!r}'
+                f'color_space must be one of {("auto", *sorted(_SUPPORTED_COLOR_SPACES))}, '
+                f'got {color_space!r}'
             )
 
     # ── Public interface ──────────────────────────────────────────────
@@ -448,6 +531,20 @@ class VideoFramesCuda:
         Each yielded frame stays in GPU memory and supports ``__dlpack__``
         for zero-copy import into PyTorch, CuPy, etc.
         """
+        inner = self._iter_once()
+        if self._repeat_count == 1:
+            yield from inner
+            return
+        for obj in inner:
+            # Non-owning views first, the original object last: an owned
+            # buffer's DLPack export hands its memory over, which must not
+            # happen while sibling views are still queued.
+            for _ in range(self._repeat_count - 1):
+                yield obj.view() if isinstance(obj, _GpuRgbBuffer) else obj
+            yield obj
+
+    def _iter_once(self):
+        """Decode and yield each selected frame exactly once."""
         # Stream without the index when the selection is a plain forward
         # slice with a small start. If the index already exists, the
         # seek-based paths are at least as good — use them.
@@ -465,7 +562,7 @@ class VideoFramesCuda:
         if len(frame_range) == 0:
             return
 
-        if self._npp_mode is not None:
+        if self._needs_stages:
             self._init_npp_pipeline()
 
         # Large step (either direction): per-frame seeks; range() iterates
@@ -480,12 +577,17 @@ class VideoFramesCuda:
         else:
             yield from self._iter_sequential(frame_range)
 
+    @property
+    def _needs_stages(self) -> bool:
+        """Whether output goes through the NPP post-processing stages."""
+        return self._npp_mode is not None or self._out_shape is not None
+
     def _iter_streamed(self, streamable: slice):
         """Decode from the start and skip, without building the frame index."""
-        if self._npp_mode is not None:
+        if self._needs_stages:
             self._init_npp_pipeline()
         session = self._make_session()
-        convert = self._npp_mode is not None
+        convert = self._needs_stages
         start = streamable.start or 0
         stop = streamable.stop
         step = streamable.step or 1
@@ -496,11 +598,11 @@ class VideoFramesCuda:
             if stop is not None and frame_count >= stop:
                 break
             if frame_count >= start and (frame_count - start) % step == 0:
-                self._check_decoded_dims(frame)
+                self._check_decoded_dims(frame, session)
                 if convert:
                     yield self._convert_frame_shared(frame)
                 else:
-                    yield frame
+                    yield _CtxFrame(frame, session)
                 yielded += 1
             frame_count += 1
         if yielded == 0 and frame_count == 0 and (stop is None or stop > 0) and start == 0:
@@ -508,7 +610,7 @@ class VideoFramesCuda:
             # here would look like a valid empty video
             raise VideoDecodeError(self.path, 0, RuntimeError('NVDEC decoder produced no frames'))
 
-    def _check_decoded_dims(self, frame) -> None:
+    def _check_decoded_dims(self, frame, session) -> None:
         """Detect decoders returning unexpected dimensions (e.g. NVDEC
         splitting interlaced MJPEG into half-height fields) instead of
         silently yielding wrong-shaped frames. Checked once per instance;
@@ -517,9 +619,10 @@ class VideoFramesCuda:
         if self._dims_checked or self._npp_mode is not None:
             return
         self._dims_checked = True
-        views = frame.cuda()
-        view = views[0] if isinstance(views, (list, tuple)) else views
-        shape = view.__cuda_array_interface__['shape']
+        with cuda_ctx_pushed(session._ctx):
+            views = frame.cuda()
+            view = views[0] if isinstance(views, (list, tuple)) else views
+            shape = view.__cuda_array_interface__['shape']
         expected = self.original_imshape
         if tuple(shape[:2]) != expected:
             raise VideoDecodeError(
@@ -548,29 +651,94 @@ class VideoFramesCuda:
                 item = length + item
             if item < 0 or item >= length:
                 total = self._index.frame_count
-                if len(self._resolved_range()) != total:
+                if len(self._resolved_range()) != total or self._repeat_count != 1:
                     detail = f'view with {length} frames (source video has {total})'
                 else:
                     detail = f'video with {length} frames'
                 raise IndexError(f'Frame index {item} out of range for {detail}')
-            abs_idx = self._resolved_range()[item]
+            abs_idx = self._resolved_range()[item // self._repeat_count]
             return self._get_frame_by_abs_idx(abs_idx, owns_memory=True)
 
         if isinstance(item, slice):
             if item.step == 0:
                 raise ValueError('Slice step cannot be zero.')
+            if self._repeat_count != 1:
+                raise NotImplementedError(
+                    'Slicing a repeated view is not supported; apply slicing '
+                    'before repeat_each_frame().'
+                )
             result = self._clone()
             result._selection = self._selection.sliced(item)
             return result
 
         raise TypeError('Indices must be integers or slices.')
 
+    def resized(self, shape: tuple[int, int], *, gamma_correct: bool = False) -> VideoFramesCuda:
+        """Return a new VideoFramesCuda that outputs frames at the given size.
+
+        The resize runs on the GPU (NPP: area averaging for downscaling,
+        Lanczos otherwise) on the converted RGB frames, so its interpolation
+        does not bit-match the CPU class's swscale resize.
+
+        Args:
+            shape: Target size as (height, width), following numpy/image
+                convention. The frame is stretched to exactly this size;
+                aspect ratio is not preserved.
+            gamma_correct: Resample in linear light instead of on the
+                gamma-encoded values: pixels are linearized with the exact
+                IEC 61966-2-1 sRGB transfer (piecewise: linear toe below
+                0.04045, power 2.4 segment above — not a plain power law),
+                resized in float32, and re-encoded. This avoids the darkening
+                of averaged high-contrast detail that gamma-space resizing
+                (the default here, and what swscale/OpenCV/PIL do) produces —
+                most visible when downscaling fine patterns. Off by default
+                to match the CPU class and common ML-pipeline conventions.
+                Not supported for PQ/HLG (HDR) transfer content.
+        """
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) != 2
+            or not all(isinstance(x, int) for x in shape)
+        ):
+            raise TypeError(f'shape must be a (height, width) tuple of two ints, got {shape!r}')
+        if gamma_correct and self._trc_id in (16, 18):  # PQ, HLG
+            raise NotImplementedError(
+                'gamma_correct resizing is not supported for PQ/HLG (HDR) transfer '
+                'content — a pure power law would mishandle it.'
+            )
+        result = self._clone()
+        result._out_shape = shape
+        result._gamma_resize = gamma_correct
+        return result
+
+    def repeat_each_frame(self, n: int) -> VideoFramesCuda:
+        """Return a new VideoFramesCuda that yields each selected frame ``n`` times.
+
+        The effective ``fps`` scales by ``n`` accordingly. Apply slicing
+        before this, not after: slicing a repeated view raises
+        NotImplementedError.
+
+        Args:
+            n: Repeat count, at least 1.
+        """
+        try:
+            n = operator.index(n)
+        except TypeError:
+            raise TypeError(
+                f'The repeat count must be an integer, got {type(n).__name__}'
+            ) from None
+        if n < 1:
+            raise ValueError('The repeat count must be at least 1.')
+        result = self._clone()
+        result._repeat_count *= n
+        return result
+
     def __len__(self) -> int:
         """Exact number of frames in this view.
 
         Builds the frame index on first use, which scans the file's packets.
         """
-        return len(self._resolved_range())
+        return len(self._resolved_range()) * self._repeat_count
 
     def __repr__(self) -> str:
         h, w = self.imshape
@@ -582,17 +750,17 @@ class VideoFramesCuda:
 
     @property
     def imshape(self) -> tuple[int, int]:
-        """Frame dimensions as (height, width)."""
-        return self.original_imshape
+        """Output frame dimensions as (height, width), after any resize."""
+        return self._out_shape if self._out_shape is not None else self.original_imshape
 
     @property
     def fps(self) -> float:
-        """Effective frame rate, accounting for slicing.
+        """Effective frame rate, accounting for slicing and repetition.
 
         Uses the selection's effective stride, which is known even before
         the frame count is — reading fps never triggers the index scan.
         """
-        return self.original_fps / abs(self._selection.step_product)
+        return self.original_fps / abs(self._selection.step_product) * self._repeat_count
 
     @property
     def _index(self) -> _FrameIndexNvDec:
@@ -644,6 +812,12 @@ class VideoFramesCuda:
         result._bit_depth = self._bit_depth
         result._chroma_is_444 = self._chroma_is_444
         result._colorspace_id = self._colorspace_id
+        result._range_full = self._range_full
+        result._float_dtype = self._float_dtype
+        result._out_shape = self._out_shape
+        result._gamma_resize = self._gamma_resize
+        result._trc_id = self._trc_id
+        result._repeat_count = self._repeat_count
         result._selection = self._selection
         result._dims_checked = self._dims_checked
         # Index state is shared: whichever view builds it, all views see it
@@ -682,80 +856,57 @@ class VideoFramesCuda:
         """Get a single frame by absolute index."""
         target_pts = self._index.frame_pts[abs_idx]
         safe_pts = self._index.safe_seek_pts[abs_idx]
-        frame, dec = self._seek_decode_to(safe_pts, target_pts)
-        return self._wrap_frame(frame, dec, owns_memory=owns_memory)
+        frame, session = self._seek_decode_to(safe_pts, target_pts)
+        return self._wrap_frame(frame, session, owns_memory=owns_memory)
 
     def _seek_decode_to(self, safe_pts: int, target_pts: int):
         """Seek to safe_pts, decode forward to target_pts.
 
-        Returns (frame, decoder) — caller must keep decoder alive while
+        Returns (frame, session) — caller must keep the session alive while
         using the frame's GPU memory.
 
         If the file is non-seekable (edit-list files), decodes from the
         beginning and skips to the target PTS.
         """
-        # Create a fresh packet source + decoder per seek for clean state.
-        src = _PyAVPacketSource(self.path, self._codec_name)
-        try:
-            dec = nvc.CreateDecoder(
-                gpuid=self._gpu,
-                codec=self._codec,
-                usedevicememory=True,
-                outputColorType=self._color_type,
-                latency=nvc.DisplayDecodeLatencyType.LOW,
-            )
-
-            if self._index.seekable and safe_pts > 0:
-                src.seek(safe_pts)
-
-            for pd in src.packets():
-                for f in dec.Decode(pd):
-                    if f.getPTS() >= target_pts:
-                        self._check_decoded_dims(f)
-                        return f, dec
-            empty = nvc.PacketData()
-            while True:
-                frames = dec.Decode(empty)
-                if not frames:
-                    break
-                for f in frames:
-                    if f.getPTS() >= target_pts:
-                        self._check_decoded_dims(f)
-                        return f, dec
-        except _NVC_ERRORS as e:
-            raise VideoDecodeError(self.path, 0, e) from e
+        # A fresh session per seek for clean decoder state.
+        session = self._make_session()
+        if self._index.seekable and safe_pts > 0:
+            session._src.seek(safe_pts)
+        for pts, frame in session._decode_all():
+            if pts >= target_pts:
+                self._check_decoded_dims(frame, session)
+                return frame, session
         raise RuntimeError(f'Failed to decode frame at PTS {target_pts} (seeked to {safe_pts})')
 
-    def _wrap_frame(self, frame, dec, *, owns_memory: bool):
-        """Wrap a decoded frame for output (NPP conversion or DLPack)."""
-        if self._npp_mode is not None:
-            self._init_npp_pipeline()
+    def _wrap_frame(self, frame, session, *, owns_memory: bool):
+        """Wrap a decoded frame for output (NPP stages or DLPack)."""
+        if self._needs_stages:
             if owns_memory:
                 buf = self._convert_frame_fresh(frame)
-                del dec
+                del session
                 return buf
             else:
                 return self._convert_frame_shared(frame)
-        # No NPP: wrap frame + decoder to prevent GC.
+        # No NPP: wrap frame + session to prevent GC.
         if owns_memory:
-            return _FrameWithDecoder(frame, dec)
+            return _FrameWithDecoder(frame, session)
         else:
-            return frame
+            return _CtxFrame(frame, session)
 
     # ── Iteration paths ──────────────────────────────────────────────
 
-    def _emit(self, frame, owned: bool):
+    def _emit(self, frame, owned: bool, session):
         """Convert or wrap a decoded frame for yielding.
 
         ``owned=False`` follows the iteration contract (shared conversion
-        buffer / raw decoder frame, valid until the next step). ``owned=True``
+        buffer / decoder frame, valid until the next step). ``owned=True``
         produces a buffer independent of the decode session — required when
         frames are buffered past subsequent decodes (reverse chunks), since
         decoder-owned surfaces are recycled from a bounded pool.
         """
-        if self._npp_mode is not None:
+        if self._needs_stages:
             return self._convert_frame_fresh(frame) if owned else self._convert_frame_shared(frame)
-        return self._copy_rgb_frame(frame) if owned else frame
+        return self._copy_rgb_frame(frame, session) if owned else _CtxFrame(frame, session)
 
     def _iter_sequential(self, frame_range: range, *, owned: bool = False):
         """Path C: sequential decode from beginning with step."""
@@ -770,8 +921,8 @@ class VideoFramesCuda:
             if frame_count >= stop:
                 break
             if frame_count >= start and (frame_count - start) % step == 0:
-                self._check_decoded_dims(frame)
-                yield self._emit(frame, owned)
+                self._check_decoded_dims(frame, session)
+                yield self._emit(frame, owned, session)
                 yielded += 1
             frame_count += 1
         if yielded == 0 and frame_count == 0 and stop > start:
@@ -807,26 +958,27 @@ class VideoFramesCuda:
             if frame_count >= max_frames:
                 break
             if frame_count % step == 0:
-                yield self._emit(frame, owned)
+                yield self._emit(frame, owned, session)
             frame_count += 1
 
     def _iter_by_index(self, frame_range: range):
         """Path A: individual seeks for each frame (large step)."""
-        convert = self._npp_mode is not None
-        # Keep the previous decoder alive between yields — the decoder owns
+        convert = self._needs_stages
+        # Keep the previous session alive between yields — its decoder owns
         # the GPU surface pool that the frame points to.
-        prev_dec = None
+        prev_session = None
         for abs_idx in frame_range:
             target_pts = self._index.frame_pts[abs_idx]
             safe_pts = self._index.safe_seek_pts[abs_idx]
-            frame, dec = self._seek_decode_to(safe_pts, target_pts)
+            frame, session = self._seek_decode_to(safe_pts, target_pts)
             if convert:
                 yield self._convert_frame_shared(frame)
             else:
-                yield frame
-            # Assign after yield so previous decoder survives while caller uses the frame
-            prev_dec = dec
-        del prev_dec
+                yield _CtxFrame(frame, session)
+            # Assign after yield so the previous session survives while the
+            # caller uses the frame
+            prev_session = session
+        del prev_session
 
     # ── Reverse iteration ────────────────────────────────────────────
 
@@ -879,20 +1031,11 @@ class VideoFramesCuda:
     def _is_safe_seek_frame(self, abs_idx: int) -> bool:
         return self._index.frame_pts[abs_idx] == self._index.safe_seek_pts[abs_idx]
 
-    def _copy_rgb_frame(self, frame) -> _GpuRgbBuffer:
+    def _copy_rgb_frame(self, frame, session) -> _GpuRgbBuffer:
         """Copy a decoder-owned RGB uint8 frame into an owned GPU buffer."""
         from cuda.bindings import driver
 
         h, w = self.original_imshape
-        views = frame.cuda()
-        view = views[0] if isinstance(views, (list, tuple)) else views
-        cai = view.__cuda_array_interface__
-        src_ptr = cai['data'][0]
-        strides = cai.get('strides')
-        src_pitch = strides[0] if strides else w * 3
-        row_bytes = w * 3
-        if src_pitch < row_bytes:
-            raise RuntimeError(f'Unexpected RGB frame pitch {src_pitch} for width {w}')
 
         err, device = driver.cuDeviceGet(self._gpu)
         if err != driver.CUresult.CUDA_SUCCESS:
@@ -902,6 +1045,17 @@ class VideoFramesCuda:
             raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
         try:
             with cuda_ctx_pushed(ctx):
+                # The frame's CUDA-array export needs the session's context
+                # current (same primary context as ours).
+                views = frame.cuda()
+                view = views[0] if isinstance(views, (list, tuple)) else views
+                cai = view.__cuda_array_interface__
+                src_ptr = cai['data'][0]
+                strides = cai.get('strides')
+                src_pitch = strides[0] if strides else w * 3
+                row_bytes = w * 3
+                if src_pitch < row_bytes:
+                    raise RuntimeError(f'Unexpected RGB frame pitch {src_pitch} for width {w}')
                 err, devptr = driver.cuMemAlloc(row_bytes * h)
                 if err != driver.CUresult.CUDA_SUCCESS:
                     raise RuntimeError(f'Failed to allocate frame copy buffer: {err}')
@@ -929,8 +1083,54 @@ class VideoFramesCuda:
 
     # ── NPP pipeline ─────────────────────────────────────────────────
 
+    @property
+    def _stage_names(self) -> list[str]:
+        """The post-decode GPU stages, in execution order."""
+        if self._out_shape is not None and self._gamma_resize:
+            # Linear-light resize: to float, linearize, resize, re-encode.
+            names = [] if self._npp_mode is None else ['convert']
+            names += ['to_f32', 'lin_resize']
+            if self._float_dtype is None:
+                names.append('to_uint')
+            elif self._float_dtype == np.dtype(np.float16):
+                names.append('f16')
+            return names
+        if self._npp_mode is None:
+            names = ['resize8'] if self._out_shape is not None else []
+        else:
+            names = ['convert']
+            if self._out_shape is not None:
+                names.append('resize16')
+        if self._float_dtype is not None:
+            names.append('f32')
+            if self._float_dtype == np.dtype(np.float16):
+                names.append('f16')
+        return names
+
+    @property
+    def _final_format(self) -> tuple[int, int]:
+        """(bits, DLPack type code) of the output samples."""
+        if self._float_dtype is not None:
+            return (16, 2) if self._float_dtype == np.dtype(np.float16) else (32, 2)
+        return (8, 1) if self.dtype == np.dtype(np.uint8) else (16, 1)
+
+    def _stage_buffer_size(self, name: str) -> int:
+        h, w = self.original_imshape
+        th, tw = self.imshape
+        final_elem = self._final_format[0] // 8
+        return {
+            'convert': w * 3 * 2 * h,
+            'resize8': tw * 3 * th,
+            'resize16': tw * 3 * 2 * th,
+            'f32': tw * 3 * 4 * th,
+            'f16': tw * 3 * 2 * th,
+            'to_f32': w * 3 * 4 * h,
+            'lin_resize': tw * 3 * 4 * th,
+            'to_uint': tw * 3 * final_elem * th,
+        }[name]
+
     def _init_npp_pipeline(self) -> None:
-        """Lazy-initialize NPP conversion resources (idempotent, thread-safe)."""
+        """Lazy-initialize NPP post-processing resources (idempotent, thread-safe)."""
         if hasattr(self, '_npp_ctx'):
             return
         with self._npp_init_lock:
@@ -952,24 +1152,27 @@ class VideoFramesCuda:
             if err != driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f'cuDevicePrimaryCtxRetain failed: {err}')
 
+            bufs: dict[str, int] = {}
             try:
                 with cuda_ctx_pushed(cuda_ctx):
                     # Build NppStreamContext (uses default stream = 0).
                     npp_ctx = npp_bindings.make_npp_stream_context(self._gpu)
 
                     # Select color twist matrix.
-                    if self._color_space == 'bt709':
-                        twist = npp_bindings.BT709_YUV_TO_RGB_16
-                    else:
-                        twist = npp_bindings.BT601_YUV_TO_RGB_16
+                    twist = npp_bindings.make_yuv_to_rgb_twist(
+                        self._color_space, full_range=self._range_full
+                    )
 
-                    # Allocate reusable output buffer for iteration.
-                    h, w = self.original_imshape
-                    out_pitch = w * 3 * 2  # uint16 packed RGB: 3 ch * 2 bytes
-                    err, devptr = driver.cuMemAlloc(out_pitch * h)
-                    if err != driver.CUresult.CUDA_SUCCESS:
-                        raise RuntimeError(f'Failed to allocate NPP output buffer: {err}')
+                    # One reusable (iteration-shared) buffer per stage.
+                    for name in self._stage_names:
+                        err, devptr = driver.cuMemAlloc(self._stage_buffer_size(name))
+                        if err != driver.CUresult.CUDA_SUCCESS:
+                            raise RuntimeError(f'Failed to allocate NPP {name} buffer: {err}')
+                        bufs[name] = int(devptr)
             except Exception:
+                with cuda_ctx_pushed(cuda_ctx):
+                    for ptr in bufs.values():
+                        driver.cuMemFree(ptr)
                 driver.cuDevicePrimaryCtxRelease(device)
                 raise
 
@@ -979,22 +1182,22 @@ class VideoFramesCuda:
             self._npp_cuda_ctx = cuda_ctx
             self._npp_bindings = npp_bindings
             self._twist = twist
-            self._out_pitch = out_pitch
-            self._iter_buf_ptr = int(devptr)
+            self._bufs = bufs
             self._npp_ctx = npp_ctx
 
     def _cleanup_npp(self) -> None:
         """Free NPP pipeline GPU resources."""
         ctx = getattr(self, '_npp_cuda_ctx', None)
-        buf = getattr(self, '_iter_buf_ptr', None)
-        if buf is not None and ctx is not None:
+        bufs = getattr(self, '_bufs', None)
+        if bufs is not None and ctx is not None:
             from cuda.bindings import driver
 
             with cuda_ctx_pushed(ctx):
                 # NPP work on the default stream may still be in flight.
                 driver.cuCtxSynchronize()
-                driver.cuMemFree(buf)
-            del self._iter_buf_ptr
+                for ptr in bufs.values():
+                    driver.cuMemFree(ptr)
+            del self._bufs
         device = getattr(self, '_cuda_device', None)
         if device is not None:
             from cuda.bindings import driver
@@ -1006,56 +1209,127 @@ class VideoFramesCuda:
         # Remove the lazy-init sentinel (and everything published with it) so
         # the pipeline re-initializes on the next use instead of hitting
         # AttributeError on the freed resources.
-        for attr in ('_npp_ctx', '_npp_bindings', '_twist', '_out_pitch'):
+        for attr in ('_npp_ctx', '_npp_bindings', '_twist'):
             if hasattr(self, attr):
                 delattr(self, attr)
 
-    def _convert_frame_shared(self, frame) -> _GpuRgbBuffer:
-        """Convert a frame into the reusable iteration buffer."""
-        self._do_convert(frame, self._iter_buf_ptr)
-        h, w = self.original_imshape
-        return _GpuRgbBuffer(
-            self._iter_buf_ptr,
-            h,
-            w,
-            self._out_pitch,
-            self._gpu,
-            owns_memory=False,
-        )
+    def _run_stages(self, frame, *, fresh: bool) -> _GpuRgbBuffer:
+        """Run the post-decode GPU stages (color, resize, dtype) on one frame.
 
-    def _convert_frame_fresh(self, frame) -> _GpuRgbBuffer:
-        """Convert a frame into a freshly allocated buffer (for indexing)."""
+        Shared mode (``fresh=False``) writes into the pipeline's reusable
+        buffers — the result is valid until the next iteration step. Fresh
+        mode writes the final stage into a new allocation, synchronizes, and
+        returns an owning buffer.
+        """
         from cuda.bindings import driver
 
+        self._init_npp_pipeline()
+        npp = self._npp_bindings
         h, w = self.original_imshape
-        pitch = w * 3 * 2
-        with cuda_ctx_pushed(self._npp_cuda_ctx):
-            err, devptr = driver.cuMemAlloc(pitch * h)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f'Failed to allocate frame buffer: {err}')
-        devptr = int(devptr)
+        th, tw = self.imshape
+        fbits, fcode = self._final_format
+        final_pitch = tw * 3 * (fbits // 8)
+        stages = self._stage_names
+
+        if fresh:
+            with cuda_ctx_pushed(self._npp_cuda_ctx):
+                err, final_ptr = driver.cuMemAlloc(final_pitch * th)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f'Failed to allocate frame buffer: {err}')
+            final_ptr = int(final_ptr)
+        else:
+            final_ptr = self._bufs[stages[-1]]
 
         try:
-            self._do_convert(frame, devptr)
             with cuda_ctx_pushed(self._npp_cuda_ctx):
-                # The NPP kernels run async on the default stream and read the
-                # decoder-owned frame memory; sync before the caller drops its
-                # frame/decoder references.
-                (err,) = driver.cuStreamSynchronize(0)
-                if err != driver.CUresult.CUDA_SUCCESS:
-                    raise RuntimeError(f'cuStreamSynchronize failed: {err}')
-            return _GpuRgbBuffer(
-                devptr,
-                h,
-                w,
-                pitch,
-                self._gpu,
-                owns_memory=True,
-            )
+                cur: tuple[int, int] | None = None  # (ptr, pitch)
+                for i, name in enumerate(stages):
+                    dst = final_ptr if (fresh and i == len(stages) - 1) else self._bufs[name]
+                    if name == 'convert':
+                        self._do_convert(frame, dst)
+                        cur = (dst, w * 3 * 2)
+                    elif name == 'resize8':
+                        ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
+                        npp.resize_rgb(
+                            src_ptr, src_pitch, w, h, dst, tw * 3, tw, th,
+                            bits=8, ctx=self._npp_ctx,
+                        )  # fmt: skip
+                        cur = (dst, tw * 3)
+                    elif name == 'resize16':
+                        npp.resize_rgb(
+                            cur[0], cur[1], w, h, dst, tw * 3 * 2, tw, th,
+                            bits=16, ctx=self._npp_ctx,
+                        )  # fmt: skip
+                        cur = (dst, tw * 3 * 2)
+                    elif name == 'f32':
+                        npp.rgb16_to_float01(
+                            cur[0], cur[1], dst, tw * 3 * 4, tw, th, ctx=self._npp_ctx
+                        )
+                        cur = (dst, tw * 3 * 4)
+                    elif name == 'to_f32':
+                        if self._npp_mode is None:
+                            ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
+                            npp.rgb8_to_float01(
+                                src_ptr, src_pitch, dst, w * 3 * 4, w, h, ctx=self._npp_ctx
+                            )
+                        else:
+                            npp.rgb16_to_float01(
+                                cur[0], cur[1], dst, w * 3 * 4, w, h, ctx=self._npp_ctx
+                            )
+                        npp.srgb_curve_inplace(dst, w * h * 3, decode=True)
+                        cur = (dst, w * 3 * 4)
+                    elif name == 'lin_resize':
+                        npp.resize_rgb(
+                            cur[0], cur[1], w, h, dst, tw * 3 * 4, tw, th,
+                            bits=32, ctx=self._npp_ctx,
+                        )  # fmt: skip
+                        # Re-encode; the kernel clamps to [0, 1] first, which
+                        # also absorbs Lanczos over/undershoot from the resize.
+                        npp.srgb_curve_inplace(dst, tw * th * 3, decode=False)
+                        cur = (dst, tw * 3 * 4)
+                    elif name == 'to_uint':
+                        bits = self._final_format[0]
+                        pitch = tw * 3 * (bits // 8)
+                        npp.float01_to_uint(
+                            cur[0], cur[1], dst, pitch, tw, th, bits=bits, ctx=self._npp_ctx
+                        )
+                        cur = (dst, pitch)
+                    else:  # 'f16'
+                        npp.float32_to_float16(
+                            cur[0], cur[1], dst, tw * 3 * 2, tw, th, ctx=self._npp_ctx
+                        )
+                        cur = (dst, tw * 3 * 2)
+                if fresh:
+                    # The NPP kernels run async on the default stream and read
+                    # decoder-owned frame memory; sync before the caller drops
+                    # its frame/session references.
+                    (err,) = driver.cuStreamSynchronize(0)
+                    if err != driver.CUresult.CUDA_SUCCESS:
+                        raise RuntimeError(f'cuStreamSynchronize failed: {err}')
         except BaseException:
-            with cuda_ctx_pushed(self._npp_cuda_ctx):
-                driver.cuMemFree(devptr)
+            if fresh:
+                with cuda_ctx_pushed(self._npp_cuda_ctx):
+                    driver.cuMemFree(final_ptr)
             raise
+
+        return _GpuRgbBuffer(
+            final_ptr,
+            th,
+            tw,
+            final_pitch,
+            self._gpu,
+            owns_memory=fresh,
+            bits=fbits,
+            code=fcode,
+        )
+
+    def _convert_frame_shared(self, frame) -> _GpuRgbBuffer:
+        """Post-process a frame into the reusable iteration buffers."""
+        return self._run_stages(frame, fresh=False)
+
+    def _convert_frame_fresh(self, frame) -> _GpuRgbBuffer:
+        """Post-process a frame into a freshly allocated owning buffer."""
+        return self._run_stages(frame, fresh=True)
 
     def _do_convert(self, frame, dst_ptr: int) -> None:
         """Dispatch NPP conversion based on mode and source format."""
@@ -1238,6 +1512,7 @@ class _GpuRgbBuffer:
         '_shape_arr',
         '_strides_arr',
         '_bits',
+        '_code',
     )
 
     def __init__(
@@ -1250,6 +1525,7 @@ class _GpuRgbBuffer:
         *,
         owns_memory: bool,
         bits: int = 16,
+        code: int = 1,
     ) -> None:
         self._devptr = devptr
         self._height = height
@@ -1258,6 +1534,7 @@ class _GpuRgbBuffer:
         self._gpu_id = gpu_id
         self._owns_memory = owns_memory
         self._bits = bits
+        self._code = code  # DLPack type code: 1 = kDLUInt, 2 = kDLFloat
         self._own_device = None
         self._own_ctx = None
         if owns_memory:
@@ -1285,7 +1562,7 @@ class _GpuRgbBuffer:
         mt.dl_tensor.data = self._devptr
         mt.dl_tensor.device = _DLDevice(2, self._gpu_id)  # kDLCUDA
         mt.dl_tensor.ndim = 3
-        mt.dl_tensor.dtype = _DLDataType(1, self._bits, 1)  # kDLUInt
+        mt.dl_tensor.dtype = _DLDataType(self._code, self._bits, 1)
         mt.dl_tensor.shape = ctypes.cast(self._shape_arr, ctypes.POINTER(ctypes.c_int64))
         mt.dl_tensor.strides = ctypes.cast(self._strides_arr, ctypes.POINTER(ctypes.c_int64))
         mt.dl_tensor.byte_offset = 0
@@ -1322,18 +1599,68 @@ class _GpuRgbBuffer:
     def __dlpack_device__(self):
         return (2, self._gpu_id)  # kDLCUDA
 
+    def view(self) -> '_GpuRgbBuffer':
+        """A non-owning alias of this buffer (used for frame repetition).
+
+        Views must be consumed before the owner's memory is handed over or
+        freed; the repeat wrapper yields views first, the original last.
+        """
+        return _GpuRgbBuffer(
+            self._devptr,
+            self._height,
+            self._width,
+            self._pitch,
+            self._gpu_id,
+            owns_memory=False,
+            bits=self._bits,
+            code=self._code,
+        )
+
     def __del__(self):
         if self._owns_memory and self._devptr:
             _free_owned_buffer(self._devptr, self._own_device, self._own_ctx)
 
 
-class _FrameWithDecoder:
-    """DLPack-compatible wrapper that prevents the decoder from being GC'd.
+class _CtxFrame:
+    """Proxy that binds a decoder-owned frame's exports to the session context.
 
-    When ``VideoFramesCuda[i]`` returns a frame, the underlying decoder
-    must stay alive (it owns the GPU surface pool). This wrapper holds
-    references to both and produces a DLPack capsule whose deleter prevents
-    GC until the consumer is done with the data.
+    PyNvVideoCodec's exports (``__dlpack__``, ``cuda()``) require the decode
+    session's CUDA context to be current on the calling thread; consumers may
+    iterate from any thread (prefetch patterns), so the proxy pushes the
+    session's context around the export and forwards everything else to the
+    wrapped frame. Holding the session also keeps the decoder — owner of the
+    frame's GPU surface pool — alive.
+    """
+
+    __slots__ = ('_frame', '_session')
+
+    def __init__(self, frame, session):
+        self._frame = frame
+        self._session = session
+
+    def __dlpack__(self, *args, **kwargs):
+        with cuda_ctx_pushed(self._session._ctx):
+            return self._frame.__dlpack__(*args, **kwargs)
+
+    def __dlpack_device__(self):
+        return self._frame.__dlpack_device__()
+
+    def cuda(self):
+        with cuda_ctx_pushed(self._session._ctx):
+            return self._frame.cuda()
+
+    def __getattr__(self, name):
+        return getattr(self._frame, name)
+
+
+class _FrameWithDecoder:
+    """DLPack-compatible wrapper that prevents the decode session from GC.
+
+    When ``VideoFramesCuda[i]`` returns a frame, the underlying session
+    must stay alive (its decoder owns the GPU surface pool). This wrapper
+    holds references to both and produces a DLPack capsule whose deleter
+    prevents GC until the consumer is done with the data. Like ``_CtxFrame``,
+    exports run under the session's CUDA context.
     """
 
     __slots__ = ('_frame', '_decoder')
@@ -1343,11 +1670,19 @@ class _FrameWithDecoder:
         self._decoder = decoder
 
     def __dlpack__(self, *args, **kwargs):
-        capsule = self._frame.__dlpack__(*args, **kwargs)
+        with cuda_ctx_pushed(self._decoder._ctx):
+            capsule = self._frame.__dlpack__(*args, **kwargs)
         return _dlpack_prevent_gc(capsule, self._decoder, self._frame)
 
     def __dlpack_device__(self):
         return self._frame.__dlpack_device__()
+
+    def cuda(self):
+        with cuda_ctx_pushed(self._decoder._ctx):
+            return self._frame.cuda()
+
+    def __getattr__(self, name):
+        return getattr(self._frame, name)
 
 
 # ── DLPack prevent-GC wrapping ────────────────────────────────────────

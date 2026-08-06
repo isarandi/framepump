@@ -69,6 +69,57 @@ NPPI_INTER_LINEAR = 2
 NPPI_INTER_SUPER = 8
 NPPI_INTER_LANCZOS = 16
 
+# Luma coefficients (Kr, Kb) per ITU-T H.273; mirrors FFmpeg's authoritative
+# table in libavutil/csp.c. Every colorspace that is a plain matrix reduces to
+# one of these five coefficient pairs (AVCOL_SPC_BT470BG and _SMPTE170M share
+# the classic BT.601 numbers). The remaining enum entries (BT2020_CL, ICtCp,
+# SMPTE 2085, YCgCo, chroma-derived) are not expressible as a single color
+# twist and are not supported here.
+LUMA_COEFFICIENTS: dict[str, tuple[float, float]] = {
+    'bt709': (0.2126, 0.0722),
+    'bt601': (0.299, 0.114),
+    'fcc': (0.30, 0.11),
+    'smpte240m': (0.212, 0.087),
+    'bt2020': (0.2627, 0.0593),  # non-constant luminance
+}
+
+
+def make_yuv_to_rgb_twist(
+    matrix: str, *, full_range: bool = False, bits: int = 16
+) -> list[list[float]]:
+    """Build a 3x4 NPP color-twist matrix for YUV→RGB conversion.
+
+    Twist format for nppiColorTwist32f:
+      dst[i] = M[i][0]*Y + M[i][1]*Cb + M[i][2]*Cr + M[i][3]
+    on ``bits``-scaled samples (Cb/Cr centered at half scale). Limited range
+    expands studio swing (luma × 255/219 with a 16-per-8-bits offset, chroma
+    × 255/224); full range converts as-is.
+
+    Args:
+        matrix: A key of ``LUMA_COEFFICIENTS``.
+        full_range: Whether the source YUV uses full (JPEG) range.
+        bits: Sample scale of the input/output (8 or 16).
+    """
+    kr, kb = LUMA_COEFFICIENTS[matrix]
+    kg = 1.0 - kr - kb
+    coeffs = (
+        (0.0, 2.0 * (1.0 - kr)),  # R: Cb, Cr
+        (-2.0 * kb * (1.0 - kb) / kg, -2.0 * kr * (1.0 - kr) / kg),  # G
+        (2.0 * (1.0 - kb), 0.0),  # B
+    )
+    if full_range:
+        y_scale, c_scale, y_offset = 1.0, 1.0, 0.0
+    else:
+        y_scale, c_scale = 255.0 / 219.0, 255.0 / 224.0
+        y_offset = 16.0 * (1 << (bits - 8))
+    half = float((1 << bits) // 2)
+    rows = []
+    for c_cb, c_cr in coeffs:
+        b, c = c_cb * c_scale, c_cr * c_scale
+        rows.append([y_scale, b, c, -(y_scale * y_offset + b * half + c * half)])
+    return rows
+
+
 # BT.709 / BT.601 limited-range YUV→RGB color twist matrices (16-bit scale).
 #
 # Standard twist format for nppiColorTwist32f:
@@ -197,6 +248,96 @@ if _load_error is None:
         NppStreamContext,
     ]
     _nppig.nppiResize_8u_C1R_Ctx.restype = c_int
+
+    # nppiResize_8u/16u_C3R_Ctx (packed 3-channel resize, same layout as C1R)
+    for _resize_fn in (_nppig.nppiResize_8u_C3R_Ctx, _nppig.nppiResize_16u_C3R_Ctx):
+        _resize_fn.argtypes = [
+            c_void_p,
+            c_int,
+            NppiSize,
+            NppiRect,  # src ptr, src pitch, src size, src ROI
+            c_void_p,
+            c_int,
+            NppiSize,
+            NppiRect,  # dst ptr, dst pitch, dst size, dst ROI
+            c_int,  # interpolation mode
+            NppStreamContext,
+        ]
+        _resize_fn.restype = c_int
+
+    # nppiConvert_16u32f_C3R_Ctx (packed RGB uint16 → float32)
+    _nppidei.nppiConvert_16u32f_C3R_Ctx.argtypes = [
+        c_void_p,
+        c_int,
+        c_void_p,
+        c_int,
+        NppiSize,
+        NppStreamContext,
+    ]
+    _nppidei.nppiConvert_16u32f_C3R_Ctx.restype = c_int
+
+    # nppiConvert_32f16f_C3R_Ctx (packed RGB float32 → float16)
+    _nppidei.nppiConvert_32f16f_C3R_Ctx.argtypes = [
+        c_void_p,
+        c_int,
+        c_void_p,
+        c_int,
+        NppiSize,
+        c_int,  # NppRoundMode
+        NppStreamContext,
+    ]
+    _nppidei.nppiConvert_32f16f_C3R_Ctx.restype = c_int
+
+    # nppiMulC_32f_C3IR_Ctx (in-place per-channel constant multiply)
+    _nppial.nppiMulC_32f_C3IR_Ctx.argtypes = [
+        c_float * 3,  # aConstants
+        c_void_p,
+        c_int,
+        NppiSize,
+        NppStreamContext,
+    ]
+    _nppial.nppiMulC_32f_C3IR_Ctx.restype = c_int
+
+    # nppiResize_32f_C3R_Ctx (packed float32 resize, same layout as 8u)
+    _nppig.nppiResize_32f_C3R_Ctx.argtypes = [
+        c_void_p,
+        c_int,
+        NppiSize,
+        NppiRect,
+        c_void_p,
+        c_int,
+        NppiSize,
+        NppiRect,
+        c_int,
+        NppStreamContext,
+    ]
+    _nppig.nppiResize_32f_C3R_Ctx.restype = c_int
+
+    # nppiScale_8u32f_C3R_Ctx (uint8 → float32 scaled to [nMin, nMax])
+    _nppidei.nppiScale_8u32f_C3R_Ctx.argtypes = [
+        c_void_p,
+        c_int,
+        c_void_p,
+        c_int,
+        NppiSize,
+        c_float,  # nMin
+        c_float,  # nMax
+        NppStreamContext,
+    ]
+    _nppidei.nppiScale_8u32f_C3R_Ctx.restype = c_int
+
+    # nppiConvert_32f8u/16u_C3R_Ctx (float32 → integer with rounding)
+    for _fnconv in (_nppidei.nppiConvert_32f8u_C3R_Ctx, _nppidei.nppiConvert_32f16u_C3R_Ctx):
+        _fnconv.argtypes = [
+            c_void_p,
+            c_int,
+            c_void_p,
+            c_int,
+            NppiSize,
+            c_int,  # NppRoundMode
+            NppStreamContext,
+        ]
+        _fnconv.restype = c_int
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +714,138 @@ def resize_plane_8u(
     _check(status, 'Resize 8u C1R')
 
 
+NPP_RND_NEAR = 0  # NppRoundMode: round to nearest, ties to even
+
+
+def resize_rgb(
+    src_ptr: int,
+    src_pitch: int,
+    src_w: int,
+    src_h: int,
+    dst_ptr: int,
+    dst_pitch: int,
+    dst_w: int,
+    dst_h: int,
+    *,
+    bits: int = 8,
+    ctx: NppStreamContext | None = None,
+) -> None:
+    """Resize a packed 3-channel RGB image on GPU (8- or 16-bit samples).
+
+    Area averaging (SUPER) for true 2D downscaling; LANCZOS otherwise
+    (NPP rejects SUPER unless both dimensions shrink).
+    """
+    _require_npp()
+    if ctx is None:
+        ctx = _get_default_ctx()
+    fn = {
+        8: _nppig.nppiResize_8u_C3R_Ctx,
+        16: _nppig.nppiResize_16u_C3R_Ctx,
+        32: _nppig.nppiResize_32f_C3R_Ctx,
+    }[bits]
+    status = fn(
+        src_ptr,
+        src_pitch,
+        NppiSize(src_w, src_h),
+        NppiRect(0, 0, src_w, src_h),
+        dst_ptr,
+        dst_pitch,
+        NppiSize(dst_w, dst_h),
+        NppiRect(0, 0, dst_w, dst_h),
+        NPPI_INTER_SUPER if dst_w < src_w and dst_h < src_h else NPPI_INTER_LANCZOS,
+        ctx,
+    )
+    _check(status, f'Resize {bits}u C3R')
+
+
+def rgb16_to_float01(
+    src_ptr: int,
+    src_pitch: int,
+    dst_ptr: int,
+    dst_pitch: int,
+    w: int,
+    h: int,
+    ctx: NppStreamContext | None = None,
+) -> None:
+    """Convert packed RGB uint16 to float32 scaled to [0, 1]."""
+    _require_npp()
+    if ctx is None:
+        ctx = _get_default_ctx()
+    size = NppiSize(w, h)
+    status = _nppidei.nppiConvert_16u32f_C3R_Ctx(src_ptr, src_pitch, dst_ptr, dst_pitch, size, ctx)
+    _check(status, 'Convert 16u32f C3R')
+    inv = 1.0 / 65535.0
+    status = _nppial.nppiMulC_32f_C3IR_Ctx((c_float * 3)(inv, inv, inv), dst_ptr, dst_pitch, size, ctx)
+    _check(status, 'MulC 32f C3IR')
+
+
+def rgb8_to_float01(
+    src_ptr: int,
+    src_pitch: int,
+    dst_ptr: int,
+    dst_pitch: int,
+    w: int,
+    h: int,
+    ctx: NppStreamContext | None = None,
+) -> None:
+    """Convert packed RGB uint8 to float32 scaled to [0, 1]."""
+    _require_npp()
+    if ctx is None:
+        ctx = _get_default_ctx()
+    status = _nppidei.nppiScale_8u32f_C3R_Ctx(
+        src_ptr, src_pitch, dst_ptr, dst_pitch, NppiSize(w, h), 0.0, 1.0, ctx
+    )
+    _check(status, 'Scale 8u32f C3R')
+
+
+def float01_to_uint(
+    src_ptr: int,
+    src_pitch: int,
+    dst_ptr: int,
+    dst_pitch: int,
+    w: int,
+    h: int,
+    *,
+    bits: int,
+    ctx: NppStreamContext | None = None,
+) -> None:
+    """Convert packed RGB float32 in [0, 1] to uint8/uint16 (rounding).
+
+    Scales the source buffer in place (it is a scratch buffer by contract).
+    """
+    _require_npp()
+    if ctx is None:
+        ctx = _get_default_ctx()
+    size = NppiSize(w, h)
+    maxval = float((1 << bits) - 1)
+    status = _nppial.nppiMulC_32f_C3IR_Ctx(
+        (c_float * 3)(maxval, maxval, maxval), src_ptr, src_pitch, size, ctx
+    )
+    _check(status, 'MulC 32f C3IR')
+    fn = _nppidei.nppiConvert_32f8u_C3R_Ctx if bits == 8 else _nppidei.nppiConvert_32f16u_C3R_Ctx
+    status = fn(src_ptr, src_pitch, dst_ptr, dst_pitch, size, NPP_RND_NEAR, ctx)
+    _check(status, f'Convert 32f{bits}u C3R')
+
+
+def float32_to_float16(
+    src_ptr: int,
+    src_pitch: int,
+    dst_ptr: int,
+    dst_pitch: int,
+    w: int,
+    h: int,
+    ctx: NppStreamContext | None = None,
+) -> None:
+    """Convert packed RGB float32 to float16 (round to nearest)."""
+    _require_npp()
+    if ctx is None:
+        ctx = _get_default_ctx()
+    status = _nppidei.nppiConvert_32f16f_C3R_Ctx(
+        src_ptr, src_pitch, dst_ptr, dst_pitch, NppiSize(w, h), NPP_RND_NEAR, ctx
+    )
+    _check(status, 'Convert 32f16f C3R')
+
+
 _INTERLEAVE_UV_PTX = b"""\
 .version 7.0
 .target sm_52
@@ -679,6 +952,123 @@ def interleave_uv(
     )
     if err != driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f'interleave_uv kernel launch failed: {err}')
+
+
+# Exact IEC 61966-2-1 sRGB transfer curves (piecewise: linear toe + power
+# segment), applied in place on flat float32 data. NPP has no per-channel
+# piecewise primitive, so these are small CUDA kernels; pow is computed as
+# ex2(e * lg2(x)) (PTX approx intrinsics, ~1e-6 relative error — far below
+# any output quantization). linear_to_srgb clamps its input to [0, 1] first,
+# absorbing Lanczos over/undershoot from resizing in linear light.
+_SRGB_PTX = b"""\
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry srgb_to_linear(
+ .param .u64 p0, .param .u32 p1)
+{
+ .reg .pred %p<2>; .reg .b32 %r<6>; .reg .b64 %rd<5>; .reg .f32 %f<8>;
+ ld.param.u64 %rd1, [p0];
+ ld.param.u32 %r1, [p1];
+ mov.u32 %r2, %ntid.x; mov.u32 %r3, %ctaid.x; mov.u32 %r4, %tid.x;
+ mad.lo.s32 %r5, %r3, %r2, %r4;
+ setp.ge.s32 %p1, %r5, %r1;
+ @%p1 bra DONE1;
+ cvta.to.global.u64 %rd2, %rd1;
+ mul.wide.s32 %rd3, %r5, 4;
+ add.s64 %rd4, %rd2, %rd3;
+ ld.global.f32 %f1, [%rd4];
+ mul.f32 %f2, %f1, 0f3D9E8391;
+ add.f32 %f3, %f1, 0f3D6147AE;
+ mul.f32 %f4, %f3, 0f3F72A76E;
+ lg2.approx.f32 %f5, %f4;
+ mul.f32 %f5, %f5, 0f4019999A;
+ ex2.approx.f32 %f6, %f5;
+ setp.le.f32 %p1, %f1, 0f3D25AEE6;
+ selp.f32 %f7, %f2, %f6, %p1;
+ st.global.f32 [%rd4], %f7;
+DONE1:
+ ret;
+}
+
+.visible .entry linear_to_srgb(
+ .param .u64 p0, .param .u32 p1)
+{
+ .reg .pred %p<2>; .reg .b32 %r<6>; .reg .b64 %rd<5>; .reg .f32 %f<8>;
+ ld.param.u64 %rd1, [p0];
+ ld.param.u32 %r1, [p1];
+ mov.u32 %r2, %ntid.x; mov.u32 %r3, %ctaid.x; mov.u32 %r4, %tid.x;
+ mad.lo.s32 %r5, %r3, %r2, %r4;
+ setp.ge.s32 %p1, %r5, %r1;
+ @%p1 bra DONE2;
+ cvta.to.global.u64 %rd2, %rd1;
+ mul.wide.s32 %rd3, %r5, 4;
+ add.s64 %rd4, %rd2, %rd3;
+ ld.global.f32 %f1, [%rd4];
+ max.f32 %f1, %f1, 0f00000000;
+ min.f32 %f1, %f1, 0f3F800000;
+ mul.f32 %f2, %f1, 0f414EB852;
+ lg2.approx.f32 %f3, %f1;
+ mul.f32 %f3, %f3, 0f3ED55555;
+ ex2.approx.f32 %f4, %f3;
+ mul.f32 %f5, %f4, 0f3F870A3D;
+ sub.f32 %f6, %f5, 0f3D6147AE;
+ setp.le.f32 %p1, %f1, 0f3B4D2E1C;
+ selp.f32 %f7, %f2, %f6, %p1;
+ st.global.f32 [%rd4], %f7;
+DONE2:
+ ret;
+}
+"""
+
+_srgb_funcs: dict[tuple[int, bytes], object] = {}
+
+
+def _get_srgb_func(name: bytes):
+    from cuda.bindings import driver
+
+    err, ctx = driver.cuCtxGetCurrent()
+    if err != driver.CUresult.CUDA_SUCCESS or ctx is None or int(ctx) == 0:
+        raise RuntimeError('srgb_curve_inplace requires a current CUDA context')
+    if hasattr(driver, 'cuCtxGetId'):
+        err, ctx_id = driver.cuCtxGetId(ctx)
+        ctx_key = int(ctx_id) if err == driver.CUresult.CUDA_SUCCESS else int(ctx)
+    else:
+        ctx_key = int(ctx)
+    key = (ctx_key, name)
+    func = _srgb_funcs.get(key)
+    if func is None:
+        err, mod = driver.cuModuleLoadData(_SRGB_PTX)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'Failed to load sRGB PTX: {err}')
+        err, func = driver.cuModuleGetFunction(mod, name)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'Failed to get sRGB kernel {name!r}: {err}')
+        _srgb_funcs[key] = func
+    return func
+
+
+def srgb_curve_inplace(ptr: int, n_floats: int, *, decode: bool, stream: int = 0) -> None:
+    """Apply the exact sRGB transfer in place on flat float32 data.
+
+    ``decode=True``: encoded sRGB → linear light. ``decode=False``: linear
+    light (clamped to [0, 1]) → encoded sRGB.
+    """
+    import ctypes as _ct
+
+    from cuda.bindings import driver
+
+    func = _get_srgb_func(b'srgb_to_linear' if decode else b'linear_to_srgb')
+    block = 256
+    grid = (n_floats + block - 1) // block
+    args = (_ct.c_uint64(ptr), _ct.c_int32(n_floats))
+    arg_ptrs = (_ct.c_void_p * len(args))(
+        *[_ct.cast(_ct.pointer(a), _ct.c_void_p) for a in args]
+    )
+    (err,) = driver.cuLaunchKernel(func, grid, 1, 1, block, 1, 1, 0, stream, arg_ptrs, 0)
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f'sRGB curve kernel launch failed: {err}')
 
 
 # ---------------------------------------------------------------------------

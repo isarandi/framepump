@@ -162,22 +162,51 @@ encoder. Pixel data never leaves the GPU.
 ``GLVideoWriter`` runs synchronously (no background thread) because the
 OpenGL context must be current on the calling thread.
 
-**Two encoding paths (auto-selected):**
+**Two encoding paths**, selectable via the ``backend`` parameter:
 
-- **GLX path** (X11 display available): GL texture → NVENC directly.
-  Selected when the ``DISPLAY`` environment variable is set.
+- **GLX path** (``backend='glx'``): GL texture → NVENC directly. Requires an
+  X11-backed (GLX) OpenGL context on the NVIDIA GPU.
 
-- **CUDA path** (headless/EGL): GL texture → CUarray via CUDA-GL interop →
-  NVENC. Selected when ``DISPLAY`` is not set. Requires
+- **CUDA path** (``backend='cuda'``): GL texture → CUarray via CUDA-GL
+  interop → NVENC. Works with EGL contexts and headless setups. Requires
   ``pip install framepump[nvenc-cuda]``.
+
+The default ``backend='auto'`` picks the CUDA path when the ``DISPLAY``
+environment variable is unset and the GLX path otherwise. That heuristic can
+guess wrong — most commonly for a standalone EGL context created while
+``DISPLAY`` is still set — so pass ``backend='cuda'`` explicitly when you
+know your context is EGL:
+
+.. code-block:: python
+
+    with GLVideoWriter('output.mp4', fps=30, backend='cuda') as writer:
+        ...
 
 **Pipeline:**
 
 ::
 
-    GL texture → [CUDA-GL interop if headless] → NVENC (GPU) → H.264 NALs → PyAV muxer → MP4
+    GL texture → [CUDA-GL interop if CUDA path] → NVENC (GPU) → H.264 NALs → PyAV muxer → MP4
 
 See :doc:`/explanation/nvenc-zero-copy` for a detailed explanation.
+
+Hybrid AMD+NVIDIA machines
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On machines where an AMD or Intel GPU drives the display and the NVIDIA card
+is a compute device (common laptop and SFF-workstation setup), GLX contexts
+land on the display GPU by default, and ``GLVideoWriter`` fails with
+*"Current OpenGL context is on a non-NVIDIA GPU"*. Two remedies:
+
+- **Windowed (GLX):** route OpenGL to the NVIDIA GPU via PRIME render
+  offload before creating the GL context::
+
+      export __NV_PRIME_RENDER_OFFLOAD=1
+      export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+- **Headless (EGL):** create an EGL context on the NVIDIA device and use
+  ``backend='cuda'`` (or unset ``DISPLAY`` and rely on ``backend='auto'``).
+  For batch/offline rendering this is the recommended setup.
 
 
 VideoWriter with GPU Encoding

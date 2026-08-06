@@ -65,13 +65,16 @@ class GLVideoWriter(
         audio_source_path: PathLike | None = None,
         queue_size: int = 32,
         encoder_config: EncoderConfig | None = None,
+        backend: str = 'auto',
     ) -> None:
         # queue_size is unused; present for API compatibility with VideoWriter
         del queue_size
+        _validate_backend(backend)
         self._writer: GLSequenceWriter | None = None
         self._accepts_new_frames: bool = False
         self._default_fps = fps
         self._default_encoder_config = encoder_config
+        self._default_backend = backend
 
         if video_path is not None:
             if fps is None:
@@ -93,6 +96,7 @@ class GLVideoWriter(
         gpu: bool | int = True,
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
+        backend: str | None = None,
     ) -> SequenceContext:
         """Start a new video sequence.
 
@@ -109,6 +113,10 @@ class GLVideoWriter(
                 determined by the GL context). Always truthy for GL writer.
             encoder_config: Encoder configuration (crf, gop, bframes).
             format: Container format (e.g., 'mp4'). Required for file-like objects.
+            backend: ``'glx'`` (direct GL-texture NVENC, needs an X11-backed
+                context), ``'cuda'`` (GL→CUDA interop NVENC, works with EGL and
+                headless), or ``'auto'`` (CUDA when ``DISPLAY`` is unset, GLX
+                otherwise). ``None`` uses the value from the constructor.
         """
         if self._writer is not None:
             self._writer.close()
@@ -121,6 +129,9 @@ class GLVideoWriter(
         if encoder_config is None:
             encoder_config = self._default_encoder_config
 
+        if backend is None:
+            backend = self._default_backend
+
         if isinstance(video_output, (str, Path)):
             spu.ensure_parent_dir_exists(video_output)
         self._writer = GLSequenceWriter(
@@ -130,6 +141,7 @@ class GLVideoWriter(
             encoder_config=encoder_config,
             format=format,
             gpu=gpu,
+            backend=backend,
         )
         self._accepts_new_frames = True
         return SequenceContext(self)
@@ -207,7 +219,9 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
         gpu: bool | int = True,
+        backend: str = 'auto',
     ) -> None:
+        _validate_backend(backend)
         self._fps_frac = (
             fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(100000)
         )
@@ -216,6 +230,7 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
         self._gpu = gpu
         self._video_output = video_output
         self._format = format
+        self._backend = backend
 
         if not isinstance(video_output, (str, Path)) and format is None:
             raise ValueError('format is required when writing to a file-like object')
@@ -268,10 +283,11 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
             gop=self._encoder_config.gop,
             bframes=self._encoder_config.bframes,
         )
-        if _is_headless():
+        use_cuda = self._backend == 'cuda' or (self._backend == 'auto' and _is_headless())
+        if use_cuda:
             if NvencCudaEncoder is None:
                 raise ImportError(
-                    'Headless mode requires NvencCudaEncoder. '
+                    'The CUDA encode backend requires NvencCudaEncoder. '
                     'Install cuda-python: pip install cuda-python'
                 )
             # type() rather than isinstance(): True must not count as ordinal 1
@@ -344,6 +360,20 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
             self.close()
         else:
             self._abort()
+
+
+def _validate_backend(backend: str) -> None:
+    if backend not in ('auto', 'glx', 'cuda'):
+        raise ValueError(f"backend must be 'auto', 'glx', or 'cuda', got {backend!r}")
+    if backend == 'cuda' and NvencCudaEncoder is None:
+        raise ImportError(
+            "backend='cuda' requires NvencCudaEncoder. Install cuda-python: pip install cuda-python"
+        )
+    if backend == 'glx' and NvencEncoder is None:
+        raise ImportError(
+            "backend='glx' requires NVENC. Ensure you have an NVIDIA GPU "
+            'with NVENC support and the NVIDIA driver installed.'
+        )
 
 
 def _is_headless() -> bool:

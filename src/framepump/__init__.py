@@ -60,7 +60,7 @@ except ImportError:
     )
 
 try:
-    from ._cuda_frames import VideoFramesCuda
+    from ._cuda.frames import VideoFramesCuda
 except ImportError:
     VideoFramesCuda = _make_cuda_stub('VideoFramesCuda', 'cuda-python and PyNvVideoCodec')
 

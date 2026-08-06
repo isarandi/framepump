@@ -111,6 +111,7 @@ class _LazyIndexState:
     __slots__ = (
         'lock',
         'index',
+        'index_ready',
         'cfr_source_map',
         'seek_disabled',
         'pts_unreliable',
@@ -120,8 +121,14 @@ class _LazyIndexState:
     )
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        # RLock: the build publishes a preliminary index and then verifies it
+        # (possibly rebuilding); the verification helpers re-enter the lock on
+        # the building thread. Other threads gate on index_ready, which is set
+        # only after verification, so they can never observe the preliminary
+        # index that a rebuild is about to replace.
+        self.lock = threading.RLock()
         self.index: FrameIndexPyAV | None = None
+        self.index_ready = False
         self.cfr_source_map: list[int] | None = None
         # True when the seek-reliability probe failed: access is sequential-only
         self.seek_disabled = False
@@ -379,13 +386,13 @@ class VideoFrames:
 
     @property
     def _index(self) -> FrameIndexPyAV:
-        if self._lazy.index is None:
+        if not self._lazy.index_ready:
             self._materialize_index()
         return self._lazy.index
 
     @property
     def _cfr_source_map(self) -> list[int] | None:
-        if self.constant_framerate and self._lazy.index is None:
+        if self.constant_framerate and not self._lazy.index_ready:
             self._materialize_index()
         return self._lazy.cfr_source_map
 
@@ -449,6 +456,10 @@ class VideoFrames:
             # derives from this single output-index -> source-index map.
             if self.constant_framerate:
                 self._lazy.cfr_source_map = self._build_cfr_source_map()
+
+            # Publish only now: the index above may have been replaced by the
+            # verification rebuilds, and readers must never see the interim.
+            self._lazy.index_ready = True
 
     def _degrade_to_sequential(self) -> None:
         """Seeking or PTS-based frame location proved unsound for this video.

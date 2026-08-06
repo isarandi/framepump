@@ -9,13 +9,22 @@ import av
 from av.bitstream import BitStreamFilterContext
 import PyNvVideoCodec as nvc
 
+from .._core import _SEEK_UNRELIABLE_CODECS
 from .._pyav import (
     FrameIndexPyAV,
     PyAVReader,
     VideoDecodeError,
     _discard_other_streams,
+    resolve_source_view,
 )
+
+
 from .compat import cuda_ctx_pushed, retain_primary_context
+
+
+def _display_name(source) -> str:
+    return source if isinstance(source, str) else '<file-like>'
+
 
 # decoder support.
 _NVDEC_CODECS = {
@@ -110,7 +119,11 @@ class _CudaFrameIndex:
     PTS are kept for the CFR source map.
     """
 
-    def __init__(self, video_path: str) -> None:
+    def __init__(self, video_path: str, codec_name: str | None = None) -> None:
+        if codec_name is not None and codec_name in _SEEK_UNRELIABLE_CODECS:
+            self._init_content_verified(video_path)
+            return
+
         reader = PyAVReader(video_path)
         try:
             time_base = reader.time_base
@@ -126,13 +139,53 @@ class _CudaFrameIndex:
             # Timestampless streams (raw bitstreams): the synthesized PTS
             # never match decoder output, so PTS-based frame location would
             # silently return wrong frames.
-            name = video_path if isinstance(video_path, str) else '<file-like>'
-            raise RuntimeError(f'No valid packets found in {name}')
+            raise RuntimeError(f'No valid packets found in {_display_name(video_path)}')
 
-        self.frame_pts_frac: list[Fraction] = base.frame_pts
-        self.frame_pts: list[int] = [int(p / time_base) for p in base.frame_pts]
-        self.safe_seek_pts: list[int] = [int(p / time_base) for p in base.safe_seek_pts]
-        self.frame_count: int = base.frame_count
+        self._adopt(base.frame_pts, base.safe_seek_pts, time_base)
+
+    def _init_content_verified(self, video_path) -> None:
+        """Build through the CPU class for codecs whose containers lie.
+
+        For _SEEK_UNRELIABLE_CODECS (screen codecs with false keyframe flags,
+        open-GOP MPEG), the raw packet index can both miscount frames and
+        carry PTS the decoder never emits — indexed access then silently
+        returns wrong frames. The CPU class decode-verifies seeking and
+        rebuilds its index from decoder output when packets mislead; adopt
+        that verified index and its verdict. Costs one CPU decode pass,
+        which only these codecs pay.
+        """
+        from .._core import VideoFrames
+
+        reader = PyAVReader(resolve_source_view(video_path))
+        try:
+            time_base = reader.time_base
+        finally:
+            reader.close()
+
+        vf = VideoFrames(video_path)
+        try:
+            base = vf._index  # builds, content-verifies, rebuilds if lying
+            seek_disabled = vf._lazy.seek_disabled
+            pts_unreliable = vf._lazy.pts_unreliable
+            container_seekable = bool(vf._lazy.seekable_probed)
+        finally:
+            vf.close()
+
+        if pts_unreliable or any(p is None for p in base.frame_pts):
+            raise RuntimeError(
+                f'Decoded timestamps of {_display_name(video_path)} are unreliable; '
+                f'PTS-based GPU frame location would return wrong frames. '
+                f'Use the CPU VideoFrames class for this file.'
+            )
+
+        self.seekable = container_seekable and not seek_disabled
+        self._adopt(base.frame_pts, base.safe_seek_pts, time_base)
+
+    def _adopt(self, frame_pts, safe_seek_pts, time_base) -> None:
+        self.frame_pts_frac: list[Fraction] = frame_pts
+        self.frame_pts: list[int] = [int(p / time_base) for p in frame_pts]
+        self.safe_seek_pts: list[int] = [int(p / time_base) for p in safe_seek_pts]
+        self.frame_count: int = len(frame_pts)
 
 
 # ── Decode session ───────────────────────────────────────────────────

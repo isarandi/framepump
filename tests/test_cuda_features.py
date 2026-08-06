@@ -361,3 +361,20 @@ class TestFloatDtypes:
         frame = _np(_cuda_frames(smooth_video, dtype=np.float32).resized((60, 80))[0])
         assert frame.shape == (60, 80, 3) and frame.dtype == np.float32
         assert 0.0 <= frame.min() and frame.max() <= 1.0
+
+
+class TestSuspectCodecVerification:
+    """Codecs whose containers lie about keyframes go through the CPU class's
+    content-verified index, so count and frame identity match ground truth."""
+
+    TS = str(Path(__file__).parent / 'data' / 'unreliable_seek.ts')
+
+    def test_count_and_indexing_match_sequential_truth(self):
+        torch = _require_cuda()
+        cpu = VideoFrames(self.TS)
+        v = _cuda_frames(self.TS)
+        assert len(v) == len(cpu)
+        seq = [torch.from_dlpack(f).clone() for f in v]
+        assert len(seq) == len(v)
+        for k in (0, 5, 9, len(v) - 1):
+            assert torch.equal(torch.from_dlpack(v[k]), seq[k]), f'frame {k}'

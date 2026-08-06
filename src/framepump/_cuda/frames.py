@@ -576,7 +576,9 @@ class VideoFramesCuda:
         if self._lazy.index is None:
             with self._lazy.lock:
                 if self._lazy.index is None:
-                    self._lazy.index = _CudaFrameIndex(resolve_source_view(self.path))
+                    self._lazy.index = _CudaFrameIndex(
+                        resolve_source_view(self.path), codec_name=self._codec_name
+                    )
         return self._lazy.index
 
     def _resolved_range(self) -> range:

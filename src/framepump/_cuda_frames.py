@@ -62,7 +62,7 @@ from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
 from ._core import build_cfr_source_map
-from ._cuda_compat import cuda_ctx_pushed, retain_primary_context
+from ._cuda.compat import cuda_ctx_pushed, retain_primary_context
 from ._pyav import (
     FrameIndexPyAV,
     PyAVReader,

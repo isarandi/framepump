@@ -10,7 +10,7 @@ from typing import Union
 import numpy as np
 from cuda.bindings import driver
 
-from .._cuda_compat import cuda_ctx_pushed, retain_primary_context
+from .._cuda.compat import cuda_ctx_pushed, retain_primary_context
 from .bindings import (
     _lib,
     nvjpegHandle_t,

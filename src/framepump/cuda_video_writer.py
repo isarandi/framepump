@@ -17,7 +17,7 @@ from typing import Any, Union
 import simplepyutils as spu
 from cuda.bindings import driver
 
-from ._cuda_compat import cuda_ctx_pushed, retain_primary_context
+from ._cuda.compat import cuda_ctx_pushed, retain_primary_context
 from ._h264_mux import H264PassthroughMuxer
 from .encoder_config import EncoderConfig
 from .nvenc._session import NvencEncodeSession

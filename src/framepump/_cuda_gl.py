@@ -19,7 +19,7 @@ import warnings
 
 from cuda.bindings import driver  # type: ignore[attr-defined]
 
-from ._cuda_compat import cuda_ctx_pushed
+from ._cuda.compat import cuda_ctx_pushed
 
 # OpenGL constants
 GL_TEXTURE_2D = 0x0DE1

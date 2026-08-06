@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 from cuda.bindings import driver  # type: ignore[attr-defined]
 
-from .._cuda_compat import cuda_ctx_pushed
+from .._cuda.compat import cuda_ctx_pushed
 from ._session import EncodedPacket, NvencEncodeSession
 from .bindings import (
     NV_ENC_BUFFER_FORMAT_ABGR,

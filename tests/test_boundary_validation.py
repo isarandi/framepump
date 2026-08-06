@@ -185,7 +185,7 @@ class TestNppBindings:
         driver = _init_gpu_or_skip()
 
         from framepump import npp_bindings
-        from framepump._cuda_compat import cuCtxCreate
+        from framepump._cuda.compat import cuCtxCreate
 
         err, dev = driver.cuDeviceGet(0)
         assert err == driver.CUresult.CUDA_SUCCESS
@@ -206,14 +206,14 @@ class TestNppBindings:
 # ---------------------------------------------------------------------------
 class TestCuCtxCreateCompat:
     def test_signature_detected_at_import(self):
-        _cuda_compat = pytest.importorskip('framepump._cuda_compat')
+        _cuda_compat = pytest.importorskip('framepump._cuda.compat')
 
         assert isinstance(_cuda_compat._CTX_CREATE_TAKES_PARAMS, bool)
 
     def test_create_and_destroy(self):
         driver = _init_gpu_or_skip()
 
-        from framepump._cuda_compat import cuCtxCreate
+        from framepump._cuda.compat import cuCtxCreate
 
         err, dev = driver.cuDeviceGet(0)
         assert err == driver.CUresult.CUDA_SUCCESS
@@ -226,7 +226,7 @@ class TestCuCtxCreateCompat:
         """A genuine bad-argument error must come from a single attempt,
         not be re-raised from a fallback with the first error chained on."""
         _init_gpu_or_skip()
-        from framepump._cuda_compat import cuCtxCreate
+        from framepump._cuda.compat import cuCtxCreate
 
         with pytest.raises(TypeError) as excinfo:
             cuCtxCreate(0, object())

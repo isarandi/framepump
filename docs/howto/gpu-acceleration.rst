@@ -93,7 +93,26 @@ exported via DLPack for zero-copy access from PyTorch, CuPy, etc.
     for decoded_frame in frames:
         # decoded_frame supports __dlpack__() for zero-copy export
         tensor = torch.from_dlpack(decoded_frame)  # no copy, shares GPU memory
-        # tensor is (H, W, 3) uint8 on CUDA
+        # tensor is (H, W, 3) uint8 on CUDA — valid until the next iteration step!
+
+.. warning::
+
+    Iteration yields **zero-copy views of reusable GPU memory**: a frame (or
+    a tensor made from it) is only valid until the next iteration step, after
+    which the underlying buffer is reused and its contents silently change.
+    Process each frame within its step, or ``.clone()`` the tensor before
+    keeping it:
+
+    .. code-block:: python
+
+        kept = [torch.from_dlpack(f).clone() for f in frames]   # safe
+        kept = [torch.from_dlpack(f) for f in frames]           # WRONG: all
+                                                                # end up with
+                                                                # recycled data
+
+    To collect many frames, prefer the batch gather below — it produces one
+    independently owned buffer with no cloning needed. Single indexed frames
+    (``frames[42]``) are also independently owned and safe to keep.
 
 ``VideoFramesCuda`` supports slicing, indexing, and batch gathering:
 

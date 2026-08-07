@@ -44,7 +44,8 @@ print(f"Number of frames in subset: {len(subset_frames)}")
 resized_frames = frames.resized((128, 128))
 print(f"Resized shape: {resized_frames.imshape}")
 
-# Change the data type (e.g., to float32 for neural network processing)
+# Change the data type (e.g., to float32 for neural network processing).
+# Float dtypes yield values scaled to [0, 1].
 float_frames = VideoFrames('my_video.mp4', dtype=np.float32)
 
 # Use NVDEC GPU acceleration for decoding (requires an NVIDIA GPU).
@@ -53,11 +54,22 @@ float_frames = VideoFrames('my_video.mp4', dtype=np.float32)
 # silently falling back to CPU.
 frames = VideoFrames('my_video.mp4', gpu=True)
 
-# For fully GPU-resident frames (no GPU→CPU transfer), use VideoFramesCuda instead.
-# This returns DecodedFrame objects that stay in GPU memory — useful when feeding
-# directly into GPU pipelines (e.g. NVENC encoding, CUDA processing).
-# from framepump import VideoFramesCuda
-# cuda_frames = VideoFramesCuda('my_video.mp4')
+```
+
+For fully GPU-resident frames (no GPU→CPU transfer), use `VideoFramesCuda`:
+frames stay in GPU memory and export zero-copy to PyTorch/CuPy via DLPack.
+
+```python
+import torch
+from framepump import VideoFramesCuda
+
+cuda_frames = VideoFramesCuda('my_video.mp4')
+for f in cuda_frames.resized((224, 224)):
+    tensor = torch.from_dlpack(f)  # (224, 224, 3) uint8 CUDA tensor, zero-copy
+    ...  # use within this step, or .clone() to keep
+
+# Gather specific frames as ONE stacked batch tensor, straight from NVDEC:
+batch = torch.from_dlpack(cuda_frames[[10, 50, 300]])  # (3, H, W, 3) on CUDA
 ```
 
 ### Writing Videos

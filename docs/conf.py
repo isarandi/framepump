@@ -138,7 +138,9 @@ python_display_short_literal_types = True
 _visible_modules = {
     main_module_name,
     f'{main_module_name}.cuda_video_writer',
-    f'{main_module_name}._cuda_frames',
+    f'{main_module_name}._cuda',
+    f'{main_module_name}._cuda.frames',
+    f'{main_module_name}._cuda.camera',
     f'{main_module_name}._cuda_gl',
 }
 

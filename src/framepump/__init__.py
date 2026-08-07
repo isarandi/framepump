@@ -60,8 +60,10 @@ except ImportError:
     )
 
 try:
+    from ._cuda.camera import CameraFrames
     from ._cuda.frames import VideoFramesCuda
 except ImportError:
+    CameraFrames = _make_cuda_stub('CameraFrames', 'cuda-python and PyNvVideoCodec')
     VideoFramesCuda = _make_cuda_stub('VideoFramesCuda', 'cuda-python and PyNvVideoCodec')
 
 try:
@@ -89,6 +91,7 @@ __all__ = [
     'DepthVideoWriter',
     'GLVideoWriter',
     'NvJpegVideoWriter',
+    'CameraFrames',
     'VideoFramesCuda',
     'CudaToGLUploader',
     'EncoderConfig',

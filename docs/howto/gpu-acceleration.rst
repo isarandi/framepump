@@ -138,6 +138,56 @@ counts. Don't mix the two classes when exact reproducibility matters.
     Video file → PyAV demuxer → NVDEC (GPU) → [NPP color conversion] → GPU buffer (DLPack)
 
 
+CameraFrames — live cameras
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+USB cameras deliver MJPEG at their real resolutions; ``CameraFrames``
+decodes that stream on the GPU (NVDEC's JPEG engine) and always hands you
+the **latest** captured frame — a consumer slower than the camera skips
+stale frames instead of processing a growing backlog, keeping latency at
+one frame interval (a naive queueing loop reaches seconds of staleness
+within moments):
+
+.. code-block:: python
+
+    from framepump import CameraFrames
+
+    with CameraFrames('/dev/video0', shape=(720, 1280), fps=30) as cam:
+        for frame in cam:
+            tensor = torch.from_dlpack(frame)  # (H, W, 3) uint8 CUDA, zero-copy
+            ...  # valid until the next iteration step; .clone() to keep
+            if done:
+                break
+
+Live semantics: iteration only (no ``len()``, seeking or slicing);
+``cam.last_capture_time`` carries the kernel capture timestamp of the
+delivered frame (monotonic clock) so staleness is always measurable.
+Linux/V4L2, MJPEG cameras (essentially all UVC devices).
+
+For a model that only reaches real-time throughput when batching,
+``cam.batched(n)`` yields adaptive batches instead of single frames: each
+step delivers up to ``n`` frames as one stacked ``(k, H, W, 3)`` GPU
+buffer, chosen by dividing the time since the previous delivery into
+``n`` equal steps and taking the nearest retained frame to each — so a
+slow consumer receives frames spread evenly across the whole interval it
+missed (always ending with the newest), never a burst of near-identical
+latest frames, and never the same frame twice. Selections landing on the
+same frame collapse, so a consumer that keeps up simply gets ``k = 1``.
+The camera retains up to ``history`` undelivered frames (default two
+seconds' worth) to make this possible; ``cam.last_capture_times`` holds
+the k capture timestamps:
+
+.. code-block:: python
+
+    with CameraFrames('/dev/video0', shape=(720, 1280), fps=30) as cam:
+        for batch in cam.batched(4):
+            tensors = torch.from_dlpack(batch)  # (k, H, W, 3), 1 <= k <= 4
+            ...
+
+Mind that shape-specializing runtimes (TorchScript JIT, cudnn benchmark
+mode) recompile for each distinct batch size — warm up every size from 1
+to ``n`` before going live, or the first occurrence of each size stalls.
+
 CudaToGLUploader
 ~~~~~~~~~~~~~~~~
 

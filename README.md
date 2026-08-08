@@ -6,13 +6,25 @@
 [![Documentation](https://readthedocs.org/projects/framepump/badge/?version=latest)](https://framepump.readthedocs.io/)
 [![License](https://img.shields.io/pypi/l/framepump.svg)](https://github.com/isarandi/framepump/blob/main/LICENSE)
 
-A Python library for high-performance video processing, built on [PyAV](https://pyav.org) (Python bindings for FFmpeg's libraries). It provides a simple and efficient way to read, write, and manipulate video files.
+A Python library for high-performance video processing, built on [PyAV](https://pyav.org) (in-process FFmpeg libraries, no subprocesses). It provides lazy, sliceable, frame-accurate video reading and threaded writing — with NVIDIA GPUs as first-class citizens: video files and even live webcams can be decoded on the GPU with the frames *staying* in GPU memory, handed to PyTorch/CuPy as zero-copy DLPack tensors, and encoded back to video straight from GPU memory (OpenGL textures or JPEG streams) with NVENC.
+
+**Highlights:**
+
+- **Lazy, sliceable reading** — `frames[::2][:100]` chains without decoding anything; exact frame counts and frame-accurate indexing even for variable-framerate files
+- **GPU decoding** — `VideoFrames(gpu=True)` decodes on NVDEC with bit-identical output; `VideoFramesCuda` keeps frames in GPU memory, exported zero-copy via DLPack, including whole batches gathered straight from the decoder
+- **Live cameras on the GPU** — `CameraFrames` decodes webcam MJPEG via NVDEC and always hands you the latest frame; `list_cameras()` discovers devices and their modes
+- **GPU encoding** — `GLVideoWriter` (OpenGL texture → NVENC, zero copy) and `NvJpegVideoWriter` (JPEG bytes → nvJPEG → NVENC, fully GPU-resident)
+- **Flexible sources** — local files, HTTP(S)/RTSP URLs, and file-like objects (BytesIO, archive members)
+- **Colors done right** — exact YUV↔RGB matrices for all matrix-expressible colorspaces, limited/full range from stream flags, 10-bit support, gamma-correct resizing in linear light
+- **Threaded writing** — non-blocking `VideoWriter` with audio carry-over (`like=` copies fps and audio from a reference), 10-bit encoding, lossless 16-bit depth video
 
 ## Installation
 
 ```bash
 pip install framepump
 ```
+
+If a GPU feature misbehaves, `framepump.diagnose()` prints an environment report (driver, FFmpeg build, per-feature availability with reasons) to attach to bug reports.
 
 ## Usage
 
@@ -25,13 +37,25 @@ from framepump import VideoFrames
 import numpy as np
 
 frames = VideoFrames('my_video.mp4')  # This is lazy, it only reads some metadata.
+# URLs and file-like objects work too: VideoFrames('https://example.com/clip.mp4')
 
 # Get basic information
 print(f"Shape: {frames.imshape}")
 print(f"FPS: {frames.fps}")
 print(f"Number of frames: {len(frames)}")
-print(frames.info)  # full overview: codec, pixel format, bit depth, colorspace, audio
+```
 
+`frames.info` gives the full overview in one readable object:
+
+```pycon
+>>> print(frames.info)
+my_video.mp4
+  video: h264, 1920x1080, 29.97 fps, 12.5 s, ~375 frames
+  pixels: yuv420p, 8-bit, colorspace bt709, range tv
+  audio: aac, 48000 Hz
+```
+
+```python
 # Iterate over all frames — this is where decoding begins
 for frame in frames:
     # frame is a numpy array of shape (height, width, 3) and dtype uint8
@@ -73,6 +97,24 @@ for f in cuda_frames.resized((224, 224)):
 batch = torch.from_dlpack(cuda_frames[[10, 50, 300]])  # (3, H, W, 3) on CUDA
 ```
 
+### Live Cameras on the GPU
+
+`CameraFrames` reads USB webcams (V4L2/MJPEG) and decodes every frame on the GPU via NVDEC's JPEG engine. Iteration always yields the **latest** captured frame — a consumer slower than the camera skips frames instead of processing a growing backlog, keeping latency at one frame interval.
+
+```python
+import torch
+from framepump import CameraFrames, list_cameras
+
+print(*list_cameras(), sep='\n')  # discover devices and their MJPEG modes
+
+with CameraFrames('/dev/video0', shape=(720, 1280), fps=30) as cam:
+    for frame in cam:
+        tensor = torch.from_dlpack(frame)  # (720, 1280, 3) uint8 CUDA, zero-copy
+        ...  # run your model; cam.last_capture_time tells you the frame's age
+```
+
+For models that only reach real-time throughput when batched, `cam.batched(n)` yields adaptive batches of the frames captured since the previous step — never the same frame twice, spread evenly across the missed interval, always ending at the newest.
+
 ### Writing Videos
 
 You can write a sequence of frames to a video file using the `VideoWriter` class. It handles the writing process in a separate thread for better performance.
@@ -105,9 +147,20 @@ with VideoWriter('output_with_audio.mp4', fps=30, audio_source_path='input_with_
         writer.append_data(frame)
 ```
 
+For the common read-process-write round trip, `like=` copies the frame rate and the audio from a reference in one go — and it tracks slicing, so a `video[::2]` reference halves the output fps while preserving duration and audio sync:
+
+```python
+from framepump import VideoFrames, VideoWriter
+
+video = VideoFrames('input.mp4')
+with VideoWriter('annotated.mp4', like=video) as writer:
+    for frame in video:
+        writer.append_data(process(frame))
+```
+
 ### Getting Video Information
 
-Several utility functions are available to get information about a video file.
+The recommended way is `VideoFrames`: `frames.info` for the full overview (shown above), `len(frames)` for the exact frame count, `frames.fps` / `frames.imshape` for the effective properties of the (possibly sliced/resized) view. Standalone utility functions also exist for one-off lookups:
 
 ```python
 from framepump import get_fps, get_duration, num_frames, video_extents
@@ -215,6 +268,16 @@ with GLVideoWriter('output.mp4', fps=30) as writer:
 - For headless: `pip install framepump[nvenc-cuda]`
 
 See the [NVENC documentation](https://framepump.readthedocs.io/en/latest/explanation/nvenc-zero-copy.html) for details.
+
+Its sibling `NvJpegVideoWriter` turns JPEG byte streams (e.g. from MJPEG cameras or archives of per-frame JPEGs) into H.264 video entirely on the GPU: nvJPEG decode → NVENC encode, with no CPU-GPU pixel transfers at all.
+
+```python
+from framepump import NvJpegVideoWriter
+
+with NvJpegVideoWriter('output.mp4', fps=30) as writer:
+    for jpeg_bytes in jpeg_stream:
+        writer.append_data(jpeg_bytes)
+```
 
 ### High Bit Depth Support
 

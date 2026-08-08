@@ -24,6 +24,7 @@ from ._pyav import (
     UnsupportedCodecError,
     VideoDecodeError,
     VideoEncodeError,
+    VideoInfo,
 )
 from ._v4l2 import CameraInfo, CameraMode, list_cameras
 from .encoder_config import EncoderConfig
@@ -98,6 +99,7 @@ __all__ = [
     'list_cameras',
     'CameraInfo',
     'CameraMode',
+    'VideoInfo',
     'EncoderConfig',
     'get_fps',
     'get_duration',

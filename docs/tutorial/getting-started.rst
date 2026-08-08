@@ -34,6 +34,17 @@ You can inspect the video's properties immediately:
     print(frames.imshape)   # (height, width) in pixels, e.g. (1080, 1920)
     print(len(frames))      # Exact frame count
 
+For a full overview of what the file contains — codec, pixel format, bit
+depth, colorspace, audio — print ``frames.info``:
+
+.. code-block:: python
+
+    >>> print(frames.info)
+    input.mp4
+      video: h264, 1920x1080, 29.97 fps, 12.5 s, ~375 frames
+      pixels: yuv420p, 8-bit, colorspace bt709, range tv
+      audio: aac, 48000 Hz
+
 The frame count is exact, not an estimate. FramePump scans the container's
 packets (without decoding frames) to build an index the first time something
 needs it — such as ``len()``, integer indexing or negative slice bounds.

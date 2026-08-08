@@ -708,6 +708,21 @@ class VideoFramesCuda:
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f'Failed to copy frame into batch buffer: {err}')
 
+    @property
+    def info(self):
+        """Properties of the underlying video: codec, size, colors, audio.
+
+        Describes the source file/stream — slicing, ``resized()`` and dtype
+        options of this instance do not affect it. Opens the container
+        briefly on the CPU side (no GPU work). See
+        :class:`framepump.VideoInfo` for the fields.
+        """
+        reader = PyAVReader(resolve_source_view(self.path), gpu=False)
+        try:
+            return reader.get_info()
+        finally:
+            reader.close()
+
     def resized(self, shape: tuple[int, int], *, gamma_correct: bool = False) -> VideoFramesCuda:
         """Return a new VideoFramesCuda that outputs frames at the given size.
 

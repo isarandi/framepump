@@ -223,6 +223,65 @@ def _make_hwaccel(gpu: bool | int):
     return HWAccel(device_type='cuda', device=device, allow_software_fallback=False)
 
 
+# FFmpeg AVColorSpace / AVColorRange enum values, for readable reporting
+_COLORSPACE_NAMES = {
+    0: 'rgb', 1: 'bt709', 2: 'unspecified', 4: 'fcc', 5: 'bt470bg',
+    6: 'smpte170m', 7: 'smpte240m', 8: 'ycgco', 9: 'bt2020nc', 10: 'bt2020c',
+    14: 'ictcp',
+}  # fmt: skip
+_COLOR_RANGE_NAMES = {0: 'unspecified', 1: 'tv', 2: 'pc'}
+
+
+@dataclass(frozen=True)
+class VideoInfo:
+    """Properties of a video file/stream, as reported by its container.
+
+    Returned by ``VideoFrames.info`` / ``VideoFramesCuda.info``. Describes the
+    *source* video; it does not change with slicing, resizing or dtype options
+    (use the reader's own ``fps``/``imshape``/``len()`` for the effective view).
+    """
+
+    source: str
+    """Path or URL of the video (``'<file-like>'`` for file objects)."""
+    codec: str
+    """Video codec name, e.g. ``'h264'``."""
+    imshape: tuple[int, int]
+    """Native frame size as (height, width)."""
+    fps: float
+    """Native average frame rate."""
+    duration: float
+    """Duration in seconds (0.0 if the container does not report one)."""
+    n_frames: int
+    """Frame count as reported/estimated by the container. Exact counting:
+    ``len(VideoFrames(path))``."""
+    pix_fmt: str
+    """Pixel format of the coded stream, e.g. ``'yuv420p'``."""
+    bit_depth: int
+    """Bits per color component (8 for most video, 10+ for HDR/high-precision)."""
+    colorspace: str
+    """YUV↔RGB matrix of the stream, e.g. ``'bt709'`` (``'unspecified'`` if unflagged)."""
+    color_range: str
+    """``'tv'`` (limited), ``'pc'`` (full), or ``'unspecified'``."""
+    has_audio: bool
+    """Whether the container has an audio stream."""
+    audio_codec: str | None
+    """Audio codec name, or None without audio."""
+    audio_sample_rate: int | None
+    """Audio sample rate in Hz, or None without audio."""
+
+    def __str__(self) -> str:
+        h, w = self.imshape
+        audio = f'{self.audio_codec}, {self.audio_sample_rate} Hz' if self.has_audio else 'none'
+        return (
+            f'{self.source}\n'
+            f'  video: {self.codec}, {w}x{h}, {self.fps:.6g} fps, '
+            f'{self.duration:.6g} s, ~{self.n_frames} frames\n'
+            f'  pixels: {self.pix_fmt}, {self.bit_depth}-bit, '
+            f'colorspace {self.colorspace}, range {self.color_range}\n'
+            f'  audio: {audio}'
+        )
+
+
 class PyAVReader:
     """Persistent video reader using PyAV.
 
@@ -528,6 +587,41 @@ class PyAVReader:
     def has_audio(self) -> bool:
         """Check if video has audio stream."""
         return len(self._container.streams.audio) > 0
+
+    def get_info(self) -> VideoInfo:
+        """Collect the stream properties into a :class:`VideoInfo`."""
+        cc = self._stream.codec_context
+        try:
+            bit_depth = max(c.bits for c in cc.format.components)
+        except (AttributeError, TypeError, ValueError):
+            bit_depth = 8
+        audio_codec = audio_rate = None
+        if self.has_audio():
+            acc = self._container.streams.audio[0].codec_context
+            audio_codec = acc.codec.name if acc is not None else 'unknown'
+            audio_rate = acc.sample_rate if acc is not None else None
+        if self.path is not None:
+            source = str(self.path)
+        elif isinstance(self._source, str):
+            source = self._source
+        else:
+            source = '<file-like>'
+        w, h = self.resolution
+        return VideoInfo(
+            source=source,
+            codec=self.codec_name,
+            imshape=(h, w),
+            fps=self.fps,
+            duration=self.duration,
+            n_frames=self.frame_count_estimate,
+            pix_fmt=cc.pix_fmt or 'unknown',
+            bit_depth=bit_depth,
+            colorspace=_COLORSPACE_NAMES.get(cc.colorspace, f'({cc.colorspace})'),
+            color_range=_COLOR_RANGE_NAMES.get(cc.color_range, f'({cc.color_range})'),
+            has_audio=self.has_audio(),
+            audio_codec=audio_codec,
+            audio_sample_rate=audio_rate,
+        )
 
     # --- Seeking and Decoding ---
 

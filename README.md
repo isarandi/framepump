@@ -30,6 +30,7 @@ frames = VideoFrames('my_video.mp4')  # This is lazy, it only reads some metadat
 print(f"Shape: {frames.imshape}")
 print(f"FPS: {frames.fps}")
 print(f"Number of frames: {len(frames)}")
+print(frames.info)  # full overview: codec, pixel format, bit depth, colorspace, audio
 
 # Iterate over all frames — this is where decoding begins
 for frame in frames:

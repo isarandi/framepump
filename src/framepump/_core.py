@@ -20,6 +20,7 @@ from ._pyav import (
     FramePumpError,
     PyAVReader,
     VideoDecodeError,
+    VideoInfo,
     resolve_source_view,
 )
 from ._selection import FrameSelection
@@ -724,6 +725,30 @@ class VideoFrames:
         frame count is — reading fps never triggers the index scan.
         """
         return self.target_fps / abs(self._selection.step_product) * self.repeat_count
+
+    @property
+    def info(self) -> VideoInfo:
+        """Properties of the underlying video: codec, size, colors, audio.
+
+        Describes the source file/stream — slicing, ``resized()`` and dtype
+        options of this instance do not affect it (their effect shows in
+        ``fps``, ``imshape`` and ``len()`` instead). Opens the container
+        briefly; never triggers a frame-index scan.
+
+        Example:
+            >>> print(VideoFrames('clip.mp4').info)
+            clip.mp4
+              video: h264, 1920x1080, 30 fps, 12.5 s, ~375 frames
+              pixels: yuv420p, 8-bit, colorspace bt709, range tv
+              audio: aac, 48000 Hz
+        """
+        # A plain reader, not _create_reader(): metadata needs no seekability
+        # probe (which decodes a frame and reopens the container).
+        reader = PyAVReader(resolve_source_view(self.path), gpu=False)
+        try:
+            return reader.get_info()
+        finally:
+            reader.close()
 
     def resized(self, shape: tuple[int, int]) -> 'VideoFrames':
         """Return a new VideoFrames that decodes frames at the given resolution.
@@ -1556,6 +1581,7 @@ def build_cfr_source_map(frame_pts: list[Fraction], target_fps: float) -> list[i
         source_map.append(len(frame_pts) - 1)
 
     return source_map
+
 
 def num_frames(path: PathLike, exact: bool = False, absolutely_exact: bool = False) -> int:
     """Count frames in a video.

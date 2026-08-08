@@ -22,6 +22,25 @@ def _require_camera():
     return torch
 
 
+def test_list_cameras():
+    """Camera discovery via V4L2 (no CUDA needed, but needs a camera)."""
+    if not os.path.exists(DEVICE):
+        pytest.skip(f'no camera at {DEVICE}')
+    from framepump import list_cameras
+
+    cams = list_cameras()
+    assert any(cam.device == DEVICE for cam in cams)
+    cam = next(cam for cam in cams if cam.device == DEVICE)
+    assert cam.name
+    assert 'MJPG' in cam.formats
+    assert cam.mjpeg_modes, 'UVC camera should offer MJPEG modes'
+    h, w = cam.mjpeg_modes[0].shape
+    assert h > 0 and w > 0 and cam.mjpeg_modes[0].fps > 0
+    # sorted largest first
+    pixel_counts = [m.shape[0] * m.shape[1] for m in cam.mjpeg_modes]
+    assert pixel_counts == sorted(pixel_counts, reverse=True)
+
+
 def test_live_frames_and_metadata():
     torch = _require_camera()
     from framepump import CameraFrames

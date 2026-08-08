@@ -160,6 +160,17 @@ counts. Don't mix the two classes when exact reproducibility matters.
 CameraFrames — live cameras
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Discover connected cameras and their supported modes with
+:func:`framepump.list_cameras` (V4L2, no extra dependencies):
+
+.. code-block:: python
+
+    >>> for cam in framepump.list_cameras():
+    ...     print(cam)
+    /dev/video0: HD Webcam
+      MJPEG modes: 1280x720 @ 30 fps, 640x480 @ 30 fps
+      formats: MJPG, YUYV
+
 USB cameras deliver MJPEG at their real resolutions; ``CameraFrames``
 decodes that stream on the GPU (NVDEC's JPEG engine) and always hands you
 the **latest** captured frame — a consumer slower than the camera skips

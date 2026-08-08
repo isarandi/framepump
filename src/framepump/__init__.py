@@ -25,6 +25,7 @@ from ._pyav import (
     VideoDecodeError,
     VideoEncodeError,
 )
+from ._v4l2 import CameraInfo, CameraMode, list_cameras
 from .encoder_config import EncoderConfig
 
 from .video_writing import (
@@ -94,6 +95,9 @@ __all__ = [
     'CameraFrames',
     'VideoFramesCuda',
     'CudaToGLUploader',
+    'list_cameras',
+    'CameraInfo',
+    'CameraMode',
     'EncoderConfig',
     'get_fps',
     'get_duration',

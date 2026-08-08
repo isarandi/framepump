@@ -80,11 +80,14 @@ audio carried over if you want it:
     from framepump import VideoFrames, VideoWriter
 
     frames = VideoFrames('input.mp4')
-    with VideoWriter('annotated.mp4', fps=frames.fps,
-                     audio_source_path='input.mp4') as writer:
+    with VideoWriter('annotated.mp4', like=frames) as writer:
         for frame, pred in zip(frames, predictions):
             writer.append_data(draw_overlay(frame.copy(), pred))
 
-The writer encodes on a background thread, so drawing and encoding overlap.
-For matching output timing on variable-framerate input, open the reader with
-``constant_framerate=True`` and pass the same fps to the writer.
+``like=`` copies the frame rate from the reference and carries its audio
+over (pass ``audio_source_path=False`` to skip the audio). It also tracks
+slicing: with ``frames[::2]`` as the reference, the output gets half the
+fps and thus keeps the original duration. The writer encodes on a
+background thread, so drawing and encoding overlap. For matching output
+timing on variable-framerate input, open the reader with
+``constant_framerate=True``.

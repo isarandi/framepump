@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, BinaryIO, Generic, TypeVar, Union
+from typing import Any, BinaryIO, Generic, Literal, TypeVar, Union
 
 import av
 import av.stream
@@ -27,7 +27,7 @@ import simplepyutils as spu
 from numpy.typing import NDArray
 
 from ._h264_mux import _FORMAT_ALIASES
-from ._pyav import FrameIndexPyAV, PyAVReader, VideoEncodeError
+from ._pyav import FrameIndexPyAV, PyAVReader, VideoEncodeError, resolve_source_view
 from ._temp_file import TempFile
 from .encoder_config import EncoderConfig
 
@@ -125,6 +125,39 @@ class SequenceContext(AbstractContextManager['SequenceContext']):
             self.multiwriter._abort()
 
 
+def _apply_like(like, fps, audio_source_path):
+    """Fill fps and audio source from a reference video where not explicitly given.
+
+    ``like`` may be a path/URL or a reader instance (VideoFrames or
+    VideoFramesCuda — anything with ``fps``, ``path`` and ``info``). Reader
+    instances contribute their *effective* fps, so a sliced input like
+    ``video[::2]`` yields a correspondingly slower output that keeps the
+    original duration (and thus stays in sync with the copied audio).
+    ``audio_source_path=False`` means "no audio even if the reference has it".
+    """
+    if like is None:
+        return fps, (None if audio_source_path is False else audio_source_path)
+    if isinstance(like, (str, Path)):
+        reader = PyAVReader(resolve_source_view(like))
+        try:
+            like_fps = reader.fps
+            like_has_audio = reader.has_audio()
+        finally:
+            reader.close()
+        like_path = like
+    else:
+        like_fps = like.fps
+        like_has_audio = like.info.has_audio
+        like_path = like.path if isinstance(like.path, (str, Path)) else None
+    if fps is None:
+        fps = like_fps
+    if audio_source_path is False:
+        audio_source_path = None
+    elif audio_source_path is None and like_has_audio and like_path is not None:
+        audio_source_path = like_path
+    return fps, audio_source_path
+
+
 class _WriterState(Enum):
     """Lifecycle of the writer/worker pair.
 
@@ -164,16 +197,30 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
             8-bit only: uint16/float frames require gpu=False.
         encoder_config: :class:`~framepump.EncoderConfig` with crf, preset,
             bframes, gop and codec settings (defaults are used if omitted).
+        like: Reference video to copy settings from: a path/URL or a reader
+            instance (:class:`VideoFrames` / ``VideoFramesCuda``). Fills
+            ``fps`` and — when the reference has audio — ``audio_source_path``,
+            unless those are given explicitly. A reader instance contributes
+            its *effective* fps, so writing ``video[::2]`` with
+            ``like=video[::2]`` preserves the original duration and audio
+            sync. Pass ``audio_source_path=False`` to opt out of the audio
+            copy. Typical round-trip:
+
+            >>> video = VideoFrames('in.mp4')
+            >>> with VideoWriter('out.mp4', like=video) as writer:
+            ...     for frame in video:
+            ...         writer.append_data(process(frame))
     """
 
     def __init__(
         self,
         video_path: PathLike | None = None,
         fps: float | None = None,
-        audio_source_path: PathLike | None = None,
+        audio_source_path: PathLike | Literal[False] | None = None,
         queue_size: int = 32,
         gpu: bool | int = False,
         encoder_config: EncoderConfig | None = None,
+        like=None,
     ) -> None:
         """Create a new VideoWriter.
 
@@ -181,6 +228,7 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         """
         if queue_size < 1:
             raise ValueError(f'queue_size must be >= 1, got {queue_size}')
+        fps, audio_source_path = _apply_like(like, fps, audio_source_path)
         self._queue: queue.Queue[Message] = queue.Queue(queue_size)
         self._feedback_queue: queue.Queue[FeedbackMessage] = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -220,11 +268,12 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
         self,
         video_output: VideoOutput,
         fps: float | Fraction | None = None,
-        audio_source_path: PathLike | None = None,
+        audio_source_path: PathLike | Literal[False] | None = None,
         audio_stream_index: int = 0,
         gpu: bool | int | None = None,
         encoder_config: EncoderConfig | None = None,
         format: str | None = None,
+        like=None,
     ) -> SequenceContext:
         """Start a new video sequence.
 
@@ -241,7 +290,9 @@ class VideoWriter(AbstractVideoWriter[NDArray], AbstractContextManager['VideoWri
                 or an int to select a specific GPU device ordinal.
             encoder_config: Encoder configuration (crf, preset, bframes, gop, codec).
             format: Container format (e.g., 'mp4'). Required for file-like objects.
+            like: Reference video to copy settings from — see the class docstring.
         """
+        fps, audio_source_path = _apply_like(like, fps, audio_source_path)
         if self._state is _WriterState.FAILED and not self._error_reported:
             self._raise_worker_failure()
         self._ensure_worker_running()
@@ -615,7 +666,7 @@ class SequenceWriter(AbstractContextManager['SequenceWriter']):
         self,
         video_output: VideoOutput,
         fps: float | Fraction,
-        audio_source_path: PathLike | None = None,
+        audio_source_path: PathLike | Literal[False] | None = None,
         audio_stream_index: int = 0,
         gpu: bool | int = False,
         encoder_config: EncoderConfig | None = None,

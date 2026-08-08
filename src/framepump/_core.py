@@ -108,10 +108,15 @@ _STREAM_MAX_SKIP = 256
 # frame count is derived from this budget (clamped to [4, 64] frames).
 _REVERSE_CHUNK_BYTES = 256 * 1024 * 1024
 
-# Measured crossover between decoding through a gap and seeking over it
-# (seeking is fast with PyAV, ~10 ms): gaps up to this many frames decode
-# through, larger ones seek. Used by strided iteration and frames_at().
-_SEEK_VS_DECODE_MAX_SKIP = 30
+# Crossover between decoding through a gap and seeking over it, calibrated
+# 2026-08-08 (explorations/2026-08-08-seek-crossover): the seek path costs a
+# near-flat 20-50 ms (reader open + decode from the previous keyframe) while
+# decode-through scales at 0.2-1.5 ms/frame, putting the measured crossover
+# at ~96-128 frames for GOP-250 content and ~48-64 for dense keyframes
+# (GOP 30). 64 sits at the dense-keyframe tie point; erring high is the
+# cheap direction (bounded ~2x near the crossover, vs 10-40x wasted when
+# seeking over small gaps). Used by strided iteration and frames_at().
+_SEEK_VS_DECODE_MAX_SKIP = 64
 
 # Consecutive forward single-frame indexed accesses before the one-shot
 # PerformanceWarning fires (the frames[i]-in-a-loop anti-pattern).

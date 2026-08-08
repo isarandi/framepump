@@ -174,7 +174,10 @@ class VideoFrames:
         ...     process(frame)
 
     Args:
-        video_path: Path to video file.
+        video_path: Path to a video file, a URL (``http(s)://`` and any other
+            protocol FFmpeg supports; live streams work for iteration, but
+            ``len()``/seeking need a stream with known duration), or a
+            seekable file-like object (e.g. BytesIO, an open archive member).
         dtype: Output dtype (uint8, uint16, float16, float32, float64).
             Float dtypes yield values scaled to [0, 1].
         gpu: False for CPU decoding, True for NVDEC hardware decoding on the

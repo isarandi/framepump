@@ -26,6 +26,15 @@ reads only metadata — no pixel data is loaded yet.
 
     frames = VideoFrames('input.mp4')
 
+The source does not have to be a local file: HTTP(S) URLs (served by any
+range-supporting server) and seekable file-like objects (``BytesIO``, open
+archive members) work the same way, and other FFmpeg protocols such as RTSP
+open for iteration:
+
+.. code-block:: python
+
+    frames = VideoFrames('https://example.com/clip.mp4')
+
 You can inspect the video's properties immediately:
 
 .. code-block:: python

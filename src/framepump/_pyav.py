@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import bisect
 import io
+import re
 from collections.abc import Generator
 from dataclasses import dataclass
 from fractions import Fraction
@@ -177,6 +178,18 @@ def _repack_semiplanar(frame: av.VideoFrame) -> av.VideoFrame:
     return out
 
 
+_URL_SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]+://')
+
+
+def is_url(source) -> bool:
+    """Whether ``source`` is a URL FFmpeg should open directly (http, rtsp, ...).
+
+    Requires a scheme of at least two characters, so Windows drive paths
+    (``C:...``) are not mistaken for URLs.
+    """
+    return isinstance(source, str) and bool(_URL_SCHEME_RE.match(source))
+
+
 def resolve_source_view(source):
     """A fresh read view of ``source`` for opening one more reader on it.
 
@@ -321,10 +334,15 @@ class PyAVReader:
             except av.error.FFmpegError as e:
                 raise VideoDecodeError('<file-like>', 0, e) from e
         else:
-            self.path = Path(source)
             self._source = source
-            if not self.path.exists():
-                raise FileNotFoundError(f'Video file not found: {source}')
+            if is_url(source):
+                # Keep the raw string: Path() would collapse the '//' of the
+                # scheme. FFmpeg's protocol handlers open it directly.
+                self.path = source
+            else:
+                self.path = Path(source)
+                if not self.path.exists():
+                    raise FileNotFoundError(f'Video file not found: {source}')
             try:
                 self._container = av.open(
                     str(source),

@@ -140,11 +140,13 @@ class VideoFramesCuda:
     state.
 
     Args:
-        video_path: Path to video file (str or Path), or a seekable file-like
-            object (must support read, seek, tell). ``BytesIO`` sources
-            support any number of concurrently active iterators (each decode
-            session gets an independent view); other file-like objects allow
-            only one active iterator at a time, since sessions share the
+        video_path: Path to video file (str or Path), a URL (``http(s)://``
+            and other FFmpeg-supported protocols, served with range support
+            for seeking/indexing), or a seekable file-like object (must
+            support read, seek, tell). ``BytesIO`` sources support any
+            number of concurrently active iterators (each decode session
+            gets an independent view); other file-like objects allow only
+            one active iterator at a time, since sessions share the
             object's read position.
         gpu: GPU device ordinal (default 0).
         dtype: Output dtype — ``np.uint8`` (default), ``np.uint16``,

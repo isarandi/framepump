@@ -39,3 +39,29 @@ The subclasses and when they are raised:
     Building the frame index failed (no valid frames found in the file).
 :class:`~framepump.FilterConfigError`
     Configuring the format/resize filter graph failed.
+
+
+Diagnosing Environment Issues
+-----------------------------
+
+When a GPU feature fails with a low-level error (CUDA context/out-of-memory
+errors, missing NVENC/NVDEC, import errors from the CUDA extras), run
+:func:`framepump.diagnose` — it prints the FFmpeg/PyAV versions in use, the
+NVIDIA driver and GPUs, the availability of each GPU feature with the
+concrete reason when one is missing, and the connected cameras:
+
+.. code-block:: python
+
+    >>> import framepump
+    >>> framepump.diagnose()
+    framepump 0.3.1
+    python 3.10.14 on Linux-6.8.0-x86_64
+    PyAV 17.1.0 (libavcodec 62.28.101, ...)
+    FFmpeg CUDA decoders (h264_cuvid): present
+    NVIDIA driver: ...
+    GPU features:
+      VideoFramesCuda / frame index: available
+      CameraFrames: available
+      ...
+
+Attach its output to bug reports.

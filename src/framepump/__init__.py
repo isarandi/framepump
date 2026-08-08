@@ -26,6 +26,7 @@ from ._pyav import (
     VideoEncodeError,
     VideoInfo,
 )
+from ._diagnose import diagnose
 from ._v4l2 import CameraInfo, CameraMode, list_cameras
 from .encoder_config import EncoderConfig
 
@@ -100,6 +101,7 @@ __all__ = [
     'CameraInfo',
     'CameraMode',
     'VideoInfo',
+    'diagnose',
     'EncoderConfig',
     'get_fps',
     'get_duration',

@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import operator
 import threading
+import warnings
 from bisect import bisect_left
 from collections import deque
 from collections.abc import Generator
@@ -18,6 +19,7 @@ from numpy.typing import DTypeLike, NDArray
 from ._pyav import (
     FrameIndexPyAV,
     FramePumpError,
+    PerformanceWarning,
     PyAVReader,
     VideoDecodeError,
     VideoInfo,
@@ -111,6 +113,40 @@ _REVERSE_CHUNK_BYTES = 256 * 1024 * 1024
 # through, larger ones seek. Used by strided iteration and frames_at().
 _SEEK_VS_DECODE_MAX_SKIP = 30
 
+# Consecutive forward single-frame indexed accesses before the one-shot
+# PerformanceWarning fires (the frames[i]-in-a-loop anti-pattern).
+_INDEXING_WARN_THRESHOLD = 10
+
+
+def _note_indexed_access(frames_obj, index: int) -> None:
+    """Track single-frame indexing and warn once about sequential-index loops.
+
+    Fires when an instance sees many single-index accesses in a row whose
+    indices march forward in steps within the seek-vs-decode crossover — the
+    signature of ``for i in ...: frames[i]``, which pays a seek plus a
+    decode-from-keyframe for every frame. Warns once per instance.
+    """
+    last = frames_obj._last_indexed
+    frames_obj._last_indexed = index
+    if last is not None and 0 < index - last <= _SEEK_VS_DECODE_MAX_SKIP:
+        frames_obj._consec_indexed += 1
+    else:
+        frames_obj._consec_indexed = 0
+    if frames_obj._consec_indexed >= _INDEXING_WARN_THRESHOLD and not frames_obj._indexing_warned:
+        frames_obj._indexing_warned = True
+        warnings.warn(
+            f'{_INDEXING_WARN_THRESHOLD}+ consecutive forward indexed accesses detected '
+            f'(the "frames[i] in a loop" pattern). Every indexed access seeks and decodes '
+            f'from the nearest previous keyframe, typically 10-100x slower than sequential '
+            f'decoding. Iterate instead (optionally over a slice like frames[a:b:step]), '
+            f'pass an index list to frames_at() or frames[[i0, i1, ...]], or zip iterators '
+            f'for lockstep multi-video reading. Indexing is meant for grabbing single '
+            f'frames. (Warned once per instance; silence via warnings.filterwarnings with '
+            f'framepump.PerformanceWarning.)',
+            PerformanceWarning,
+            stacklevel=3,
+        )
+
 
 class _LazyIndexState:
     """Frame-index state shared between a VideoFrames and all its views.
@@ -173,6 +209,12 @@ class VideoFrames:
         >>> for frame in frames[::2][:100].resized((128, 128)):
         ...     process(frame)
 
+    Indexing is a convenience for grabbing *single* frames: every indexed
+    access seeks and decodes from the nearest previous keyframe. To read many
+    frames, iterate (over a slice for a range, over ``zip(*videos)`` for
+    lockstep multi-video reading) or use :meth:`frames_at` for index lists —
+    typically 10-100x faster than indexing in a loop.
+
     Args:
         video_path: Path to a video file, a URL (``http(s)://`` and any other
             protocol FFmpeg supports; live streams work for iteration, but
@@ -197,6 +239,12 @@ class VideoFrames:
             bit-exact for gray16le sources (e.g. FFV1 depth videos written by
             DepthVideoWriter). Not supported together with gpu decoding.
     """
+
+    # Sequential-indexing anti-pattern detection (see _note_indexed_access);
+    # class-level defaults so views created by _clone() start fresh too.
+    _last_indexed: int | None = None
+    _consec_indexed: int = 0
+    _indexing_warned: bool = False
 
     def __init__(
         self,
@@ -513,6 +561,14 @@ class VideoFrames:
             The decoded frame as a numpy array for an integer index, a
             stacked (n, height, width, 3) array for an index list, or a
             new lazy VideoFrames view for a slice (no decoding happens).
+
+        Note:
+            Integer indexing seeks and decodes from the nearest previous
+            keyframe on every access — right for grabbing single frames,
+            10-100x slower than iteration when done in a loop. For many
+            frames, iterate over the object or a slice of it, or pass the
+            whole index list at once (``frames[[i0, i1, ...]]`` /
+            :meth:`frames_at`).
         """
         if isinstance(item, (list, np.ndarray)) and getattr(item, 'ndim', 1) != 0:
             return self._gather_indices(item)
@@ -536,6 +592,7 @@ class VideoFrames:
                     detail = f'video with {length} frames'
                 raise IndexError(f'Frame index {item} out of range for {detail}')
 
+            _note_indexed_access(self, item)
             # The bounds check above uses the repeat-inclusive length, so after
             # dividing out the repeat factor the index is always within range.
             abs_idx = self._resolved_range()[item // self.repeat_count]

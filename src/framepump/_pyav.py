@@ -126,6 +126,14 @@ class FilterConfigError(FramePumpError):
     pass
 
 
+class PerformanceWarning(UserWarning):
+    """Warns about usage patterns that are drastically slower than an
+    equivalent API the library offers (e.g. indexing frames one by one in a
+    loop instead of iterating). Silence with
+    ``warnings.filterwarnings('ignore', category=framepump.PerformanceWarning)``.
+    """
+
+
 # Lossless repack targets for semi-planar NVDEC download formats
 _SEMIPLANAR_TO_PLANAR = {
     'nv12': 'yuv420p',

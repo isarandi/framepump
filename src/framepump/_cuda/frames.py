@@ -55,7 +55,7 @@ import numpy as np
 from numpy.typing import DTypeLike
 import PyNvVideoCodec as nvc
 
-from .._core import _SEEK_VS_DECODE_MAX_SKIP, build_cfr_source_map
+from .._core import _SEEK_VS_DECODE_MAX_SKIP, _note_indexed_access, build_cfr_source_map
 from .compat import cuda_ctx_pushed, retain_primary_context
 from .._pyav import (
     PyAVReader,
@@ -100,7 +100,6 @@ _AVCOL_SPC_TO_MATRIX = {
     9: 'bt2020',  # non-constant luminance
 }
 _SUPPORTED_COLOR_SPACES = frozenset(_AVCOL_SPC_TO_MATRIX.values())
-
 
 
 class _CudaLazyIndexState:
@@ -166,6 +165,11 @@ class VideoFramesCuda:
             from the stream. (BT.2020 constant-luminance, ICtCp and other
             non-matrix colorspaces are not supported — use ``VideoFrames``.)
     """
+
+    # Sequential-indexing anti-pattern detection (see _core._note_indexed_access)
+    _last_indexed: int | None = None
+    _consec_indexed: int = 0
+    _indexing_warned: bool = False
 
     def __init__(
         self,
@@ -438,6 +442,13 @@ class VideoFramesCuda:
             index, a stacked (n, height, width, 3) GPU buffer for an index
             list (``torch.from_dlpack`` gives a ready batch tensor), or a
             new lazy VideoFramesCuda view for a slice.
+
+        Note:
+            Integer indexing seeks and decodes from the nearest previous
+            keyframe on every access — right for grabbing single frames,
+            10-100x slower than iteration when done in a loop. For many
+            frames, iterate over the object or a slice of it, or pass the
+            whole index list at once (batch gather / :meth:`frames_at`).
         """
         if isinstance(item, (list, np.ndarray)) and getattr(item, 'ndim', 1) != 0:
             return self._gather_indices(item)
@@ -445,9 +456,7 @@ class VideoFramesCuda:
             try:
                 item = operator.index(item)
             except TypeError:
-                raise TypeError(
-                    'Indices must be integers, integer arrays or slices.'
-                ) from None
+                raise TypeError('Indices must be integers, integer arrays or slices.') from None
         if isinstance(item, int):
             length = len(self)
             if item < 0:
@@ -459,6 +468,7 @@ class VideoFramesCuda:
                 else:
                     detail = f'video with {length} frames'
                 raise IndexError(f'Frame index {item} out of range for {detail}')
+            _note_indexed_access(self, item)
             abs_idx = self._resolved_range()[item // self._repeat_count]
             return self._get_frame_by_abs_idx(self._source_index(abs_idx), owns_memory=True)
 

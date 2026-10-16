@@ -15,6 +15,8 @@ import ctypes
 import itertools
 import warnings
 
+from cuda.bindings import driver
+
 from .compat import cuda_ctx_pushed
 
 class _GpuRgbBuffer:
@@ -300,10 +302,10 @@ def _free_owned_buffer(devptr, device, ctx) -> None:
 
     May run on any thread (GC, or a DLPack consumer's deleter), so the
     owning context is pushed for the free and the retain released after.
-    Failures are reported as warnings — deleters cannot raise.
+    Failures are reported as warnings — deleters cannot raise. The driver
+    module is imported at module load: this deleter also runs at interpreter
+    shutdown, when imports fail.
     """
-    from cuda.bindings import driver
-
     if ctx is not None:
         (err,) = driver.cuCtxPushCurrent(ctx)
         if err != driver.CUresult.CUDA_SUCCESS:

@@ -163,6 +163,7 @@ class _PostProcessor:
 
             # Publish only on full success; the sentinel (_npp_ctx) goes last
             # so the unlocked fast path never sees a partial pipeline.
+            self._driver = driver
             self._cuda_device = device
             self._npp_cuda_ctx = cuda_ctx
             self._npp_bindings = npp_bindings
@@ -173,11 +174,12 @@ class _PostProcessor:
 
     def close(self) -> None:
         """Free NPP pipeline GPU resources."""
+        # The driver module reference was captured at init: close() also runs
+        # from __del__ at interpreter shutdown, when imports fail.
+        driver = getattr(self, '_driver', None)
         ctx = getattr(self, '_npp_cuda_ctx', None)
         bufs = getattr(self, '_bufs', None)
-        if bufs is not None and ctx is not None:
-            from cuda.bindings import driver
-
+        if bufs is not None and ctx is not None and driver is not None:
             with cuda_ctx_pushed(ctx):
                 # NPP work on the default stream may still be in flight.
                 driver.cuCtxSynchronize()
@@ -185,9 +187,7 @@ class _PostProcessor:
                     driver.cuMemFree(ptr)
             del self._bufs
         device = getattr(self, '_cuda_device', None)
-        if device is not None:
-            from cuda.bindings import driver
-
+        if device is not None and driver is not None:
             driver.cuDevicePrimaryCtxRelease(device)
             del self._cuda_device
         if ctx is not None:

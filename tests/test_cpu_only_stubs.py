@@ -24,14 +24,14 @@ def test_import_without_cuda_gives_stubs():
 import sys
 
 class _Blocker:
+    # find_spec: the meta-path finder protocol; find_module/load_module are ignored
+    # since Python 3.12, which made this blocker a silent no-op there.
     blocked = ('cuda', 'PyNvVideoCodec')
 
-    def find_module(self, name, path=None):
+    def find_spec(self, name, path=None, target=None):
         if name in self.blocked or any(name.startswith(b + '.') for b in self.blocked):
-            return self
-
-    def load_module(self, name):
-        raise ImportError(f'{name} is blocked for this test')
+            raise ImportError(f'{name} is blocked for this test')
+        return None
 
 sys.meta_path.insert(0, _Blocker())
 

@@ -362,12 +362,29 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
             self._abort()
 
 
+def available_backends() -> tuple[str, ...]:
+    """Return the GL encoding backends usable on this machine, as accepted by ``backend=``.
+
+    ``'glx'`` needs the NVIDIA encoder library (``libnvidia-encode``, part of the
+    driver); ``'cuda'`` additionally needs the CUDA Python bindings (the
+    ``framepump[cuda]`` extra). An empty tuple means GPU encoding of GL textures
+    is not possible here; render to a NumPy frame and use :class:`VideoWriter` instead.
+    Whether the GL context sits on an NVIDIA GPU is a separate condition that only the
+    caller can check (``ctx.info['GL_VENDOR']``).
+    """
+    from .video_writing import _nvenc_available
+
+    if NvencEncoder is None or not _nvenc_available():
+        return ()
+    return ('glx', 'cuda') if NvencCudaEncoder is not None else ('glx',)
+
+
 def _validate_backend(backend: str) -> None:
     if backend not in ('auto', 'glx', 'cuda'):
         raise ValueError(f"backend must be 'auto', 'glx', or 'cuda', got {backend!r}")
     if backend == 'cuda' and NvencCudaEncoder is None:
         raise ImportError(
-            "backend='cuda' requires NvencCudaEncoder. Install cuda-python: pip install cuda-python"
+            "backend='cuda' requires the CUDA Python bindings: pip install 'framepump[cuda]'"
         )
     if backend == 'glx' and NvencEncoder is None:
         raise ImportError(

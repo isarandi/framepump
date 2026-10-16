@@ -211,7 +211,10 @@ def test_output_chroma_format(tmp_path, jpeg_subsampling, chroma, expected_pix_f
     write_video(out_path, jpegs, chroma=chroma)
     with av.open(str(out_path)) as container:
         stream = container.streams.video[0]
-        assert stream.codec_context.pix_fmt in (expected_pix_fmt, expected_pix_fmt.replace('yuv', 'yuvj'))
+        assert stream.codec_context.pix_fmt in (
+            expected_pix_fmt,
+            expected_pix_fmt.replace('yuv', 'yuvj'),
+        )
 
 
 @needs_gpu

@@ -217,8 +217,6 @@ gpu_only = pytest.mark.skipif(not _gpu_available(), reason='Requires NVIDIA GPU'
 gl_only = pytest.mark.skipif(not _nvenc_gl_available(), reason='Requires NVENC + GL')
 
 
-
-
 def write_gl_video(gl_context, out, n=30, bframes=2, audio_source_path=None):
     from framepump import EncoderConfig, GLVideoWriter
 

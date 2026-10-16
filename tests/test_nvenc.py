@@ -86,7 +86,6 @@ class TestGLVideoWriterImport:
         assert hasattr(GLVideoWriter, '__exit__')
 
 
-
 @pytest.mark.skipif(not NVENC_AVAILABLE, reason='Requires NVIDIA GPU with NVENC support')
 class TestNvencEncoder:
     """Tests that require actual NVENC hardware."""

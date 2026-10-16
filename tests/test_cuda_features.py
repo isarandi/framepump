@@ -38,9 +38,9 @@ def smooth_video(tmp_path_factory):
     """Smooth gradients with a per-frame brightness shift (no sharp edges)."""
     path = tmp_path_factory.mktemp('cuda_feat') / 'smooth.mp4'
     yy, xx = np.mgrid[0:240, 0:320]
-    base = np.stack(
-        [xx * 255 // 319, yy * 255 // 239, (xx + yy) * 255 // 558], axis=-1
-    ).astype(np.int16)
+    base = np.stack([xx * 255 // 319, yy * 255 // 239, (xx + yy) * 255 // 558], axis=-1).astype(
+        np.int16
+    )
     with VideoWriter(str(path), fps=30) as w:
         for i in range(12):
             w.append_data(np.clip(base + i * 3, 0, 255).astype(np.uint8))
@@ -70,9 +70,9 @@ class TestResized:
         cpu = VideoFrames(smooth_video).resized((120, 160))[5].astype(np.int32)
         gpu = _np(_cuda_frames(smooth_video).resized((120, 160))[5]).astype(np.int32)
         diff = np.abs(cpu - gpu)
-        assert diff.mean() < 3 and np.percentile(diff, 99) < 10, (
-            f'mean {diff.mean():.2f}, p99 {np.percentile(diff, 99):.1f}'
-        )
+        assert (
+            diff.mean() < 3 and np.percentile(diff, 99) < 10
+        ), f'mean {diff.mean():.2f}, p99 {np.percentile(diff, 99):.1f}'
 
     def test_upscale_close_to_cpu(self, smooth_video):
         _require_cuda()
@@ -186,9 +186,13 @@ class TestGammaCorrectResize:
 
     def test_dtypes_and_ranges(self, smooth_video):
         _require_cuda()
-        u16 = _np(_cuda_frames(smooth_video, dtype=np.uint16).resized((120, 160), gamma_correct=True)[0])
+        u16 = _np(
+            _cuda_frames(smooth_video, dtype=np.uint16).resized((120, 160), gamma_correct=True)[0]
+        )
         assert u16.dtype == np.uint16 and u16.shape == (120, 160, 3) and u16.max() > 255
-        f32 = _np(_cuda_frames(smooth_video, dtype=np.float32).resized((120, 160), gamma_correct=True)[0])
+        f32 = _np(
+            _cuda_frames(smooth_video, dtype=np.float32).resized((120, 160), gamma_correct=True)[0]
+        )
         assert f32.dtype == np.float32 and 0.0 <= f32.min() and f32.max() <= 1.0
 
     def test_hdr_transfer_rejected(self, smooth_video):
@@ -433,7 +437,11 @@ class TestBatched:
         torch = _require_cuda()
         v = _cuda_frames(smooth_video)
         batches = [torch.from_dlpack(b) for b in v.batched(5)]  # no clone
-        assert [tuple(b.shape) for b in batches] == [(5, 240, 320, 3), (5, 240, 320, 3), (2, 240, 320, 3)]
+        assert [tuple(b.shape) for b in batches] == [
+            (5, 240, 320, 3),
+            (5, 240, 320, 3),
+            (2, 240, 320, 3),
+        ]
         flat = torch.cat(batches)
         for i in range(12):
             assert torch.equal(flat[i], torch.from_dlpack(v[i])), f'frame {i}'

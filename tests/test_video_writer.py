@@ -405,7 +405,9 @@ class TestPixelRoundtrip:
         frame = make_quadrant_frame_uint8(size=256)  # NVENC needs larger frames
 
         # Create headless OpenGL context and texture
-        ctx = moderngl.create_standalone_context(backend=None if os.environ.get('DISPLAY') else 'egl')
+        ctx = moderngl.create_standalone_context(
+            backend=None if os.environ.get('DISPLAY') else 'egl'
+        )
         try:
             texture = ctx.texture((256, 256), 3, frame.tobytes())
 
@@ -456,7 +458,9 @@ class TestPixelRoundtrip:
 
         video_path = tmp_path / 'gl_small.mp4'
 
-        ctx = moderngl.create_standalone_context(backend=None if os.environ.get('DISPLAY') else 'egl')
+        ctx = moderngl.create_standalone_context(
+            backend=None if os.environ.get('DISPLAY') else 'egl'
+        )
         try:
             # 64x64 is too small for NVENC
             texture = ctx.texture((64, 64), 3, np.zeros((64, 64, 3), dtype=np.uint8).tobytes())
@@ -495,7 +499,9 @@ class TestPixelRoundtrip:
         frame = make_quadrant_frame_uint8(size=256)
 
         # Use default backend which will be X11/GLX when DISPLAY is set
-        ctx = moderngl.create_standalone_context(backend=None if os.environ.get('DISPLAY') else 'egl')
+        ctx = moderngl.create_standalone_context(
+            backend=None if os.environ.get('DISPLAY') else 'egl'
+        )
         try:
             texture = ctx.texture((256, 256), 3, frame.tobytes())
 

@@ -4,7 +4,6 @@ import ctypes
 from ctypes import c_int, c_void_p, c_size_t, c_uint, POINTER, Structure
 
 
-
 def _load_nvjpeg():
     """Load libnvjpeg: from the nvidia-nvjpeg wheel, conda or the system CUDA toolkit.
 

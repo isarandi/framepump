@@ -775,7 +775,9 @@ def rgb16_to_float01(
     status = _nppidei.nppiConvert_16u32f_C3R_Ctx(src_ptr, src_pitch, dst_ptr, dst_pitch, size, ctx)
     _check(status, 'Convert 16u32f C3R')
     inv = 1.0 / 65535.0
-    status = _nppial.nppiMulC_32f_C3IR_Ctx((c_float * 3)(inv, inv, inv), dst_ptr, dst_pitch, size, ctx)
+    status = _nppial.nppiMulC_32f_C3IR_Ctx(
+        (c_float * 3)(inv, inv, inv), dst_ptr, dst_pitch, size, ctx
+    )
     _check(status, 'MulC 32f C3IR')
 
 

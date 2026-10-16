@@ -345,7 +345,6 @@ class _NvDecSession:
 # ── Public class ─────────────────────────────────────────────────────
 
 
-
 def _plane_layouts(frame, num_planes: int, min_row_bytes: int, height: int) -> list:
     """Get (device pointer, row pitch in bytes) for each plane of a decoded frame.
 

@@ -34,8 +34,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-
-
 def expected_red(i):
     return (i * 37) % 200 + 20
 

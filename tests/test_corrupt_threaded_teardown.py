@@ -16,6 +16,7 @@ FRAMEPUMP_CORRUPT_MPEG4, or a known sample path) and is skipped where that is
 unavailable. It is sensitive there: with _flush_decoder disabled the scenario
 hangs. The scenario runs in a subprocess with a timeout so a regression fails
 instead of hanging the suite."""
+
 import os
 import subprocess
 import sys
@@ -25,7 +26,7 @@ import pytest
 
 DEFAULT_SAMPLE = '/data/freeman/videos/20221012_ebbdbef707_subj19/vframes/c08.mp4'
 
-SCENARIO = textwrap.dedent('''
+SCENARIO = textwrap.dedent("""
     import gc, sys
     import av
     av.logging.set_level(av.logging.ERROR)  # the trigger (torchvision does this at import)
@@ -45,7 +46,7 @@ SCENARIO = textwrap.dedent('''
     del vf
     gc.collect()
     print('freed OK', flush=True)
-''')
+""")
 
 
 @pytest.mark.timeout(240)
@@ -54,9 +55,13 @@ def test_indexed_reads_on_damaged_mpeg4_do_not_hang():
     if not os.path.exists(path):
         pytest.skip(f'no damaged MPEG-4 sample at {path} (set FRAMEPUMP_CORRUPT_MPEG4)')
     try:
-        r = subprocess.run([sys.executable, '-c', SCENARIO, path], capture_output=True, text=True, timeout=150)
+        r = subprocess.run(
+            [sys.executable, '-c', SCENARIO, path], capture_output=True, text=True, timeout=150
+        )
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b'').decode()
-        pytest.fail(f'HANG: frame-threaded decoder teardown deadlock regression. stdout so far: {out}')
+        pytest.fail(
+            f'HANG: frame-threaded decoder teardown deadlock regression. stdout so far: {out}'
+        )
     assert r.returncode == 0, r.stderr[-2000:]
     assert 'freed OK' in r.stdout, r.stdout

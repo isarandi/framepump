@@ -45,7 +45,7 @@ def _run_isolated(code: str, timeout: float = 180.0) -> None:
     )
 
 
-_CONSUME_IN_WORKER = f'''
+_CONSUME_IN_WORKER = f"""
 import threading, sys
 import torch
 
@@ -72,7 +72,7 @@ t = threading.Thread(target=consume)
 t.start()
 t.join(timeout=120)
 sys.exit(2 if t.is_alive() else (1 if failures else 0))
-'''
+"""
 
 
 class TestWorkerThreadDecoding:
@@ -100,7 +100,7 @@ class TestWorkerThreadDecoding:
         never touches CUDA itself — the frame proxy must supply the context."""
         _require_torch_cuda()
         pytest.importorskip('PyNvVideoCodec')
-        _run_isolated(f'''
+        _run_isolated(f"""
 import threading, sys
 import torch
 import framepump
@@ -126,7 +126,7 @@ t = threading.Thread(target=advance)
 t.start()
 t.join(timeout=120)
 sys.exit(2 if t.is_alive() else (1 if failures else 0))
-''')
+""")
 
 
 class TestCleanProcessExit:
@@ -138,7 +138,7 @@ class TestCleanProcessExit:
         """
         _require_torch_cuda()
         pytest.importorskip('torchvision')
-        code = f'''
+        code = f"""
 import torchvision
 import numpy as np
 from framepump import VideoFrames
@@ -153,7 +153,7 @@ n = len(v)
 assert n == 24, n
 count = sum(1 for _ in v)
 assert count == n, (count, n)
-'''
+"""
         try:
             proc = subprocess.run(
                 [sys.executable, '-c', code], capture_output=True, text=True, timeout=180

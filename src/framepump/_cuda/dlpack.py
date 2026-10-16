@@ -19,6 +19,7 @@ from cuda.bindings import driver
 
 from .compat import cuda_ctx_pushed
 
+
 class _GpuRgbBuffer:
     """DLPack-compatible wrapper around a GPU-resident packed uint16 RGB buffer.
 

@@ -42,6 +42,7 @@ needs_gpu = pytest.mark.skipif(
 
 # PIL subsampling codes
 PIL_444 = 0
+PIL_422 = 1  # the MJPEG format of typical UVC webcams
 PIL_420 = 2
 
 
@@ -93,6 +94,8 @@ CHROMA_CASES = [
     pytest.param(PIL_444, '420', id='444-to-420'),
     pytest.param(PIL_444, '422', id='444-to-422'),
     pytest.param(PIL_444, None, id='444-native'),
+    pytest.param(PIL_422, None, id='422-native'),
+    pytest.param(PIL_422, '420', id='422-to-420'),
 ]
 
 
@@ -186,6 +189,81 @@ def test_unknown_attribute_still_raises_attribute_error():
 
     with pytest.raises(AttributeError, match='no attribute'):
         framepump.NoSuchThing
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    'jpeg_subsampling,chroma,expected_pix_fmt',
+    [
+        pytest.param(PIL_422, None, 'yuv422p', id='422-native'),
+        pytest.param(PIL_422, '444', 'yuv422p', id='422-never-upsampled'),
+        pytest.param(PIL_422, '420', 'yuv420p', id='422-to-420'),
+        pytest.param(PIL_444, '422', 'yuv422p', id='444-to-422'),
+        pytest.param(PIL_420, '444', 'yuv420p', id='420-never-upsampled'),
+    ],
+)
+def test_output_chroma_format(tmp_path, jpeg_subsampling, chroma, expected_pix_fmt):
+    """The encoded stream keeps the JPEG's chroma, or the requested lower one."""
+    import av
+
+    out_path = tmp_path / 'out.mp4'
+    jpegs = [make_jpeg(320, 240, i, jpeg_subsampling) for i in range(3)]
+    write_video(out_path, jpegs, chroma=chroma)
+    with av.open(str(out_path)) as container:
+        stream = container.streams.video[0]
+        assert stream.codec_context.pix_fmt in (expected_pix_fmt, expected_pix_fmt.replace('yuv', 'yuvj'))
+
+
+@needs_gpu
+def test_native_422_keeps_horizontal_chroma_detail(tmp_path):
+    """Native 4:2:2 must keep full vertical chroma resolution, which 4:2:0 halves.
+
+    Rows alternating between two saturated colors (same luma neighborhood, opposite
+    chroma) survive 4:2:2 but are averaged to grey by 4:2:0.
+    """
+    from PIL import Image
+
+    width, height = 320, 240
+    img = np.zeros((height, width, 3), np.uint8)
+    img[0::2] = (255, 0, 0)
+    img[1::2] = (0, 0, 255)
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, format='JPEG', quality=100, subsampling=PIL_422)
+    jpegs = [buf.getvalue()] * 3
+    errors = {}
+    for chroma in (None, '420'):
+        out_path = tmp_path / f'{chroma}.mp4'
+        write_video(out_path, jpegs, chroma=chroma, bframes=0)
+        frame = decode_video(out_path)[0].astype(np.int16)
+        errors[chroma] = float(np.abs(frame - img.astype(np.int16)).mean())
+    assert errors[None] < errors['420'] / 3, errors
+
+
+@needs_gpu
+@pytest.mark.parametrize('chroma', [None, '420', '444'])
+def test_grayscale_jpeg(tmp_path, chroma):
+    """Grayscale JPEGs become 4:2:0 video whose luma matches and whose color is neutral."""
+    import av
+    from PIL import Image
+
+    width, height, n_frames = 320, 240, 4
+    grays = [frame_rgb(width, height, i)[..., 0] for i in range(n_frames)]
+    jpegs = []
+    for g in grays:
+        buf = io.BytesIO()
+        Image.fromarray(g, 'L').save(buf, format='JPEG', quality=95)
+        jpegs.append(buf.getvalue())
+    out_path = tmp_path / 'gray.mp4'
+    write_video(out_path, jpegs, chroma=chroma)
+    with av.open(str(out_path)) as container:
+        assert container.streams.video[0].codec_context.pix_fmt in ('yuv420p', 'yuvj420p')
+    frames = decode_video(out_path)
+    assert len(frames) == n_frames
+    for frame, g in zip(frames, grays):
+        rgb = frame.astype(np.int16)
+        assert np.abs(rgb - g.astype(np.int16)[..., None]).mean() < 3.0
+        # neutral chroma: R, G and B equal up to coding noise
+        assert np.abs(rgb[..., 0] - rgb[..., 2]).mean() < 1.0
 
 
 def test_invalid_chroma_rejected():

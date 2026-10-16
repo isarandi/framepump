@@ -355,12 +355,17 @@ The decoder uses a phased pipeline for throughput: while frame N is being
 encoded by NVENC, frame N+1's JPEG is being decoded by nvJPEG. Two GPU
 buffers alternate (ping-pong) so decode and encode overlap.
 
-Supports both 4:2:0 and 4:4:4 chroma subsampling — auto-detected from the
-first JPEG frame, or set explicitly:
+Each JPEG's chroma subsampling is kept: 4:2:0, 4:2:2 (the MJPEG format of
+typical UVC webcams) and 4:4:4 are all encoded natively, detected from the first
+frame. 4:2:2 and 4:4:4 use the H.264 High 4:2:2 / High 4:4:4 profiles, which need
+an NVENC that supports them and which not every player can play. Grayscale
+JPEGs become 4:2:0 video with neutral chroma. ``chroma`` requests less chroma
+resolution, resized on the GPU (it never upsamples):
 
 .. code-block:: python
 
-    writer = NvJpegVideoWriter('output.mp4', fps=30, gpu=0, chroma='444')
+    # 4:2:2 webcam MJPEG to 4:2:0 H.264, playable everywhere
+    writer = NvJpegVideoWriter('output.mp4', fps=30, gpu=0, chroma='420')
 
 **Pipeline:**
 

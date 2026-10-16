@@ -1,9 +1,17 @@
 """CUDA video writer with GPU JPEG decoding and NVENC encoding.
 
-Pipeline for 4:2:0 JPEGs: JPEG → nvJPEG → NVENC (zero-copy, IYUV format)
-Pipeline for 4:4:4 JPEGs: JPEG → nvJPEG → NVENC (zero-copy, YUV444 format)
+Each JPEG chroma subsampling is encoded natively by default:
 
-nvJPEG decodes directly into NVENC-registered device buffer - no GPU copies.
+- 4:2:0: nvJPEG decodes straight into an NVENC IYUV buffer (zero-copy)
+- 4:4:4: nvJPEG decodes straight into an NVENC YUV444 buffer (zero-copy)
+- 4:2:2: nvJPEG decodes the half-width chroma planes, which are packed into
+  the interleaved UV plane of an NVENC NV16 buffer (NVENC has no planar 4:2:2
+  input format); encoded as H.264 High 4:2:2
+- grayscale: nvJPEG decodes the luma straight into an NVENC IYUV buffer whose
+  chroma planes hold the neutral value (a gray image is exactly that in YUV;
+  NVENC has no 4:0:0 input format)
+
+``chroma`` can request less chroma resolution than the source has (GPU resize).
 """
 
 from __future__ import annotations
@@ -36,7 +44,7 @@ from .nvenc.bindings import (
 )
 from .nvenc.exceptions import NvencError
 from .nvjpeg import NvjpegPhasedDecoder
-from .nvjpeg.bindings import NVJPEG_CSS_420, NVJPEG_CSS_444
+from .nvjpeg.bindings import NVJPEG_CSS_420, NVJPEG_CSS_422, NVJPEG_CSS_444, NVJPEG_CSS_GRAY
 from .video_writing import AbstractVideoWriter, SequenceContext, VideoOutput
 
 PathLike = Union[str, Path]
@@ -268,8 +276,11 @@ class NvJpegVideoWriter(AbstractVideoWriter[bytes], AbstractContextManager['NvJp
     """Zero-copy JPEG to video writer using nvJPEG decoder and NVENC encoder.
 
     Decodes JPEG to YUV on GPU with nvJPEG and encodes with NVENC - all
-    without CPU-GPU data transfers. 4:2:0 input is encoded as 4:2:0 and
-    4:4:4 input as 4:4:4, unless ``chroma`` requests downsampling.
+    without CPU-GPU data transfers. Each JPEG is encoded with its own chroma
+    subsampling (4:2:0, 4:2:2 or 4:4:4), unless ``chroma`` requests less;
+    grayscale JPEGs become 4:2:0 video with neutral chroma.
+    4:2:2 and 4:4:4 output use the H.264 High 4:2:2 / High 4:4:4 profiles, which
+    need an NVENC that supports them and are not playable by every player.
 
     Ending a sequence to which no frame was written is a no-op: no output
     file is created. ``start_sequence`` returns a context manager that
@@ -301,10 +312,11 @@ class NvJpegVideoWriter(AbstractVideoWriter[bytes], AbstractContextManager['NvJp
             queue_size: Unused, present for API compatibility with VideoWriter.
             encoder_config: Encoder configuration (crf, preset, bframes, gop).
             gpu: CUDA device ordinal (default 0).
-            chroma: Target chroma subsampling for 4:4:4 JPEG input: '420' or
-                '422' downsample the chroma planes before encoding; None or
-                '444' keep the source subsampling (4:2:0 input is always
-                encoded as 4:2:0, 4:4:4 input as 4:4:4).
+            chroma: Upper bound on the output chroma subsampling: '420', '422'
+                or '444'. Chroma is downsampled on the GPU when the JPEG has more
+                (e.g. '420' for 4:2:2 webcam MJPEG, for the widest player
+                compatibility) and never upsampled; None (default) keeps the
+                JPEG's own subsampling.
         """
         if chroma not in (None, '420', '422', '444'):
             raise ValueError(f"chroma must be None, '420', '422' or '444', got {chroma!r}")
@@ -443,62 +455,100 @@ class _EncodeBufferLayout:
 
 @dataclass(frozen=True)
 class _ScratchLayout:
-    """Scratch buffer layout for 4:4:4 → 4:2:0/4:2:2 chroma downsampling.
+    """Scratch planes for chroma that cannot be decoded straight into the NVENC buffer.
 
-    Holds the full-resolution U/V planes decoded from the JPEG and, for the
-    4:2:2 path, staging planes for the half-width resize before NV16
-    interleaving. Extents here are display-sized on purpose: this buffer is
-    never registered with NVENC.
+    Used when the output chroma differs from the JPEG's (GPU resize) and for 4:2:2
+    output, whose NV16 buffer has an interleaved UV plane that nvJPEG cannot write.
+    ``src_u``/``src_v`` receive nvJPEG's planar chroma at the JPEG's resolution;
+    ``staged_u``/``staged_v`` hold the half-width resize of 4:4:4 chroma before NV16
+    interleaving. Extents here are display-sized on purpose: this buffer is never
+    registered with NVENC.
     """
 
     size: int
-    full_u: _Plane
-    full_v: _Plane
-    resized_u: _Plane | None
-    resized_v: _Plane | None
-    chroma_width: int
+    src_u: _Plane
+    src_v: _Plane
+    src_width: int  # decoded chroma plane extents (the JPEG's subsampling)
+    src_height: int
+    staged_u: _Plane | None
+    staged_v: _Plane | None
+    chroma_width: int  # output chroma plane extents
     chroma_height: int
 
 
-def _build_encode_layout(
-    enc_width: int, enc_height: int, subsampling: int, downsample_to: str | None
-) -> _EncodeBufferLayout:
+_CSS_TO_CHROMA = {
+    NVJPEG_CSS_420: '420',
+    NVJPEG_CSS_422: '422',
+    NVJPEG_CSS_444: '444',
+    NVJPEG_CSS_GRAY: 'gray',
+}
+_CHROMA_RANK = {'420': 0, '422': 1, '444': 2}
+
+
+def _resolve_out_chroma(subsampling: int, target: str | None) -> str:
+    """Output chroma: the JPEG's own, or the requested one if that has less."""
+    if subsampling not in _CSS_TO_CHROMA:
+        raise NvencError(
+            f'Unsupported JPEG chroma subsampling {_css_name(subsampling)} '
+            f'(supported: 4:2:0, 4:2:2, 4:4:4, grayscale)'
+        )
+    native = _CSS_TO_CHROMA[subsampling]
+    if native == 'gray':
+        # Neutral chroma in the smallest format; requesting less chroma changes nothing
+        return '420'
+    if target is None or _CHROMA_RANK[target] >= _CHROMA_RANK[native]:
+        return native
+    return target
+
+
+def _align256(n: int) -> int:
+    return ((n + 255) // 256) * 256
+
+
+def _build_encode_layout(enc_width: int, enc_height: int, out_chroma: str) -> _EncodeBufferLayout:
     """Compute the NVENC input buffer layout from the padded encode dimensions."""
     # Align pitch to 256 bytes for optimal GPU access
-    pitch = ((enc_width + 255) // 256) * 256
+    pitch = _align256(enc_width)
     y = _Plane(0, pitch, enc_height)
-    if subsampling == NVJPEG_CSS_420 or downsample_to == '420':
+    if out_chroma == '420':
         # IYUV: UV pitch must be exactly Y pitch / 2 (NVENC infers it from Y)
         uv_pitch = pitch // 2
         u = _Plane(y.end, uv_pitch, enc_height // 2)
         v = _Plane(u.end, uv_pitch, enc_height // 2)
         return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_IYUV, v.end, y, u, v)
-    if downsample_to == '422':
+    if out_chroma == '422':
         # NV16: interleaved UV plane with the same pitch and rows as Y
         uv = _Plane(y.end, pitch, enc_height)
         return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_NV16, uv.end, y, uv, None)
-    if subsampling == NVJPEG_CSS_444:
-        u = _Plane(y.end, pitch, enc_height)
-        v = _Plane(u.end, pitch, enc_height)
-        return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_YUV444, v.end, y, u, v)
-    raise NvencError(f'Unsupported chroma subsampling: {_css_name(subsampling)}')
+    u = _Plane(y.end, pitch, enc_height)
+    v = _Plane(u.end, pitch, enc_height)
+    return _EncodeBufferLayout(NV_ENC_BUFFER_FORMAT_YUV444, v.end, y, u, v)
 
 
 def _build_scratch_layout(
-    width: int, height: int, y_pitch: int, downsample_to: str
-) -> _ScratchLayout:
-    """Compute the downsample scratch layout from the display dimensions."""
-    full_u = _Plane(0, y_pitch, height)
-    full_v = _Plane(full_u.end, y_pitch, height)
-    chroma_width = width // 2
-    if downsample_to == '422':
-        half_pitch = ((chroma_width + 255) // 256) * 256
-        resized_u = _Plane(full_v.end, half_pitch, height)
-        resized_v = _Plane(resized_u.end, half_pitch, height)
-        return _ScratchLayout(
-            resized_v.end, full_u, full_v, resized_u, resized_v, chroma_width, height
-        )
-    return _ScratchLayout(full_v.end, full_u, full_v, None, None, chroma_width, height // 2)
+    width: int, height: int, in_chroma: str, out_chroma: str
+) -> _ScratchLayout | None:
+    """Scratch layout from the display dimensions, or None if nvJPEG can decode in place."""
+    if in_chroma == 'gray' or (in_chroma == out_chroma and out_chroma != '422'):
+        return None
+    src_width = width if in_chroma == '444' else (width + 1) // 2
+    src_height = height if in_chroma != '420' else (height + 1) // 2
+    src_pitch = _align256(src_width)
+    src_u = _Plane(0, src_pitch, src_height)
+    src_v = _Plane(src_u.end, src_pitch, src_height)
+    chroma_width = width // 2 if out_chroma != '444' else width
+    chroma_height = height // 2 if out_chroma == '420' else height
+    if out_chroma == '422' and in_chroma == '444':
+        staged_pitch = _align256(chroma_width)
+        staged_u = _Plane(src_v.end, staged_pitch, chroma_height)
+        staged_v = _Plane(staged_u.end, staged_pitch, chroma_height)
+        size = staged_v.end
+    else:
+        staged_u = staged_v = None
+        size = src_v.end
+    return _ScratchLayout(
+        size, src_u, src_v, src_width, src_height, staged_u, staged_v, chroma_width, chroma_height
+    )
 
 
 _CSS_NAMES = {0: '4:4:4', 1: '4:2:2', 2: '4:2:0', 3: '4:4:0', 4: '4:1:1', 5: '4:1:0', 6: 'gray'}
@@ -511,7 +561,7 @@ def _css_name(subsampling: int) -> str:
 class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
     """Internal writer: nvJPEG decode (YUV) → NVENC encode via device pointer.
 
-    Supports both 4:2:0 (IYUV) and 4:4:4 (YUV444) chroma subsampling.
+    Supports 4:2:0 (IYUV), 4:2:2 (NV16) and 4:4:4 (YUV444) chroma subsampling.
     """
 
     def __init__(
@@ -558,10 +608,11 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._registered: list = []  # NVENC registered-resource handles
         self._num_yuv_buffers = 0  # Set from the session's ring size
         self._layout: _EncodeBufferLayout | None = None  # NVENC input buffer layout
-        self._scratch: _ScratchLayout | None = None  # Downsample scratch layout
-        self._subsampling = None  # NVJPEG_CSS_420 or NVJPEG_CSS_444
-        self._downsample_to = None  # '420' or '422' when downsampling from 4:4:4
-        self._uv_scratch: int = 0  # Scratch buffer for full-res U/V before downsample
+        self._scratch: _ScratchLayout | None = None  # Chroma scratch layout, if needed
+        self._subsampling = None  # NVJPEG_CSS_* of the first frame (all must match)
+        self._in_chroma = None  # '420', '422', '444' or 'gray': the JPEGs' chroma
+        self._out_chroma = None  # '420', '422' or '444': the encoded chroma
+        self._uv_scratch: int = 0  # Scratch buffer for decoded U/V that need resize/packing
         self._npp_ctx = None  # NppStreamContext for resize calls
         self._current_buffer = 0  # Which buffer to decode into (round-robin)
 
@@ -612,11 +663,8 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._width = width
         self._height = height
         self._subsampling = subsampling
-        # Determine if we need to downsample from 4:4:4
-        if subsampling == NVJPEG_CSS_444 and self._target_chroma in ('420', '422'):
-            self._downsample_to = self._target_chroma
-        else:
-            self._downsample_to = None
+        self._out_chroma = _resolve_out_chroma(subsampling, self._target_chroma)
+        self._in_chroma = _CSS_TO_CHROMA[subsampling]
 
         # H.264 macroblocks are 16x16. Pad encode dimensions so NVENC doesn't
         # silently crop. We rewrite the SPS to add frame_cropping_rect so
@@ -625,12 +673,9 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         self._encode_height = ((height + 15) // 16) * 16
 
         self._layout = _build_encode_layout(
-            self._encode_width, self._encode_height, subsampling, self._downsample_to
+            self._encode_width, self._encode_height, self._out_chroma
         )
-        if self._downsample_to:
-            self._scratch = _build_scratch_layout(
-                width, height, self._layout.y.pitch, self._downsample_to
-            )
+        self._scratch = _build_scratch_layout(width, height, self._in_chroma, self._out_chroma)
 
     def _alloc_buffers(self) -> None:
         """Allocate the YUV input ring plus downsample scratch space.
@@ -649,7 +694,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
             self._yuv_buffers.append(int(devptr))
             self._memset_planes(int(devptr), self._layout)
 
-        if self._downsample_to:
+        if self._scratch is not None:
             # Scratch shared across ring buffers (decode stream is serialized)
             err, devptr = driver.cuMemAlloc(self._scratch.size)
             if err != driver.CUresult.CUDA_SUCCESS:
@@ -681,12 +726,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
 
     def _init_session(self) -> None:
         """Open the NVENC encode session, customized for JPEG-decoded YUV input."""
-        if self._downsample_to == '422':
-            chroma_idc = 2
-        elif self._subsampling == NVJPEG_CSS_444 and not self._downsample_to:
-            chroma_idc = 3
-        else:
-            chroma_idc = 1
+        chroma_idc = {'420': 1, '422': 2, '444': 3}[self._out_chroma]
         self._compute_sps_crop(chroma_idc)
 
         qp = self._encoder_config.crf
@@ -769,12 +809,7 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
 
     def _open(self) -> None:
         """Create the output muxer, once the frame geometry is known."""
-        if self._downsample_to == '422':
-            pix_fmt = 'yuv422p'
-        elif self._subsampling == NVJPEG_CSS_444 and not self._downsample_to:
-            pix_fmt = 'yuv444p'
-        else:
-            pix_fmt = 'yuv420p'
+        pix_fmt = f'yuv{self._out_chroma}p'
 
         self._muxer = H264PassthroughMuxer(
             self._video_output,
@@ -886,67 +921,11 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
         # Transfer from pinned buffer to device (async)
         self._jpeg_decoder.decode_transfer(stream)
 
-        if self._downsample_to:
-            # Decode 4:4:4 JPEG, then downsample U/V chroma.
-            # Y goes directly into the encode buffer; U/V go to scratch, then resize.
-            scratch = self._scratch
-            self._jpeg_decoder.decode_device(
-                base + layout.y.offset,
-                self._uv_scratch + scratch.full_u.offset,
-                self._uv_scratch + scratch.full_v.offset,
-                layout.y.pitch,
-                scratch.full_u.pitch,
-                scratch.full_v.pitch,
-                stream,
-            )
-            self._npp_ctx.hStream = stream
-            from .npp_bindings import resize_plane_8u
-
-            if self._downsample_to == '420':
-                # Half width, half height, straight into the IYUV chroma planes
-                for src, dst in ((scratch.full_u, layout.u), (scratch.full_v, layout.v)):
-                    resize_plane_8u(
-                        self._uv_scratch + src.offset,
-                        src.pitch,
-                        self._width,
-                        self._height,
-                        base + dst.offset,
-                        dst.pitch,
-                        scratch.chroma_width,
-                        scratch.chroma_height,
-                        ctx=self._npp_ctx,
-                    )
-            else:  # '422': half width, full height, staged then interleaved into NV16
-                for src, dst in (
-                    (scratch.full_u, scratch.resized_u),
-                    (scratch.full_v, scratch.resized_v),
-                ):
-                    resize_plane_8u(
-                        self._uv_scratch + src.offset,
-                        src.pitch,
-                        self._width,
-                        self._height,
-                        self._uv_scratch + dst.offset,
-                        dst.pitch,
-                        scratch.chroma_width,
-                        scratch.chroma_height,
-                        ctx=self._npp_ctx,
-                    )
-                from ._cuda.kernels import interleave_uv
-
-                interleave_uv(
-                    self._uv_scratch + scratch.resized_u.offset,
-                    scratch.resized_u.pitch,
-                    self._uv_scratch + scratch.resized_v.offset,
-                    scratch.resized_v.pitch,
-                    base + layout.u.offset,
-                    layout.u.pitch,
-                    scratch.chroma_width,
-                    scratch.chroma_height,
-                    stream=stream,
-                )
-        else:
-            # Native 4:2:0 or 4:4:4: decode straight into the encode buffer planes
+        scratch = self._scratch
+        if scratch is None:
+            # Output chroma = JPEG chroma, planar (4:2:0, 4:4:4): decode straight into
+            # the encode buffer planes. Grayscale too: nvJPEG writes only the luma, so
+            # the chroma planes keep the neutral 128 they were initialized with.
             self._jpeg_decoder.decode_device(
                 base + layout.y.offset,
                 base + layout.u.offset,
@@ -956,6 +935,63 @@ class _CudaSequenceWriter(AbstractContextManager['_CudaSequenceWriter']):
                 layout.v.pitch,
                 stream,
             )
+            return
+
+        # Y goes straight into the encode buffer; U/V to scratch at the JPEG's resolution
+        self._jpeg_decoder.decode_device(
+            base + layout.y.offset,
+            self._uv_scratch + scratch.src_u.offset,
+            self._uv_scratch + scratch.src_v.offset,
+            layout.y.pitch,
+            scratch.src_u.pitch,
+            scratch.src_v.pitch,
+            stream,
+        )
+        if self._out_chroma == '420':
+            # Downsample (4:4:4 both axes, 4:2:2 vertically) into the IYUV chroma planes
+            for src, dst in ((scratch.src_u, layout.u), (scratch.src_v, layout.v)):
+                self._resize_chroma(src, scratch, base + dst.offset, dst.pitch, stream)
+            return
+
+        # 4:2:2 output: NV16 wants U and V interleaved in one plane
+        if self._in_chroma == '444':
+            for src, dst in ((scratch.src_u, scratch.staged_u), (scratch.src_v, scratch.staged_v)):
+                self._resize_chroma(src, scratch, self._uv_scratch + dst.offset, dst.pitch, stream)
+            u, v = scratch.staged_u, scratch.staged_v
+        else:
+            u, v = scratch.src_u, scratch.src_v  # native 4:2:2: no resampling, only packing
+        from ._cuda.kernels import interleave_uv
+
+        interleave_uv(
+            self._uv_scratch + u.offset,
+            u.pitch,
+            self._uv_scratch + v.offset,
+            v.pitch,
+            base + layout.u.offset,
+            layout.u.pitch,
+            scratch.chroma_width,
+            scratch.chroma_height,
+            stream=stream,
+        )
+
+    def _resize_chroma(
+        self, src: _Plane, scratch: _ScratchLayout, dst_ptr: int, dst_pitch: int, stream: int
+    ) -> None:
+        """Resize one decoded chroma plane to the output chroma extents (NPP, on stream)."""
+        from .npp_bindings import resize_plane_8u
+
+        self._npp_ctx.hStream = stream
+        resize_plane_8u(
+            self._uv_scratch + src.offset,
+            src.pitch,
+            scratch.src_width,
+            scratch.src_height,
+            dst_ptr,
+            dst_pitch,
+            scratch.chroma_width,
+            scratch.chroma_height,
+            ctx=self._npp_ctx,
+        )
 
     def _encode_buffer(self, buf_idx: int) -> None:
         """Submit a decoded YUV buffer to NVENC and mux whatever output is ready."""

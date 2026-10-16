@@ -18,11 +18,12 @@ Installation
 
     pip install framepump
 
-For zero-copy GPU encoding with headless/EGL contexts:
+For the GPU-resident features (``VideoFramesCuda``, ``CameraFrames``,
+``NvJpegVideoWriter``, headless ``GLVideoWriter``) on a machine with an NVIDIA GPU:
 
 .. code-block:: bash
 
-    pip install framepump[nvenc-cuda]
+    pip install 'framepump[cuda]'
 
 Quick Start
 -----------

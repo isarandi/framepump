@@ -50,7 +50,8 @@ def _make_cuda_stub(class_name: str, requirements: str) -> type:
 
     def __init__(self, *args, **kwargs):
         raise ImportError(
-            f'{class_name} requires {requirements}. ' f'Install the CUDA dependencies to use it.'
+            f"{class_name} requires {requirements}: pip install 'framepump[cuda]' "
+            f'(an NVIDIA GPU and driver are needed as well).'
         )
 
     return type(class_name, (), {'__init__': __init__, '__doc__': f'{class_name} (unavailable)'})

@@ -287,8 +287,8 @@ class GLSequenceWriter(AbstractContextManager['GLSequenceWriter']):
         if use_cuda:
             if NvencCudaEncoder is None:
                 raise ImportError(
-                    'The CUDA encode backend requires NvencCudaEncoder. '
-                    'Install cuda-python: pip install cuda-python'
+                    'The CUDA encode backend requires the CUDA Python bindings: '
+                    "pip install 'framepump[cuda]'"
                 )
             # type() rather than isinstance(): True must not count as ordinal 1
             gpu_device = self._gpu if type(self._gpu) is int else None  # noqa: E721

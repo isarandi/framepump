@@ -83,7 +83,7 @@ class NvjpegDecoder:
         if _lib is None:
             raise ImportError(
                 'nvJPEG library not available. '
-                'Ensure libnvjpeg.so is installed (part of CUDA toolkit).'
+                "Install it with pip install 'framepump[cuda]' (or the CUDA toolkit)."
             )
 
         self._cuda_device, self._cuda_ctx = retain_primary_context(gpu)
@@ -295,7 +295,7 @@ class NvjpegPhasedDecoder:
         if _lib is None:
             raise ImportError(
                 'nvJPEG library not available. '
-                'Ensure libnvjpeg.so is installed (part of CUDA toolkit).'
+                "Install it with pip install 'framepump[cuda]' (or the CUDA toolkit)."
             )
         self._handle = nvjpegHandle_t()
         self._decoder = nvjpegJpegDecoder_t()

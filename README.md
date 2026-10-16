@@ -265,7 +265,7 @@ with GLVideoWriter('output.mp4', fps=30) as writer:
 **Requirements:**
 - NVIDIA GPU with NVENC support
 - Linux with NVIDIA driver
-- For headless: `pip install framepump[nvenc-cuda]`
+- For headless: `pip install 'framepump[cuda]'`
 
 See the [NVENC documentation](https://framepump.readthedocs.io/en/latest/explanation/nvenc-zero-copy.html) for details.
 

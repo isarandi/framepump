@@ -3,11 +3,32 @@
 import ctypes
 from ctypes import c_int, c_void_p, c_size_t, c_uint, POINTER, Structure
 
-# Load library
-try:
-    _lib = ctypes.CDLL('libnvjpeg.so')
-except OSError:
-    _lib = None
+
+
+def _load_nvjpeg():
+    """Load libnvjpeg: from the nvidia-nvjpeg wheel, conda or the system CUDA toolkit.
+
+    cuda.pathfinder (part of cuda-python, the framepump[cuda] extra) knows where each
+    of these installs puts the versioned library; without it, fall back to the
+    dynamic loader's search path.
+    """
+    try:
+        from cuda.pathfinder import load_nvidia_dynamic_lib
+
+        path = load_nvidia_dynamic_lib('nvjpeg').abs_path
+        if path:
+            return ctypes.CDLL(path)
+    except Exception:  # cuda-python missing or too old, library not found
+        pass
+    for name in ('libnvjpeg.so', 'libnvjpeg.so.13', 'libnvjpeg.so.12'):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+_lib = _load_nvjpeg()
 
 # Constants
 NVJPEG_MAX_COMPONENT = 4

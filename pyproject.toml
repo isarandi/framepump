@@ -71,8 +71,15 @@ gl = [
     "moderngl",
     "glfw",
 ]
-nvenc-cuda = [
+# Everything the GPU-resident features need: NvJpegVideoWriter, VideoFramesCuda,
+# CameraFrames, headless GLVideoWriter, CudaToGLUploader. All three follow CUDA 13.
+cuda = [
     "cuda-python>=13,<14",  # Pinned to v13 bindings API (cuCtxCreate, cuGLGetDevices signatures)
+    "PyNvVideoCodec>=2",  # NVDEC decoding for VideoFramesCuda and CameraFrames
+    "nvidia-nvjpeg>=13,<14",  # libnvjpeg for NvJpegVideoWriter (found via cuda.pathfinder)
+]
+nvenc-cuda = [  # former name, kept so existing install commands keep working
+    "framepump[cuda]",
 ]
 dev = [
     "framepump[test,lint,docs]",

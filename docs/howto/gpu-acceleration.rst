@@ -269,7 +269,7 @@ OpenGL context must be current on the calling thread.
 
 - **CUDA path** (``backend='cuda'``): GL texture → CUarray via CUDA-GL
   interop → NVENC. Works with EGL contexts and headless setups. Requires
-  ``pip install framepump[nvenc-cuda]``.
+  ``pip install 'framepump[cuda]'``.
 
 The default ``backend='auto'`` picks the CUDA path when the ``DISPLAY``
 environment variable is unset and the GLX path otherwise. That heuristic can
@@ -399,10 +399,10 @@ Requirements
 
 - **GPU decoding** (``gpu=True``): NVIDIA GPU with driver installed; the
   standard PyAV wheels include NVDEC support
-- **VideoFramesCuda**: ``pip install framepump[cuda]`` (requires
-  ``PyNvVideoCodec``)
+- **VideoFramesCuda**, **CameraFrames**: ``pip install 'framepump[cuda]'``
+  (``cuda-python``, ``PyNvVideoCodec``)
 - **GLVideoWriter (GLX)**: NVIDIA GPU, X11 display, ``libnvidia-encode.so``
-- **GLVideoWriter (headless)**: ``pip install framepump[nvenc-cuda]``
+- **GLVideoWriter (headless)**: ``pip install 'framepump[cuda]'``
   (``cuda-python``)
-- **NvJpegVideoWriter**: ``pip install framepump[cuda]`` (``cuda-python``,
-  nvJPEG)
+- **NvJpegVideoWriter**: ``pip install 'framepump[cuda]'`` (``cuda-python``,
+  ``nvidia-nvjpeg``; a CUDA toolkit's nvJPEG is used as well if installed)

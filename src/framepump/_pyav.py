@@ -502,6 +502,7 @@ class PyAVReader:
         if use_threading is None:
             use_threading = self._use_threading
         self._threading_active = use_threading
+        _flush_decoder(self._stream)
         self._container.close()
         if self._is_fileobj:
             self._source.seek(0)
@@ -1006,13 +1007,46 @@ class PyAVReader:
 
     def close(self) -> None:
         """Close the container."""
+        _flush_decoder(self._stream)
         self._container.close()
+
+    def __del__(self) -> None:
+        # Readers dropped without close() (e.g. during exception unwinding)
+        # are freed by the garbage collector; flush first for the same reason
+        # as in close().
+        try:
+            _flush_decoder(self._stream)
+        except Exception:
+            pass
 
     def __enter__(self) -> 'PyAVReader':
         return self
 
     def __exit__(self, *args) -> None:
         self.close()
+
+
+def _flush_decoder(stream) -> None:
+    """Reset the decoder's internal state before the codec context is freed.
+
+    Freeing a frame-threaded decoder right after a mid-stream decode error
+    (e.g. corrupt MPEG-4 macroblocks) can deadlock in ``avcodec_free_context``
+    -> ``ff_frame_thread_free`` -> pthread_cond_wait through a GIL inversion:
+    when PyAV's Python log callback is active (anyone in the process called
+    ``av.logging.set_level(...)``; torchvision does so at import time in
+    ``torchvision/io/video.py``), it takes the GIL for every FFmpeg log
+    message. A damaged stream makes the worker threads emit decoder messages,
+    while the codec context is freed from a Cython dealloc with the GIL held,
+    waiting for those workers. ``avcodec_flush_buffers`` (GIL released) drains
+    the workers first, so the later free has nothing to wait for. It is
+    harmless otherwise, hence unconditional before every close.
+    """
+    try:
+        cc = stream.codec_context
+        if cc is not None:
+            cc.flush_buffers()
+    except Exception:
+        pass
 
 
 @dataclass(slots=True)

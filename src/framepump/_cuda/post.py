@@ -16,7 +16,7 @@ import PyNvVideoCodec as nvc
 from .compat import cuda_ctx_pushed
 from .decode import _plane_layouts
 from .dlpack import _GpuRgbBuffer
-from .kernels import srgb_curve_inplace
+from .kernels import srgb_curve_inplace, sws_yuv2rgb_coeffs, yuv_to_rgb8_sws
 
 
 class _PostProcessor:
@@ -57,22 +57,32 @@ class _PostProcessor:
 
     @property
     def _stage_names(self) -> list[str]:
-        """The post-decode GPU stages, in execution order."""
+        """The post-decode GPU stages, in execution order.
+
+        Modes: ``'yuv_to_rgb8'`` (8-bit sources) starts with ``convert8``,
+        the swscale-exact YUV → RGB8 kernel; ``'yuv_to_rgb16'`` (10-bit
+        sources, 16-bit outputs) with ``convert``, the NPP colour twist to
+        RGB16; ``None`` (10-bit source, uint8 output) takes the decoder's
+        own RGB frames. Everything after that operates on the RGB buffer.
+        """
+        eight = self._npp_mode == 'yuv_to_rgb8'
+        names = ['convert8'] if eight else []
         if self._out_shape is not None and self._gamma_resize:
             # Linear-light resize: to float, linearize, resize, re-encode.
-            names = [] if self._npp_mode is None else ['convert']
+            if self._npp_mode == 'yuv_to_rgb16':
+                names.append('convert')
             names += ['to_f32', 'lin_resize']
             if self._float_dtype is None:
                 names.append('to_uint')
             elif self._float_dtype == np.dtype(np.float16):
                 names.append('f16')
             return names
-        if self._npp_mode is None:
-            names = ['resize8'] if self._out_shape is not None else []
-        else:
-            names = ['convert']
+        if self._npp_mode == 'yuv_to_rgb16' or (eight and self.dtype != np.dtype(np.uint8)):
+            names.append('convert')
             if self._out_shape is not None:
                 names.append('resize16')
+        elif self._out_shape is not None:
+            names.append('resize8')
         if self._float_dtype is not None:
             names.append('f32')
             if self._float_dtype == np.dtype(np.float16):
@@ -91,6 +101,7 @@ class _PostProcessor:
         th, tw = self.imshape
         final_elem = self._final_format[0] // 8
         return {
+            'convert8': w * 3 * h,
             'convert': w * 3 * 2 * h,
             'resize8': tw * 3 * th,
             'resize16': tw * 3 * 2 * th,
@@ -130,10 +141,12 @@ class _PostProcessor:
                     # Build NppStreamContext (uses default stream = 0).
                     npp_ctx = npp_bindings.make_npp_stream_context(self._gpu)
 
-                    # Select color twist matrix.
+                    # Select color twist matrix (16-bit NPP path) and the
+                    # swscale-exact 8-bit constants for the same matrix/range.
                     twist = npp_bindings.make_yuv_to_rgb_twist(
                         self._color_space, full_range=self._range_full
                     )
+                    sws_coeffs = sws_yuv2rgb_coeffs(self._color_space, full_range=self._range_full)
 
                     # One reusable (iteration-shared) buffer per stage.
                     for name in self._stage_names:
@@ -154,6 +167,7 @@ class _PostProcessor:
             self._npp_cuda_ctx = cuda_ctx
             self._npp_bindings = npp_bindings
             self._twist = twist
+            self._sws_coeffs = sws_coeffs
             self._bufs = bufs
             self._npp_ctx = npp_ctx
 
@@ -181,7 +195,7 @@ class _PostProcessor:
         # Remove the lazy-init sentinel (and everything published with it) so
         # the pipeline re-initializes on the next use instead of hitting
         # AttributeError on the freed resources.
-        for attr in ('_npp_ctx', '_npp_bindings', '_twist'):
+        for attr in ('_npp_ctx', '_npp_bindings', '_twist', '_sws_coeffs'):
             if hasattr(self, attr):
                 delattr(self, attr)
 
@@ -217,11 +231,23 @@ class _PostProcessor:
                 cur: tuple[int, int] | None = None  # (ptr, pitch)
                 for i, name in enumerate(stages):
                     dst = final_ptr if (fresh and i == len(stages) - 1) else self._bufs[name]
-                    if name == 'convert':
-                        self._do_convert(frame, dst)
+                    if name == 'convert8':
+                        self._do_convert8(frame, dst)
+                        cur = (dst, w * 3)
+                    elif name == 'convert':
+                        if cur is not None:
+                            # 8-bit source: RGB8 from convert8, scaled to 16 bits
+                            npp.rgb8_to_rgb16(
+                                cur[0], cur[1], dst, w * 3 * 2, w, h, ctx=self._npp_ctx
+                            )
+                        else:
+                            self._do_convert(frame, dst)
                         cur = (dst, w * 3 * 2)
                     elif name == 'resize8':
-                        ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
+                        if cur is not None:
+                            src_ptr, src_pitch = cur
+                        else:
+                            ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
                         npp.resize_rgb(
                             src_ptr, src_pitch, w, h, dst, tw * 3, tw, th,
                             bits=8, ctx=self._npp_ctx,
@@ -243,6 +269,10 @@ class _PostProcessor:
                             ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
                             npp.rgb8_to_float01(
                                 src_ptr, src_pitch, dst, w * 3 * 4, w, h, ctx=self._npp_ctx
+                            )
+                        elif cur[1] == w * 3:  # RGB8 from convert8
+                            npp.rgb8_to_float01(
+                                cur[0], cur[1], dst, w * 3 * 4, w, h, ctx=self._npp_ctx
                             )
                         else:
                             npp.rgb16_to_float01(
@@ -342,20 +372,21 @@ class _PostProcessor:
                 else:
                     raise RuntimeError(f'Unsupported source format for yuv_to_rgb16: {pf}')
 
-            elif self._npp_mode == 'scale_8u_16u':
-                ((src_ptr, src_pitch),) = _plane_layouts(frame, 1, w * 3, h)
-                npp.rgb8_to_rgb16(
-                    src_ptr,
-                    src_pitch,
-                    dst_ptr,
-                    dst_pitch,
-                    w,
-                    h,
-                    ctx,
-                )
-
             else:
                 raise RuntimeError(f'Unknown _npp_mode: {self._npp_mode!r}')
+
+    def _do_convert8(self, frame, dst_ptr: int) -> None:
+        """8-bit NV12 / 4:4:4 decoder frame → packed RGB8, swscale-exact."""
+        h, w = self.original_imshape
+        pf = self._source_format
+        with cuda_ctx_pushed(self._npp_cuda_ctx):
+            if pf == nvc.Pixel_Format.NV12:
+                planes = _plane_layouts(frame, 2, w, h)
+            elif pf == nvc.Pixel_Format.YUV444:
+                planes = _plane_layouts(frame, 3, w, h)
+            else:
+                raise RuntimeError(f'Unsupported source format for yuv_to_rgb8: {pf}')
+            yuv_to_rgb8_sws(planes, dst_ptr, w * 3, w, h, self._sws_coeffs)
 
 
 def copy_rgb_frame(frame, session, original_imshape, gpu) -> _GpuRgbBuffer:

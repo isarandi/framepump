@@ -145,10 +145,17 @@ precision through an NPP (NVIDIA Performance Primitives) conversion
 pipeline; the conversion matrix and range follow the stream's colorspace
 flags (BT.601/709/2020 and friends).
 
-Unlike ``VideoFrames(gpu=True)``, the output of ``VideoFramesCuda`` is **not
-bit-identical** to CPU decoding: its YUV→RGB conversion runs in CUDA kernels
-rather than FFmpeg's swscale, so pixel values typically differ by a few
-counts. Don't mix the two classes when exact reproducibility matters.
+For 8-bit sources, ``VideoFramesCuda`` converts YUV→RGB with a CUDA kernel
+that reproduces libswscale's 8-bit arithmetic exactly, so its output matches
+``VideoFrames`` up to decoder differences: bit-identical for H.264, and
+within IDCT drift (~0.1 gray levels on average) for MPEG-4/MPEG-2. Streams
+without colour tags are converted with BT.601 at any resolution — the
+libswscale convention, and what ffmpeg-family encoders (incl. OpenCV) used
+when writing such files; pass ``color_space='bt709'`` for untagged HD
+material known to be BT.709. 10-bit sources go through NPP and differ from
+the CPU class by a few counts, and ``resized()`` output differs too (NPP
+resize vs swscale). Only ``VideoFrames(gpu=True)`` is bit-identical in every
+case — use it when exact reproducibility matters.
 
 **Pipeline:**
 

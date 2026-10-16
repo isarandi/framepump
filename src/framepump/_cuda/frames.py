@@ -123,10 +123,13 @@ class VideoFramesCuda:
     from ``VideoFrames(gpu=True)``, which also decodes with NVDEC but
     downloads every frame to a numpy array.
 
-    Output is not bit-identical to CPU decoding (``VideoFrames``): the
-    YUV->RGB conversion runs in CUDA kernels rather than FFmpeg's swscale,
-    so pixel values typically differ by a few counts. ``VideoFrames``
-    with ``gpu=True`` is bit-identical to CPU decoding instead.
+    For 8-bit sources the YUV->RGB conversion runs in a CUDA kernel that
+    reproduces libswscale's 8-bit arithmetic exactly, so output matches
+    ``VideoFrames`` up to decoder differences (bit-identical for H.264;
+    MPEG-4/MPEG-2 IDCT drift of ~0.1 gray levels on average). 10-bit
+    sources go through NPP and differ by a few counts; ``resized()`` output
+    differs too (NPP resize vs swscale). ``VideoFrames`` with ``gpu=True``
+    is bit-identical to CPU decoding in every case.
 
     ``resized()`` (GPU-side NPP resize), ``repeat_each_frame()``, and float
     output dtypes, ``constant_framerate`` and file-like sources are supported
@@ -160,12 +163,21 @@ class VideoFramesCuda:
             Uses the same ffmpeg-parity source map as the CPU class, so the
             two classes select identical source frames.
         color_space: ``'auto'`` (default), ``'bt601'``, ``'bt709'``,
-            ``'bt2020'``, ``'fcc'``, or ``'smpte240m'``. Only used when NPP
-            conversion is active (10-bit + uint16). ``'auto'`` follows the
-            stream's colorspace flag; if unspecified, BT.709 is assumed for
-            height >= 720, else BT.601. Limited vs full range is always taken
-            from the stream. (BT.2020 constant-luminance, ICtCp and other
-            non-matrix colorspaces are not supported — use ``VideoFrames``.)
+            ``'bt2020'``, ``'fcc'``, or ``'smpte240m'``. The YUV->RGB matrix
+            for 8-bit sources and for 10-bit sources with 16-bit output (a
+            10-bit source with ``uint8`` output uses the decoder's own RGB
+            conversion, which honours the stream's tags). ``'auto'`` follows
+            the stream's colorspace tag and falls back to BT.601 for untagged
+            streams at any resolution — libswscale's convention, hence the
+            CPU class's: untagged MPEG-4/MPEG-2 in the wild was written by
+            ffmpeg-family encoders (incl. OpenCV) with BT.601, and the codec
+            specs' BT.709 inference (what NVDEC's own RGB output applies)
+            decodes such files with a visible tint. Pass ``'bt709'``
+            explicitly for untagged HD material known to be BT.709. Limited
+            vs full range is always taken from the stream (unspecified =
+            limited, like swscale). (BT.2020 constant-luminance, ICtCp and
+            other non-matrix colorspaces are not supported — use
+            ``VideoFrames``.)
     """
 
     # Sequential-indexing anti-pattern detection (see _core._note_indexed_access)
@@ -245,18 +257,23 @@ class VideoFramesCuda:
         source_is_hbd = self._source_format in _HBD_FORMATS
         want_16 = dtype != np.dtype(np.uint8)
 
-        if not want_16:
-            # uint8 output: library's RGB conversion handles everything
-            # (truncates 10-bit to 8-bit automatically).
-            self._npp_mode: str | None = None
-            self._color_type = nvc.OutputColorType.RGB
-        elif source_is_hbd:
+        if not source_is_hbd:
+            # 8-bit source: decode NATIVE (NV12 / 4:4:4) and convert to RGB
+            # ourselves with swscale's exact arithmetic, so the matrix/range
+            # rule below applies and the output matches the CPU class. The
+            # decoder's own RGB conversion is not used: it follows the codec
+            # spec's inference for untagged streams (BT.709 for MPEG-4/2),
+            # which is not what ffmpeg-family encoders wrote.
+            self._npp_mode: str | None = 'yuv_to_rgb8'
+            self._color_type = nvc.OutputColorType.NATIVE
+        elif want_16:
             # 10-bit source + uint16 → decode NATIVE, NPP YUV→RGB16.
             self._npp_mode = 'yuv_to_rgb16'
             self._color_type = nvc.OutputColorType.NATIVE
         else:
-            # 8-bit source + uint16 → decode RGB (uint8), NPP upscale.
-            self._npp_mode = 'scale_8u_16u'
+            # 10-bit source + uint8 output: the decoder's RGB conversion
+            # (truncates 10-bit to 8-bit; matrix from the stream's tags).
+            self._npp_mode = None
             self._color_type = nvc.OutputColorType.RGB
 
         self._out_shape: tuple[int, int] | None = None
@@ -274,14 +291,17 @@ class VideoFramesCuda:
             self.constant_framerate = True
             self.target_fps = float(constant_framerate)
 
-        # Color space (only matters for yuv_to_rgb16 path).
+        # Color space for our own YUV→RGB conversions (all 8-bit sources,
+        # and 10-bit sources with 16-bit output).
         if color_space == 'auto':
-            mapped = _AVCOL_SPC_TO_MATRIX.get(self._colorspace_id)
-            if mapped is not None:
-                self._color_space = mapped
-            else:
-                # Unspecified — fall back to height heuristic.
-                self._color_space = 'bt709' if self.original_imshape[0] >= 720 else 'bt601'
+            # Untagged streams get BT.601 at any resolution, like libswscale
+            # (and thus the CPU class): untagged MPEG-4/MPEG-2 in the wild
+            # comes from ffmpeg-family encoders that convert with BT.601 and
+            # write no tags, and untagged H.264 without VUI is treated the
+            # same by every ffmpeg-based tool. (The codec specs would infer
+            # BT.709 for MPEG-4/2 here — that is what NVDEC's own RGB output
+            # applies — but it does not match what was encoded.)
+            self._color_space = _AVCOL_SPC_TO_MATRIX.get(self._colorspace_id, 'bt601')
         elif color_space in _SUPPORTED_COLOR_SPACES:
             self._color_space = color_space
         else:
@@ -409,10 +429,11 @@ class VideoFramesCuda:
     def _check_decoded_dims(self, frame, session) -> None:
         """Detect decoders returning unexpected dimensions (e.g. NVDEC
         splitting interlaced MJPEG into half-height fields) instead of
-        silently yielding wrong-shaped frames. Checked once per instance;
-        only the RGB path is checked (the NPP path validates plane layouts).
+        silently yielding wrong-shaped frames. Checked once per instance on
+        the decoder's RGB frames and on 8-bit NATIVE frames (whose first
+        view is the luma plane); the 16-bit NPP path validates plane layouts.
         """
-        if self._dims_checked or self._npp_mode is not None:
+        if self._dims_checked or self._npp_mode == 'yuv_to_rgb16':
             return
         self._dims_checked = True
         with cuda_ctx_pushed(session._ctx):

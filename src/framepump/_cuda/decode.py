@@ -40,9 +40,27 @@ _NVDEC_CODECS = {
     'vc1': nvc.cudaVideoCodec.VC1,
 }
 
-# Codecs whose MP4/MKV packets need conversion to Annex-B start codes for
-# the NVDEC parser
-_ANNEXB_FILTERS = {'h264': 'h264_mp4toannexb', 'hevc': 'hevc_mp4toannexb'}
+# Bitstream filters that make container packets parseable by the NVDEC
+# parser, which sees only the packet bytes (PyNvVideoCodec has no way to
+# hand it the container's out-of-band ``extradata``, unlike FFmpeg's cuvid
+# path). H.264/HEVC packets in MP4/MKV are AVCC-framed and need Annex-B
+# start codes. The MPEG-style start-code codecs keep their sequence
+# headers (MPEG-4 VOS/VOL, MPEG-1/2 sequence header, VC-1 sequence + entry
+# point) only in ``extradata`` in MP4/MKV, so the parser would emit nothing;
+# ``dump_extra`` re-inserts them before every keyframe packet, skipping
+# packets that already start with them (AVI, MPEG-PS, raw streams), and
+# repeated headers are legal in these codecs. Verified against CPU decoding
+# for MPEG-4 (MP4/MKV/AVI), MPEG-1/2 (MP4/MKV) and VC-1 (ISM/MKV, where the
+# in-band headers get duplicated); VC-1 with headers only in extradata is
+# untested (no encoder available).
+_NVDEC_BSF_FILTERS = {
+    'h264': 'h264_mp4toannexb',
+    'hevc': 'hevc_mp4toannexb',
+    'mpeg1video': 'dump_extra',
+    'mpeg2video': 'dump_extra',
+    'mpeg4': 'dump_extra',
+    'vc1': 'dump_extra',
+}
 
 # Raw PyNvVideoCodec exceptions, wrapped into VideoDecodeError wherever the
 # decoder is driven (unsupported profiles, reconfiguration limits, ...)
@@ -54,8 +72,9 @@ class _PyAVPacketSource:
 
     PyAV replaces PyNvDemuxer here: its seeking is reliable (PyNvDemuxer's
     Seek() segfaults outright on some driver/library combinations and
-    mishandles edit-list files), and its bitstream filters convert AVCC
-    packets to the Annex-B form the NVDEC parser expects.
+    mishandles edit-list files), and its bitstream filters give the NVDEC
+    parser what the container keeps out of band (Annex-B framing, sequence
+    headers; see ``_NVDEC_BSF_FILTERS``).
     """
 
     def __init__(self, video_path: str, codec_name: str) -> None:
@@ -69,7 +88,7 @@ class _PyAVPacketSource:
         self._last_buf = None
 
     def _make_bsf(self):
-        filter_name = _ANNEXB_FILTERS.get(self._codec_name)
+        filter_name = _NVDEC_BSF_FILTERS.get(self._codec_name)
         if filter_name is None:
             return None
         return BitStreamFilterContext(filter_name, self._stream)
@@ -260,6 +279,15 @@ class _NvDecSession:
     def _decode_all(self):
         """Feed every remaining packet and flush; yield (pts, frame).
 
+        Frames with negative PTS are decoded (later frames reference them)
+        but not yielded: they are the discard-flagged preroll of edit-list
+        trims (an MP4 cut with ``-ss -c copy`` keeps the frames from the
+        preceding keyframe on, timestamped before zero). libavcodec drops
+        them, so the CPU class never sees them, and the frame index skips
+        them by this same PTS rule (``FrameIndexPyAV._build_from_packets``);
+        NVDEC has no discard flag, so applying the rule here is what keeps
+        positional iteration in step with ``len()`` and indexed access.
+
         NVDEC/driver errors (unsupported profile, mid-stream reconfiguration
         beyond limits, ...) are wrapped so callers never see raw
         PyNvVideoCodec exceptions. Decode calls run under the session context
@@ -272,6 +300,8 @@ class _NvDecSession:
                 with cuda_ctx_pushed(self._ctx):
                     decoded = [(f.getPTS(), f) for f in self._dec.Decode(pd)]
                 for item in decoded:
+                    if item[0] < 0:
+                        continue
                     count += 1
                     yield item
             empty = nvc.PacketData()
@@ -281,6 +311,8 @@ class _NvDecSession:
                 if not decoded:
                     break
                 for item in decoded:
+                    if item[0] < 0:
+                        continue
                     count += 1
                     yield item
         except _NVC_ERRORS as e:

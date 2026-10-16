@@ -33,39 +33,7 @@ pytestmark = pytest.mark.skipif(
     not NVENC_AVAILABLE, reason='Requires NVIDIA GPU with NVENC support'
 )
 
-_glfw_initialized = False
 
-
-@pytest.fixture
-def gl_context():
-    """Headless GLX context on the NVIDIA GPU (PRIME offload set in conftest)."""
-    global _glfw_initialized
-    import glfw
-    import moderngl
-
-    if not _glfw_initialized:
-        if not glfw.init():
-            pytest.skip('Failed to initialize GLFW')
-        _glfw_initialized = True
-
-    glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-    window = glfw.create_window(640, 480, 'test', None, None)
-    if not window:
-        pytest.skip('Failed to create GLFW window')
-    glfw.make_context_current(window)
-
-    import ctypes
-
-    gl = ctypes.cdll.LoadLibrary('libGL.so.1')
-    gl.glGetString.restype = ctypes.c_char_p
-    renderer = (gl.glGetString(0x1F01) or b'').decode(errors='replace')
-    if 'nvidia' not in renderer.lower():
-        glfw.destroy_window(window)
-        pytest.skip(f'GL context is on non-NVIDIA GPU: {renderer}')
-
-    ctx = moderngl.create_context()
-    yield ctx
-    glfw.destroy_window(window)
 
 
 def expected_red(i):

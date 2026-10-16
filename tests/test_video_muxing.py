@@ -216,39 +216,7 @@ def _nvenc_gl_available():
 gpu_only = pytest.mark.skipif(not _gpu_available(), reason='Requires NVIDIA GPU')
 gl_only = pytest.mark.skipif(not _nvenc_gl_available(), reason='Requires NVENC + GL')
 
-_glfw_initialized = False
 
-
-@pytest.fixture
-def gl_context():
-    """Headless GLX context on the NVIDIA GPU (PRIME offload set in conftest)."""
-    global _glfw_initialized
-    import glfw
-    import moderngl
-
-    if not _glfw_initialized:
-        if not glfw.init():
-            pytest.skip('Failed to initialize GLFW')
-        _glfw_initialized = True
-
-    glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-    window = glfw.create_window(320, 240, 'test', None, None)
-    if not window:
-        pytest.skip('Failed to create GLFW window')
-    glfw.make_context_current(window)
-
-    import ctypes
-
-    gl = ctypes.cdll.LoadLibrary('libGL.so.1')
-    gl.glGetString.restype = ctypes.c_char_p
-    renderer = (gl.glGetString(0x1F01) or b'').decode(errors='replace')
-    if 'nvidia' not in renderer.lower():
-        glfw.destroy_window(window)
-        pytest.skip(f'GL context is on non-NVIDIA GPU: {renderer}')
-
-    ctx = moderngl.create_context()
-    yield ctx
-    glfw.destroy_window(window)
 
 
 def write_gl_video(gl_context, out, n=30, bframes=2, audio_source_path=None):

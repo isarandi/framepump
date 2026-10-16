@@ -5,8 +5,8 @@ arriving frame on the GPU (NVDEC's JPEG engine for the MJPEG wire format
 that UVC cameras use at real resolutions). Decoded frames are published to
 a small ring buffer from which consumers only ever receive frames they have
 not seen before; frames the consumer was too slow for are dropped rather
-than queued (measured: naive queueing reaches seconds of staleness within
-moments — see explorations/2026-08-07-webcam-poc).
+than queued (naive queueing is measured to reach seconds of staleness
+within moments).
 """
 
 from __future__ import annotations
